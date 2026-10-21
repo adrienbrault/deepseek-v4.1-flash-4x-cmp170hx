@@ -1,0 +1,17 @@
+{
+ "label": "tc-v2-sparse",
+ "requests": 65,
+ "failed": 0,
+ "span_s": 337.0,
+ "gen_tokens": 46442,
+ "aggregate_tok_s": 137.8,
+ "decode_median": 27.7,
+ "decode_clean_median": 47.3,
+ "decode_mixed_median": 27.5,
+ "mixed_share": 0.969,
+ "ttft_median_s": 2.307,
+ "ttft_p90_s": 13.82,
+ "ttft_max_s": 62.683,
+ "streams_mean": 6.56,
+ "prompt_tokens_median": 12741
+}

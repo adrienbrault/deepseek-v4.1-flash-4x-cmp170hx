@@ -1,0 +1,5 @@
+# Sparse-attention agent screen
+
+Measured on 2026-10-21, image `dsv41:int-r17`, TP4 DSpark K5 with TC prefill and medium-batch v2, sparse decode enabled. Results directory: `2026-10-21T105809Z-dsv41-sparse`. The frozen code-prefix growing-agent replay uses ten sessions, seeded workload, 10-second think time, a 240-second scored submission window and up to 90 seconds of drain, with workload-selected output lengths and temperature 0.6. Compare the same replay without sparse in `2026-10-21T101344Z-dsv41-tc-v2`.
+
+The screen completed 65 requests with zero failures at 137.8 aggregate tok/s, versus 139.3 without sparse (−1.1%). Median decode beside prefill was 27.5 versus 28.0 tok/s. TTFT median was 2.307 versus 2.518 seconds, while p90 was 13.820 versus 11.512 seconds. Mean observed overlap was 6.56 streams. Six known answers, vision and prefix-cache reporting passed. This single sequential screen establishes no throughput improvement; leave sparse off for the next experiment. The preceding 2.55x median kernel speedup did not translate into an agent-throughput gain.
