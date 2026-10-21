@@ -1,0 +1,17 @@
+{
+ "label": "ring-model-r1",
+ "requests": 76,
+ "failed": 0,
+ "span_s": 341.3,
+ "gen_tokens": 53657,
+ "aggregate_tok_s": 157.2,
+ "decode_median": 31.3,
+ "decode_clean_median": 48.4,
+ "decode_mixed_median": 31.2,
+ "mixed_share": 0.987,
+ "ttft_median_s": 1.269,
+ "ttft_p90_s": 8.391,
+ "ttft_max_s": 49.744,
+ "streams_mean": 6.43,
+ "prompt_tokens_median": 13534.5
+}

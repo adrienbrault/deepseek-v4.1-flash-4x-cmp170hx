@@ -1,0 +1,9 @@
+Measured2026-10-21UTC on four CMP170HX GPUs, EPYC7401P, TP4 DSparkK5, TC-MoE prefill+v2, batch2048, OMP2 and loader-r2 with strided pinned transfers. Hybrid weights use two970EVOPlus SSDs in RAID0; Engram remains on a separate970EVOPlus. The qualified native ring variant handles BF16 rows6/24/48, with stock handling other rows. Early coop, batched reads and SSD side-stream are disabled. Same loaded container served agent, fixed and fresh-prefill screens.
+
+Agent replay157.2tok/s,76requests/0failures, median mixed decode31.2tok/s, TTFT median/p901.269/8.391seconds and6.43mean decoding streams. Ten respawning sessions, growing prompts, temperature0.6, seed1,240-second generation window plus drain; variable output lengths total53657tokens over341.3seconds. This is5.6% above earlier148.9 best, with the same-image ring-OFF comparison still pending. It is a provisional screen result.
+
+Fixed c1/c4/c8 aggregate73.520/138.657/171.890tok/s. Protocol400tokens, ignored EOS, temperature0, seed15, one excluded warmup and three measured batches. Aggregate sums stream decode rates; it differs from agent wall-time throughput. C1 is close to earlier72.658; c4 exceeds earlier135.680, while c8 is below earlier182.190. Those earlier results use another image/configuration.
+
+Fresh2k c1/c4/c8 input1010.5/1171.0/1196.2tok/s; fresh8k1210.9/1231.5/1248.1. Exact usage counts, random-leading synthetic text, thinking off, one output token and explicit zero cached tokens in every request. The aggregate batch rate includes HTTP, tokenization, scheduling, prefill and first decode. One batch per point; not kernel throughput. Earlier batched-read candidate retains the stronger8k screen at1313.5/1350.9/1385.4; combined behavior remains unmeasured.
+
+The unscored repaired profiling helper completed after scores with all four GPU rank traces in each c8/8kc1/8kc4 phase and confirmed cleanup. Native callback intervals remain unavailable in this image. No daily promotion.
