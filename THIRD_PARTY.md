@@ -22,3 +22,7 @@ Licenses not stated above were not verified when this file was written; check ea
 
 
 The optional loading-only patches documented in [LOADER-CANDIDATES](docs/LOADER-CANDIDATES.md) retain the target projects' licenses: plugin patches 0008 and0009 are AGPL-3.0-only and vLLM patch 0026 is Apache-2.0. They add no third-party dependency. The document pins the source revisions, installed base hashes and candidate hashes.
+
+## Pinned decode benchmark
+
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks, commit6278ecb, `tests/bench_decode.py`, git blobd9b24cf29a56c6e215144b267bc874e428b9dcb4, AGPL-3.0. `scripts/mia-prose-screen.py --stage` fetches and verifies this source; it is not vendored here. Protocol comparison follows GNmac-lab/deepseek-v41-flash-1017-cmp170hx atbbaf3672914eb1bbbca11de685be5f0c150f577a.

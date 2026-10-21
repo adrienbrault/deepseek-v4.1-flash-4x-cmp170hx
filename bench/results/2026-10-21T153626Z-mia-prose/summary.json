@@ -1,0 +1,52 @@
+{
+  "ts": 1792596986.8979204,
+  "thinking": false,
+  "temperature": 0,
+  "concurrency": 1,
+  "prompt": "hashmap-prose",
+  "tok_s_median": 88.84402000163222,
+  "tok_s_min": 69.4534394239828,
+  "tok_s_max": 89.63667270908398,
+  "ttft_median_s": 0.10022040199999083,
+  "completion_tokens_median": 400.0,
+  "accepted_per_step_median": 2.64,
+  "any_nan": false,
+  "configuration": {
+    "base": "loader-r1",
+    "tp": 4,
+    "pp": 1,
+    "batch_tokens": 1024,
+    "speculation": "dspark K5",
+    "tc_moe": "prefill+v2",
+    "omp_threads": 2,
+    "prefix_cache": true,
+    "image": "sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7cd39eadab7be62d1a31"
+  },
+  "runs": [
+    {
+      "decode_tok_s": 69.4534394239828,
+      "completion_tokens": 400,
+      "ttft_s": 0.1536107729999685
+    },
+    {
+      "decode_tok_s": 87.9771168247005,
+      "completion_tokens": 400,
+      "ttft_s": 0.09995960800006287
+    },
+    {
+      "decode_tok_s": 89.63667270908398,
+      "completion_tokens": 400,
+      "ttft_s": 0.10347835299990038
+    },
+    {
+      "decode_tok_s": 88.84402000163222,
+      "completion_tokens": 400,
+      "ttft_s": 0.09874979400001394
+    },
+    {
+      "decode_tok_s": 89.24547328053619,
+      "completion_tokens": 400,
+      "ttft_s": 0.10022040199999083
+    }
+  ]
+}
