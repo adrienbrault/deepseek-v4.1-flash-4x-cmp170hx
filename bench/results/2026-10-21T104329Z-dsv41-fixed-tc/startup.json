@@ -1,0 +1,13 @@
+{
+  "date_utc": "2026-10-21",
+  "results_directory": "2026-10-21T104329Z-dsv41-fixed-tc",
+  "configuration": "int-r17 TC prefill+v2, TP4 DSpark K5, vision enabled",
+  "boot_to_ready_seconds": 591,
+  "model_loading_seconds": 280.04,
+  "engine_initialization_seconds": 181.92,
+  "weight_pass_seconds": [
+    201.24,
+    31.9
+  ],
+  "notes": "Approximate nonoverlapping wall-time decomposition: model loading 280 s, engine initialization 182 s, remaining launcher checks/imports/process startup/health polling 129 s. Kernel caches in /root/.triton and /root/.tilelang were not bind-mounted; fixed for future boots. No warm-cache speedup measured."
+}
