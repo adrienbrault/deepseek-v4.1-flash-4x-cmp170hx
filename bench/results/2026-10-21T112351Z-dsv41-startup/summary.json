@@ -1,0 +1,37 @@
+{
+  "date_utc": "2026-10-21",
+  "image": "dsv41:int-r17",
+  "configuration": "TP4 DSpark K5, TC prefill+v2, vision on, sparse off; unchanged numerical configuration",
+  "baseline_results": "2026-10-21T104329Z-dsv41-fixed-tc",
+  "results_directory": "2026-10-21T112351Z-dsv41-startup",
+  "boot_to_ready_s": {
+    "baseline": 591,
+    "persistent_compiler_cache": 446
+  },
+  "model_load_s": {
+    "baseline": 280.042,
+    "persistent_compiler_cache": 278.923
+  },
+  "engine_initialization_s": {
+    "baseline": 181.92,
+    "persistent_compiler_cache": 36.86
+  },
+  "preflight_s": {
+    "initial_miss": 74.052,
+    "verified_hit": 0.289
+  },
+  "next_unchanged_boot_estimate_s": 372.23699999999997,
+  "next_boot_estimate_measured": false,
+  "quality": "6/6 PASS",
+  "vision": "PASS",
+  "prefix_usage": "12544/12618 tokens cached",
+  "cache_reuse": "PASS",
+  "left_loaded": true,
+  "GLM_restored": false,
+  "linux_launcher_tests": 9,
+  "static_serving": {
+    "pass": 13,
+    "fail": 0,
+    "warn": 2
+  }
+}
