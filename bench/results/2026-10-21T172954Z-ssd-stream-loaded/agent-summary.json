@@ -1,0 +1,23 @@
+{
+  "label": "ssd-stream-r2",
+  "requests": 71,
+  "failed": 0,
+  "span_s": 346.4,
+  "gen_tokens": 49951,
+  "aggregate_tok_s": 144.2,
+  "decode_median": 28.0,
+  "decode_clean_median": 41.4,
+  "decode_mixed_median": 28.0,
+  "mixed_share": 0.972,
+  "ttft_median_s": 1.636,
+  "ttft_p90_s": 8.816,
+  "ttft_max_s": 52.69,
+  "streams_mean": 6.54,
+  "prompt_tokens_median": 13062,
+  "tag": "ssd-stream-r2",
+  "batched": 2048,
+  "tc_prefill_rows": 2048,
+  "comparison_reference_tok_s": 141.9,
+  "aggregate_change_pct": 1.62,
+  "classification": "screen result; no daily promotion"
+}

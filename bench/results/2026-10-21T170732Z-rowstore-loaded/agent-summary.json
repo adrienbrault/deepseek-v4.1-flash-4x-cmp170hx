@@ -1,0 +1,23 @@
+{
+  "label": "rowstore-r2",
+  "requests": 68,
+  "failed": 0,
+  "span_s": 342.1,
+  "gen_tokens": 48004,
+  "aggregate_tok_s": 140.3,
+  "decode_median": 24.4,
+  "decode_clean_median": 38.3,
+  "decode_mixed_median": 24.0,
+  "mixed_share": 0.956,
+  "ttft_median_s": 1.339,
+  "ttft_p90_s": 12.613,
+  "ttft_max_s": 51.056,
+  "streams_mean": 6.64,
+  "prompt_tokens_median": 12780.5,
+  "tag": "rowstore-r2",
+  "batched": 2048,
+  "tc_prefill_rows": 2048,
+  "comparison_reference_tok_s": 141.9,
+  "aggregate_change_pct": -1.13,
+  "classification": "screen result; no daily promotion"
+}

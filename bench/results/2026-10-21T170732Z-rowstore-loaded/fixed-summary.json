@@ -1,0 +1,21 @@
+{
+  "classification": "fixed short-chat decode; sum of per-stream rates, not agent replay",
+  "protocol": "400 tokens, ignored EOS, temperature0, seed15, 1warmup+3measured batches",
+  "fixed": {
+    "1": {
+      "aggregate_decode_tok_s": 75.75583853866581,
+      "per_stream_decode_tok_s": 75.75583853866581,
+      "ttft_median_s": 0.26036834716796875
+    },
+    "4": {
+      "aggregate_decode_tok_s": 128.7002390747134,
+      "per_stream_decode_tok_s": 32.17505976867835,
+      "ttft_median_s": 0.5296112298965454
+    },
+    "8": {
+      "aggregate_decode_tok_s": 180.45871251077395,
+      "per_stream_decode_tok_s": 22.557339063846744,
+      "ttft_median_s": 0.7882059812545776
+    }
+  }
+}
