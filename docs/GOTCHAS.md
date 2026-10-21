@@ -28,3 +28,10 @@ Weight-load counters on 2026-10-21 found four loader workers near one CPU core e
 
 
 A queue that exists only in the operator's conversation does not execute between turns. `scripts/work-loop.py` is a generic persistent serial executor for explicitly queued experiment scripts. It records terminal job IDs, returns failed jobs without retry, polls exact service states and accepts fresh queue files while running. Run under systemd with `KillMode=control-group`; experiment wrappers must hold the GPU lock. An exhausted queue records `needs_plan` and requires new experiments; the worker cannot wake the operator or choose levers. Six actual-subprocess tests passed on Linux2026-10-21, including timeout and interruption cleanup. This executor changes experiment scheduling, not the serving configuration.
+
+
+## Loaded decode and prefill profiling,2026-10-21
+
+`prefill-profile.py` captures unscored c8 decode and fresh8k prefill at c1/c4 after throughput scores finish. Every phase requires a profiler stop acknowledgement and observer cleanup; unresolved requests require replacing the model before another scored run. The240-second helper budget reserves80seconds for cleanup and bounds CPU report processing. CPU reports run after GPU captures because symbol processing previously consumed later phases' request deadlines. Twenty Linux tests pass; a hardware rerun of the repaired lifecycle is pending.
+
+`summarize-prefill-profile.py` reports per-phase GPU rank coverage, summed communication kernel durations, separately observed callback intervals and host counters. Collective kernel duration includes possible waiting and is not exclusive PCIe transfer or callback time. Missing callback spans remain unavailable. A partial or unsafe capture keeps its original status even when all four rank traces are recoverable.
