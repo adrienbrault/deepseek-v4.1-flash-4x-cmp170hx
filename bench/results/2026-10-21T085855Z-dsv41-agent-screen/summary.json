@@ -1,0 +1,78 @@
+{
+  "date_utc": "2026-10-21",
+  "status": "control complete; TC-MoE prefill pending",
+  "image_id": "sha256:cae174260cb6d6c9ab113ecb9db179bf20180662e4e16860252f9b8000bdb916",
+  "serial": {
+    "75k": {
+      "base": {
+        "decode_mean_tok_s": 53.675,
+        "prompt_tokens": [
+          81484,
+          81476,
+          81475,
+          81482
+        ],
+        "completion_tokens": [
+          1500,
+          1500,
+          1500,
+          1500
+        ],
+        "first_ttft_s": 97.16,
+        "warm_ttft_median_s": 0.86
+      }
+    },
+    "3k": {
+      "base": {
+        "decode_mean_tok_s": 60.233,
+        "prompt_tokens": [
+          2767,
+          2759,
+          2758
+        ],
+        "completion_tokens": [
+          1500,
+          241,
+          1500
+        ],
+        "first_ttft_s": 0.53,
+        "warm_ttft_median_s": 0.54
+      }
+    }
+  },
+  "agent": {
+    "base": {
+      "label": "base",
+      "requests": 52,
+      "failed": 0,
+      "span_s": 348.4,
+      "gen_tokens": 38649,
+      "aggregate_tok_s": 110.9,
+      "decode_median": 21.0,
+      "decode_clean_median": 49.9,
+      "decode_mixed_median": 21.0,
+      "mixed_share": 0.981,
+      "ttft_median_s": 3.286,
+      "ttft_p90_s": 26.973,
+      "ttft_max_s": 79.827,
+      "streams_mean": 6.4,
+      "prompt_tokens_median": 11484.0
+    }
+  },
+  "serving_check": {
+    "prefix": {
+      "cold_s": 21.113,
+      "warm_s": 0.667,
+      "prompt_tokens": 12618,
+      "cached_tokens": 12544,
+      "same_text": true,
+      "answer": "Sensor 4 read 481 at minute 599.",
+      "cached_answer": "Sensor 4 read 481 at minute 599.",
+      "cache_reporting_pass": true
+    },
+    "vision": {
+      "answer": "Red",
+      "pass": true
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+ "label": "base",
+ "requests": 52,
+ "failed": 0,
+ "span_s": 348.4,
+ "gen_tokens": 38649,
+ "aggregate_tok_s": 110.9,
+ "decode_median": 21.0,
+ "decode_clean_median": 49.9,
+ "decode_mixed_median": 21.0,
+ "mixed_share": 0.981,
+ "ttft_median_s": 3.286,
+ "ttft_p90_s": 26.973,
+ "ttft_max_s": 79.827,
+ "streams_mean": 6.4,
+ "prompt_tokens_median": 11484.0
+}
