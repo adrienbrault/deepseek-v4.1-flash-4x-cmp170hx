@@ -1,0 +1,178 @@
+# Purpose: Skip provably ineligible reclaim work for newly allocated direct-fill buffers.
+# Origin: Local changes against the pinned vllm-exl3 tree plus patches 0001 through 0007.
+# License: AGPL-3.0-only (same as vllm-exl3).
+# Enable candidate: VLLM_EXL3_LOAD_RECLAIM_FAST=1 (default off).
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -945,6 +945,13 @@
+         if view_start == 0 or view_nbytes <= 0:
+             return False
+         view_end = view_start + view_nbytes
++        fast = os.environ.get("VLLM_EXL3_LOAD_RECLAIM_FAST", "0") == "1"
++        page = os.sysconf("SC_PAGESIZE")
++        if fast:
++            # No complete view page can be reclaimed: avoid opening procfs.
++            start = view_start + ((page - (view_start % page)) % page)
++            if view_end - (view_end % page) <= start:
++                return False
+         vma = _find_containing_vma(view_start)
+         if vma is None:
+             return False
+@@ -954,15 +961,18 @@
+             return False
+         safe_start = max(view_start, vma_lo)
+         safe_end = min(view_end, vma_hi)
+-        page = os.sysconf("SC_PAGESIZE")
+         # Page-align INWARD only — never touch adjacent views / heap.
+         start = safe_start + ((page - (safe_start % page)) % page)
+         end = safe_end - (safe_end % page)
+         if end <= start:
+             return False
+-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+-        libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+-        libc.madvise.restype = ctypes.c_int
++        if fast:
++            # Cache the function binding only, never VMA/address information.
++            libc = _p1_libc()
++        else:
++            libc = ctypes.CDLL("libc.so.6", use_errno=True)
++            libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
++            libc.madvise.restype = ctypes.c_int
+         advised = end - start
+         rc = libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(advised), 4)
+         if rc == 0:
+@@ -1143,11 +1153,18 @@
+     # PR14's direct H2D copy, kept separate from its broader policy changes.
+     # Keep conversion on the source device; never allocate src.to(cuda) beside
+     # the final arena. Blocking copy establishes completion before release.
++    fast_reclaim = os.environ.get("VLLM_EXL3_LOAD_RECLAIM_FAST", "0") == "1"
++    source_may_be_mmap = True
+     if src.dtype != torch.int16:
+         src = src.to(dtype=torch.int16)
++        source_may_be_mmap = False  # dtype change allocated new torch storage
+     if not src.is_contiguous():
+         src = src.contiguous()
+-    src = _p1_prefault(src)  # _P1_POPULATE: install PTEs before the CPU memcpy
++        source_may_be_mmap = False  # materialization allocated torch storage
++    prefaulted = _p1_prefault(src)
++    if prefaulted is not src:
++        source_may_be_mmap = False  # prefault fallback returned a CPU clone
++    src = prefaulted  # _P1_POPULATE: install PTEs before the CPU memcpy
+     if arena[idx].is_cuda:
+         # Pinned bounce: one host memcpy plus an async H2D, no per-tensor sync.
+         _bounce_copy(arena[idx], src)
+@@ -1155,7 +1172,11 @@
+         # CPU arena (unit tests, CPU-only torch): blocking copy establishes
+         # completion before ``src`` is released.
+         arena[idx].copy_(src, non_blocking=False)
+-    _madv_dontneed_cpu_tensor(src)
++    # The safetensors-only reclaim helper always rejects these new torch
++    # allocations. Skip that procfs scan without caching any address lifetime.
++    # Original mmap sources still take the unchanged, fresh VMA validation.
++    if not fast_reclaim or source_may_be_mmap:
++        _madv_dontneed_cpu_tensor(src)
+     layer._exl3_trellis_filled.add((proj, int(expert_id)))
+     _DIRECT_FILL_STATS["DIRECT_FILL_CALLS"] += 1
+     _DIRECT_FILL_STATS["DIRECT_FILL_BYTES"] += transient
+--- /dev/null
++++ b/tests/test_load_reclaim_fast.py
+@@ -0,0 +1,99 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""CPU regressions for allocation-aware direct-fill reclaim."""
++import ctypes
++import mmap
++import os
++from types import SimpleNamespace
++
++import pytest
++
++torch = pytest.importorskip("torch")
++from vllm_exl3 import exl3 as ex
++
++PAGE = os.sysconf("SC_PAGESIZE")
++
++
++def _layer(src):
++    shape = tuple(src.shape)
++    arena = torch.empty((1, *shape), dtype=torch.int16)
++    return SimpleNamespace(
++        _exl3_trellis_eid_index={"gate": {0: (shape, 0)}},
++        _exl3_trellis_arena_plan={"gate": {shape: {"arena": arena, "eid_to_idx": {0: 0}}}},
++        _exl3_trellis_filled=set(),
++    ), arena
++
++
++@pytest.mark.parametrize("fast", ["0", "1"])
++@pytest.mark.parametrize("kind", ["original", "dtype", "strided", "clone"])
++def test_allocation_provenance_and_copy_order(monkeypatch, fast, kind):
++    monkeypatch.setenv("VLLM_EXL3_LOAD_RECLAIM_FAST", fast)
++    src = torch.arange(PAGE * 2, dtype=torch.int16)
++    if kind == "dtype":
++        src = src.to(torch.int32)
++    elif kind == "strided":
++        src = src[::2]
++    layer, arena = _layer(src)
++    seen = []
++    def prefault(t):
++        return t.clone() if kind == "clone" else t
++    def reclaim(t):
++        # No reclaim before the copy consumed its source, even on CPU.
++        assert torch.equal(arena[0], src.to(torch.int16))
++        seen.append(t)
++        return False
++    monkeypatch.setattr(ex, "_p1_prefault", prefault)
++    monkeypatch.setattr(ex, "_madv_dontneed_cpu_tensor", reclaim)
++    ex._direct_fill_trellis_slot(layer, "gate", 0, src)
++    assert torch.equal(arena[0], src.to(torch.int16))
++    assert bool(seen) == (fast == "0" or kind == "original")
++    assert layer._exl3_trellis_filled == {("gate", 0)}
++
++
++@pytest.mark.parametrize("fast", ["0", "1"])
++def test_file_view_preserves_unconsumed_pages_and_rechecks_remapped_address(tmp_path, monkeypatch, fast):
++    monkeypatch.setenv("VLLM_EXL3_LOAD_RECLAIM_FAST", fast)
++    monkeypatch.setenv("VLLM_EXL3_MADV_AFTER_H2D", "1")
++    p = tmp_path / "weights.safetensors"
++    p.write_bytes(bytes([7]) * PAGE * 8)
++    with p.open("r+b") as f:
++        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)
++    base = torch.frombuffer(mm, dtype=torch.uint8)
++    addr = base.data_ptr()
++    first, later = base[PAGE:PAGE * 3], base[PAGE * 4:PAGE * 6]
++    first.fill_(19)
++    later.fill_(91)
++    assert ex._madv_dontneed_cpu_tensor(first)
++    assert bool(torch.all(first == 7))
++    assert bool(torch.all(later == 91))
++    # Replace only our own still-reserved mapping, never an unowned address.
++    # A stale VMA cache would now misclassify this writable anonymous memory.
++    libc = ctypes.CDLL("libc.so.6", use_errno=True)
++    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
++    libc.mmap.restype = ctypes.c_void_p
++    replaced = libc.mmap(addr, PAGE * 8, mmap.PROT_READ | mmap.PROT_WRITE,
++                         mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | 0x10, -1, 0)  # MAP_FIXED
++    assert replaced == addr
++    base.fill_(42)
++    assert ex._madv_dontneed_cpu_tensor(first) is False
++    assert bool(torch.all(base == 42))
++    del first, later, base
++    mm.close()
++
++
++def test_subpage_skips_procfs_and_disabled_flag_still_wins(monkeypatch):
++    monkeypatch.setenv("VLLM_EXL3_LOAD_RECLAIM_FAST", "1")
++    monkeypatch.setenv("VLLM_EXL3_MADV_AFTER_H2D", "1")
++    lookups = []
++    def find(addr):
++        lookups.append(addr)
++        return None
++    monkeypatch.setattr(ex, "_find_containing_vma", find)
++    assert ex._madv_dontneed_cpu_tensor(torch.empty(16, dtype=torch.uint8)) is False
++    assert lookups == []
++    monkeypatch.setenv("VLLM_EXL3_MADV_AFTER_H2D", "0")
++    assert ex._madv_dontneed_cpu_tensor(torch.empty(PAGE * 4, dtype=torch.uint8)) is False
++    assert lookups == []
++    monkeypatch.setenv("VLLM_EXL3_MADV_AFTER_H2D", "1")
++    monkeypatch.setenv("VLLM_EXL3_LOAD_RECLAIM_FAST", "0")
++    assert ex._madv_dontneed_cpu_tensor(torch.empty(16, dtype=torch.uint8)) is False
++    assert len(lookups) == 1

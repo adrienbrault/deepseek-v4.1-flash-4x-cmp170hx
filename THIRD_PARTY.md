@@ -19,3 +19,6 @@ Original documentation, scripts and benchmark instruments in this repository use
 | amoghmunikote/cmpunlocker | [Project](https://github.com/amoghmunikote/cmpunlocker) | Host memory unlock and driver tooling used in the setup. |
 
 Licenses not stated above were not verified when this file was written; check each project before redistributing its code.
+
+
+The optional loading-only patches documented in [LOADER-CANDIDATES](docs/LOADER-CANDIDATES.md) retain the target projects' licenses: plugin patch 0008 is AGPL-3.0-only and vLLM patch 0026 is Apache-2.0. They add no third-party dependency. The document pins the source revisions, installed base hashes and candidate hashes.

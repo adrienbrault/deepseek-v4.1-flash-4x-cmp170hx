@@ -1,0 +1,43 @@
+# Purpose: Skip wholly unused target-model shards during optional DSpark loading.
+# Origin: Local startup optimization against pinned vLLM df3bd094 plus the existing series.
+# License: Apache-2.0. Enable VLLM_DSV4_DSPARK_FILTER_SHARDS=1; default off.
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -10,7 +10,8 @@
+ include the future query tokens in the top-k indices for each query token.
+ """
+ 
+-from collections.abc import Iterable
++import os
++from collections.abc import Callable, Iterable
+ 
+ import regex as re
+ import torch
+@@ -369,6 +370,26 @@
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
++    @property
++    def is_unused_checkpoint_weight(self) -> Callable[[str], bool] | None:
++        """Opt in to skipping target-only shards during draft loading."""
++        if os.environ.get("VLLM_DSV4_DSPARK_FILTER_SHARDS", "0") != "1":
++            return None
++        return self._is_unused_checkpoint_weight
++
++    def _is_unused_checkpoint_weight(self, name: str) -> bool:
++        # Pipeline-parallel drafts load a private embedding before the normal
++        # MTP remap; keep every alias accepted by load_weights below.
++        if self.has_own_embed_tokens and name in (
++            "embed.weight",
++            "embed_tokens.weight",
++            "model.embed_tokens.weight",
++        ):
++            return False
++        # Keep the exact same MTP/head/EXL3 acceptance decision as load_weights.
++        # The loader drops only wholly unused files; mixed files remain intact.
++        return self._remap_dspark_name(name) is None
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
+ 
