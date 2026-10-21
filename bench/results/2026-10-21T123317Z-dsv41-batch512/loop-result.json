@@ -1,0 +1,23 @@
+{
+  "label": "batch512",
+  "requests": 62,
+  "failed": 0,
+  "span_s": 357.9,
+  "gen_tokens": 44948,
+  "aggregate_tok_s": 125.6,
+  "decode_median": 26.1,
+  "decode_clean_median": 33.9,
+  "decode_mixed_median": 26.1,
+  "mixed_share": 0.968,
+  "ttft_median_s": 3.244,
+  "ttft_p90_s": 30.346,
+  "ttft_max_s": 83.055,
+  "streams_mean": 6.16,
+  "prompt_tokens_median": 12674.0,
+  "tag": "batch512",
+  "batched": 512,
+  "tc_prefill_rows": 2048,
+  "comparison_reference_tok_s": 139.3,
+  "aggregate_change_pct": -9.83,
+  "classification": "screen result; no daily promotion"
+}

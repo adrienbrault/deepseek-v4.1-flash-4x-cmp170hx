@@ -1,0 +1,71 @@
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -1099,6 +1099,26 @@
+     return f"layer={name} tensor=experts.{expert_id}.{shard}.trellis"
+ 
+ 
++def _trellis_load_tp_view(
++    loaded: "torch.Tensor", shard_id: str, tp_rank: int, tp_size: int
++) -> "torch.Tensor":
++    """Use the existing TP geometry without making a pageable packed copy.
++
++    Only the opt-in arena loader calls this helper. The final pinned bounce
++    performs the same strided gather with Tensor.copy_ before its H2D copy.
++    """
++    if shard_id in ("w1", "w3"):
++        dim = 1
++    elif shard_id == "w2":
++        dim = 0
++    else:
++        raise ValueError(f"unknown EXL3 shard_id={shard_id}")
++    if tp_size <= 1:
++        return loaded
++    off, length = _tp_slice(int(loaded.shape[dim]), tp_rank, tp_size, 16, True)
++    return loaded.narrow(dim, off, length)
++
++
+ def _direct_fill_trellis_slot(
+     layer: Any,
+     proj: str,
+@@ -1158,7 +1178,12 @@
+     if src.dtype != torch.int16:
+         src = src.to(dtype=torch.int16)
+         source_may_be_mmap = False  # dtype change allocated new torch storage
+-    if not src.is_contiguous():
++    strided_bounce = (
++        os.environ.get("VLLM_EXL3_LOAD_STRIDED_BOUNCE", "0") == "1"
++        and src.device.type == "cpu"
++        and arena[idx].is_cuda
++    )
++    if not src.is_contiguous() and not strided_bounce:
+         src = src.contiguous()
+         source_may_be_mmap = False  # materialization allocated torch storage
+     prefaulted = _p1_prefault(src)
+@@ -3882,11 +3907,25 @@
+             if _exl3_mem_waterfall_enabled():
+                 _exl3_mem_snapshot("BEFORE_SOURCE", owner_mod)
+             try:
++                strided_bounce = (
++                    os.environ.get("VLLM_EXL3_LOAD_STRIDED_BOUNCE", "0") == "1"
++                    and loaded.device.type == "cpu"
++                    and owner_mod.w13_suh.device.type == "cuda"
++                    and _exl3_trellis_arena_enabled()
++                )
+                 if shard_id in ("w1", "w3"):
+-                    sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size, aligned=True)
++                    sharded = (
++                        _trellis_load_tp_view(loaded, shard_id, tp_rank, tp_size)
++                        if strided_bounce else
++                        shard_exl3_col(loaded, suffix, tp_rank, tp_size, aligned=True)
++                    )
+                     plist = owner_mod.gate_trellis if shard_id == "w1" else owner_mod.up_trellis
+                 elif shard_id == "w2":
+-                    sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size, aligned=True)
++                    sharded = (
++                        _trellis_load_tp_view(loaded, shard_id, tp_rank, tp_size)
++                        if strided_bounce else
++                        shard_exl3_row(loaded, suffix, tp_rank, tp_size, aligned=True)
++                    )
+                     plist = owner_mod.down_trellis
+                 else:
+                     raise ValueError(f"unknown EXL3 shard_id={shard_id}")

@@ -20,3 +20,8 @@ The candidate image ID is `sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7c
 ## 2026-10-21 hardware screen
 
 The combined allocation-aware reclaim and DSpark file filter reduced total model loading from280.956 to246.656seconds (12.2%), including header selection overhead. Six answers, vision and prefix-cache reporting passed. Fixed decode and the growing-agent replay establish no serving-speed improvement. Workloads, samplers, concurrency and caveats are recorded in `bench/results/2026-10-21T120933Z-dsv41-loader/NOTES.md`; no daily promotion is implied.
+
+
+## Next bounded candidate
+
+Plugin0009 targets the same pinned vcruz305/vllm-exl3 revision after0008, retaining AGPL-3.0-only. It removes the pageable TP trellis packing copy before the existing pinned transfer buffers. Source base0dd89079d21181a8c35f668c4de51b95e0e2463e6a0ca3130f289e99c43e1a87; patchedab3d0e3798b960bf34e734de07c357711d13004baf8433883e75a88fb7428f27. `scripts/build-loader-candidate.py --strided` builds the exact-parent child; `scripts/strided-bounce-gpu-gate.py` requires exact CUDA copy/lifetime checks on four cards. Hardware results remain pending. Component benchmark context and manifests: `bench/results/2026-10-21-loader-strided/NOTES.md`.

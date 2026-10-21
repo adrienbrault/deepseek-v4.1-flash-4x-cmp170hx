@@ -1,0 +1,14 @@
+{
+  "base_image": "sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7cd39eadab7be62d1a31",
+  "candidate_image": "sha256:e63668debfbd2bb656a2fee114e16f1b8862ba862d78cce2edece67f46e7da1c",
+  "changed_modules": {
+    "exl3.py": "vllm_exl3/exl3.py"
+  },
+  "files": {
+    "exl3.py": "ab3d0e3798b960bf34e734de07c357711d13004baf8433883e75a88fb7428f27"
+  },
+  "patches": {
+    "exl3.py": "707a1a6d188cdea5072152af9b8a5b6f0858808ce4811d51bacbbb6470a8c3bb"
+  },
+  "compiler_cache_seeded_from": "sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7cd39eadab7be62d1a31"
+}

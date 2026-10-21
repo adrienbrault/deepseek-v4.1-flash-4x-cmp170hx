@@ -1,0 +1,24 @@
+{
+  "scope": "Linux CPU warm memory only; not Opera boot saving",
+  "torch_version": "2.8.0+cpu",
+  "rows": [
+    {
+      "torch_threads": 1,
+      "view_bytes": 2097152,
+      "median_us_per_copy": {
+        "pack_then_bounce": 89.00438027922064,
+        "strided_to_bounce": 33.393410267308354
+      },
+      "component_speedup": 2.665327666948547
+    },
+    {
+      "torch_threads": 2,
+      "view_bytes": 2097152,
+      "median_us_per_copy": {
+        "pack_then_bounce": 44.121770188212395,
+        "strided_to_bounce": 21.5175497578457
+      },
+      "component_speedup": 2.0505015991481454
+    }
+  ]
+}

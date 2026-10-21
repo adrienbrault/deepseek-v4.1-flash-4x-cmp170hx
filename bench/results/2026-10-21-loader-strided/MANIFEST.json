@@ -1,0 +1,6 @@
+{
+  "base_sha256": "0dd89079d21181a8c35f668c4de51b95e0e2463e6a0ca3130f289e99c43e1a87",
+  "patched_sha256": "ab3d0e3798b960bf34e734de07c357711d13004baf8433883e75a88fb7428f27",
+  "requires": "vllm-exl3 patches0001 through0008",
+  "flag": "VLLM_EXL3_LOAD_STRIDED_BOUNCE=1"
+}

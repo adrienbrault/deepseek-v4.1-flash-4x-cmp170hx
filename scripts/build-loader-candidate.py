@@ -1,11 +1,12 @@
 """Build a loading-only child image from exact int-r17; preserve its compiler caches."""
+import os
+import argparse
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-import os
 
 BASE = 'sha256:cae174260cb6d6c9ab113ecb9db179bf20180662e4e16860252f9b8000bdb916'
 EXPECTED = {'exl3.py': '5f8b22b99948c36f6e1f1a8c406ad21a1225da8c38854a8b59922f314d2aa35d',
@@ -13,10 +14,20 @@ EXPECTED = {'exl3.py': '5f8b22b99948c36f6e1f1a8c406ad21a1225da8c38854a8b59922f31
 MODULES = {'exl3.py': 'vllm_exl3/exl3.py', 'dspark.py': 'vllm/models/deepseek_v41/nvidia/dspark.py'}
 SITE = '/usr/local/lib/python3.12/dist-packages/'
 H = Path(__file__).resolve().parent
-out = H / 'loader-candidate'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--strided', action='store_true', help='Stack the reviewed strided-copy patch on exact loader-r1')
+args = parser.parse_args()
+tag = 'dsv41:loader-r1'
+patches = {'exl3.py': H.parent / 'patches/vllm-exl3/0008-load-reclaim-fast.patch', 'dspark.py': H.parent / 'patches/vllm/0026-filter-dspark-unused-shards.patch'}
+if args.strided:
+    BASE = 'sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7cd39eadab7be62d1a31'
+    EXPECTED = {'exl3.py': '0dd89079d21181a8c35f668c4de51b95e0e2463e6a0ca3130f289e99c43e1a87'}
+    MODULES = {'exl3.py': 'vllm_exl3/exl3.py'}
+    patches = {'exl3.py': H.parent / 'patches/vllm-exl3/0009-load-strided-bounce.patch'}
+    tag = 'dsv41:loader-r2'
+out = H / ('loader-candidate-strided' if args.strided else 'loader-candidate')
 context = out / 'image'
 context.mkdir(parents=True, exist_ok=True)
-patches = {'exl3.py': H.parent / 'patches/vllm-exl3/0008-load-reclaim-fast.patch', 'dspark.py': H.parent / 'patches/vllm/0026-filter-dspark-unused-shards.patch'}
 for name, module in MODULES.items():
     source = subprocess.check_output(['docker', 'run', '--rm', '--pull=never', '--network', 'none',
                                       '--entrypoint', 'cat', BASE, SITE + module])
@@ -32,9 +43,9 @@ for name, module in MODULES.items():
     shutil.copy2(path, context / name)
 (context / 'Dockerfile').write_text('FROM ' + BASE + '\n' + ''.join(
     f'COPY {name} {SITE}{module}\n' for name, module in MODULES.items()))
-subprocess.run(['docker', 'build', '--pull=false', '--network=none', '-t', 'dsv41:loader-r1', str(context)], check=True)
+subprocess.run(['docker', 'build', '--pull=false', '--network=none', '-t', tag, str(context)], check=True)
 base = json.loads(subprocess.check_output(['docker','image','inspect',BASE]))[0]
-new = json.loads(subprocess.check_output(['docker','image','inspect','dsv41:loader-r1']))[0]
+new = json.loads(subprocess.check_output(['docker','image','inspect',tag]))[0]
 assert new['RootFS']['Layers'][:len(base['RootFS']['Layers'])] == base['RootFS']['Layers']
 # The only child filesystem changes are the two reviewed loading-only Python files.
 # Compiler libraries and Triton/TileLang kernel source remain byte-identical.
