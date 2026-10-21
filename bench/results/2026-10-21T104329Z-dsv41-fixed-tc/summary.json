@@ -1,0 +1,50 @@
+{
+  "date_utc": "2026-10-21",
+  "image": "dsv41:int-r17",
+  "configuration": "TC prefill plus medium-batch v2; TP4 DSpark K5",
+  "workload": "short prose chat, 68 prompt tokens, 400 completion tokens, ignored EOS, temperature 0, seed 15; one excluded warmup and three measured batches per concurrency",
+  "fixed": {
+    "1": {
+      "aggregate_decode_tok_s": 72.65837359530175,
+      "per_stream_decode_tok_s": 72.65837359530175,
+      "ttft_median_s": 0.2446613311767578,
+      "batch_aggregate_range": [
+        66.39149771063157,
+        81.13750728698443
+      ]
+    },
+    "4": {
+      "aggregate_decode_tok_s": 135.67952080898954,
+      "per_stream_decode_tok_s": 33.919880202247384,
+      "ttft_median_s": 0.5198051929473877,
+      "batch_aggregate_range": [
+        126.99896542513252,
+        146.01367012609967
+      ]
+    },
+    "8": {
+      "aggregate_decode_tok_s": 182.18961108233412,
+      "per_stream_decode_tok_s": 22.773701385291762,
+      "ttft_median_s": 0.753595232963562,
+      "batch_aggregate_range": [
+        179.02669199068333,
+        185.9427799219559
+      ]
+    }
+  },
+  "cpu": {
+    "workload": "37-token raw-completion code prompt; 400 output tokens, ignored EOS, temperature 0, seed 15; six interleaved rounds",
+    "means": {
+      "1": {
+        "normal": 93.05275386886257,
+        "limited": 96.04288558009011
+      },
+      "4": {
+        "normal": 183.60905380514436,
+        "limited": 174.32354413106802
+      }
+    },
+    "restore_receipt": false,
+    "restore_followup": "All 24 policy values matched saved originals on live readback at 11:05 UTC; immediate sysfs readback receipt was false."
+  }
+}
