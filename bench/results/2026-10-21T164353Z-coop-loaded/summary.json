@@ -1,0 +1,120 @@
+{
+  "date_utc": "2026-10-21",
+  "fixed_decode": {
+    "classification": "fixed short-chat decode; sum of per-stream rates, not agent replay",
+    "protocol": "400 tokens, ignored EOS, temperature0, seed15, 1warmup+3measured batches",
+    "fixed": {
+      "1": {
+        "aggregate_decode_tok_s": 72.71831259486734,
+        "per_stream_decode_tok_s": 72.71831259486734,
+        "ttft_median_s": 0.265718936920166
+      },
+      "4": {
+        "aggregate_decode_tok_s": 127.3138256231767,
+        "per_stream_decode_tok_s": 31.828456405794174,
+        "ttft_median_s": 0.46475207805633545
+      },
+      "8": {
+        "aggregate_decode_tok_s": 171.11005425876965,
+        "per_stream_decode_tok_s": 21.388756782346206,
+        "ttft_median_s": 0.7794595956802368
+      }
+    }
+  },
+  "agent": {
+    "label": "coop-r2",
+    "requests": 73,
+    "failed": 0,
+    "span_s": 347.9,
+    "gen_tokens": 51809,
+    "aggregate_tok_s": 148.9,
+    "decode_median": 29.8,
+    "decode_clean_median": 41.0,
+    "decode_mixed_median": 29.7,
+    "mixed_share": 0.986,
+    "ttft_median_s": 1.608,
+    "ttft_p90_s": 11.871,
+    "ttft_max_s": 50.326,
+    "streams_mean": 6.35,
+    "prompt_tokens_median": 13090,
+    "tag": "coop-r2",
+    "batched": 2048,
+    "tc_prefill_rows": 2048,
+    "comparison_reference_tok_s": 141.9,
+    "aggregate_change_pct": 4.93,
+    "classification": "screen result; no daily promotion"
+  },
+  "prefill": {
+    "status": "COMPLETED",
+    "elapsed_s": 113.80934970199996,
+    "interpretation": "Input tokens / client TTFT and aggregate batch first-output span are end-to-end proxies including HTTP, tokenization, scheduling, queueing, prefill and first decode. Not pure kernel prefill.",
+    "points": [
+      {
+        "target_text_tokens": 2048,
+        "concurrency": 1,
+        "status": "COLD",
+        "prompt_tokens_total": 2051,
+        "actual_prompt_tokens_min": 2051,
+        "actual_prompt_tokens_max": 2051,
+        "aggregate_input_tok_s_e2e_proxy": 980.2171504158705,
+        "ttft_median_s": 2.0923935060000076,
+        "server_prefill_input_tok_s_per_request_time_normalized": 986.8682698457956
+      },
+      {
+        "target_text_tokens": 2048,
+        "concurrency": 4,
+        "status": "COLD",
+        "prompt_tokens_total": 8200,
+        "actual_prompt_tokens_min": 2050,
+        "actual_prompt_tokens_max": 2050,
+        "aggregate_input_tok_s_e2e_proxy": 1133.363679560452,
+        "ttft_median_s": 6.291586246999941,
+        "server_prefill_input_tok_s_per_request_time_normalized": 571.5655268135039
+      },
+      {
+        "target_text_tokens": 2048,
+        "concurrency": 8,
+        "status": "COLD",
+        "prompt_tokens_total": 16401,
+        "actual_prompt_tokens_min": 2050,
+        "actual_prompt_tokens_max": 2051,
+        "aggregate_input_tok_s_e2e_proxy": 1155.0079721578086,
+        "ttft_median_s": 9.750585067499742,
+        "server_prefill_input_tok_s_per_request_time_normalized": 464.4853194266804
+      },
+      {
+        "target_text_tokens": 8192,
+        "concurrency": 1,
+        "status": "COLD",
+        "prompt_tokens_total": 8196,
+        "actual_prompt_tokens_min": 8196,
+        "actual_prompt_tokens_max": 8196,
+        "aggregate_input_tok_s_e2e_proxy": 1167.9800459301598,
+        "ttft_median_s": 7.017243170000256,
+        "server_prefill_input_tok_s_per_request_time_normalized": 1174.2331182612045
+      },
+      {
+        "target_text_tokens": 8192,
+        "concurrency": 4,
+        "status": "COLD",
+        "prompt_tokens_total": 32781,
+        "actual_prompt_tokens_min": 8195,
+        "actual_prompt_tokens_max": 8196,
+        "aggregate_input_tok_s_e2e_proxy": 1190.8375705347257,
+        "ttft_median_s": 18.9378192424997,
+        "server_prefill_input_tok_s_per_request_time_normalized": 867.5635066266254
+      },
+      {
+        "target_text_tokens": 8192,
+        "concurrency": 8,
+        "status": "COLD",
+        "prompt_tokens_total": 65564,
+        "actual_prompt_tokens_min": 8195,
+        "actual_prompt_tokens_max": 8196,
+        "aggregate_input_tok_s_e2e_proxy": 1200.46429311827,
+        "ttft_median_s": 32.47542783049994,
+        "server_prefill_input_tok_s_per_request_time_normalized": 835.7410285095947
+      }
+    ]
+  }
+}

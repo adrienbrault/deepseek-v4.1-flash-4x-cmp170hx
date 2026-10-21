@@ -1,0 +1,5 @@
+Measured2026-10-21 on four CMP170HX GPUs, EPYC7401P, TP4 DSparkK5, TC-MoE prefill+v2, batch2048, OMP2, loader-r2, early coop dispatch and fused preparation. Hybrid weights use two970EVOPlus SSDs in RAID0; Engram remains on a separate970EVOPlus. The same loaded container served all three screens.
+
+Agent throughput148.9tok/s is effectively tied with earlier best148.7; no robust throughput win established. Fixed short-chat decode c1/c4/c8 was72.7/127.3/171.1tok/s aggregate, versus earlier72.7/135.7/182.2. One excluded warmup and three measured400-token batches; ignored EOS, temperature0, seed15. Fixed aggregate sums stream decode rates and differs from agent wall-time throughput.
+
+Prefill uses approximately2k/8k fresh synthetic inputs at c1/c4/c8, exact usage counts, thinking off and one output token. Every request reported zero cached tokens. Aggregate input rates980/1133/1155 and1168/1191/1201tok/s include HTTP, queueing, prefill and first decode. Single batch per point; not kernel throughput. Server request-time-normalized rates are separate and not aggregate. Six Linux HTTP/SSE/cache/metrics/deadline tests passed for the helper. No daily promotion.
