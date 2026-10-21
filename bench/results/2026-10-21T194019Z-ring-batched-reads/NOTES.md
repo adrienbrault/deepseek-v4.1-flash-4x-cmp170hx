@@ -1,0 +1,9 @@
+# Ring and batched Engram reads screen
+
+Measured2026-10-21UTC, results directory `2026-10-21T194019Z-ring-batched-reads`. DeepSeek-V4.1-Flash-1017 EXL3, four CMP170HX, TP4, DSparkK5, TC prefill and v2, OMP2, batch2048, scratch cap2048, strided loader bounce, RAID Engram, ring enabled and batched Engram reads for every row count. Image digest `sha256:52407a561be7ea3e75bc5a1c4734f576edbd191d04e5063d04101a75044b952a`. This is an experiment; no served configuration is selected.
+
+Fixed chat decode uses400output tokens, ignored EOS, temperature0, seed15, one excluded warmup and three measured batches at each concurrency. Direct sums of stream rates are78.795/142.695/181.470tok/s at c1/c4/c8; corresponding per-stream means78.795/35.674/22.684. TTFT and individual request receipts are in the fixed files.
+
+The growing-agent replay uses10respawning sessions, seed1, temperature0.6, sampled output lengths,240scored seconds and drain. It completed78requests with0failures,162.2aggregate tok/s and mean6.33decoding streams. This aggregate divides generated tokens by the full341second request span and differs from fixed decode. The earlier ring-on screen was157.2tok/s with Engram on a different SSD; the RAID ring-off screen was147.5. These sequential comparisons do not isolate each flag or establish repeatability.
+
+Fresh input uses synthetic random-leading text, thinking disabled, max_tokens1 and one batch per point. All requests reported zero cached tokens. End-to-end aggregate input rates at c1/c4/c8 are1058.3/1256.8/1300.4inputtok/s for approximately2k input, and1321.3/1353.6/1367.6 for approximately8k. Rates divide exact total batch input tokens by submit-to-last-first-output time, including HTTP, tokenization, queueing, prefill and first decode. Random inputs and page-cache history limit attribution; these are not GPU kernel rates.

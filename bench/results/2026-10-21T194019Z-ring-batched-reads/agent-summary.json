@@ -1,0 +1,17 @@
+{
+ "label": "ring-rowstore-r1",
+ "requests": 78,
+ "failed": 0,
+ "span_s": 341.0,
+ "gen_tokens": 55320,
+ "aggregate_tok_s": 162.2,
+ "decode_median": 31.4,
+ "decode_clean_median": 47.7,
+ "decode_mixed_median": 31.4,
+ "mixed_share": 0.987,
+ "ttft_median_s": 1.426,
+ "ttft_p90_s": 9.036,
+ "ttft_max_s": 48.415,
+ "streams_mean": 6.33,
+ "prompt_tokens_median": 13923.5
+}

@@ -1,0 +1,68 @@
+{
+  "classification": "sequential compound ring+batch-read screen against preceding ring-OFF RAID control; no promotion",
+  "agent_tok_s": 162.2,
+  "agent_reference_tok_s": 147.5,
+  "agent_change_pct": 9.97,
+  "fixed": {
+    "1": {
+      "candidate": 78.79452630511169,
+      "reference": 70.7834495785394,
+      "change_pct": 11.32
+    },
+    "4": {
+      "candidate": 142.69461838172504,
+      "reference": 126.57567147628008,
+      "change_pct": 12.73
+    },
+    "8": {
+      "candidate": 181.46978679350462,
+      "reference": 173.06702349148838,
+      "change_pct": 4.86
+    }
+  },
+  "prefill": [
+    {
+      "target_text_tokens": 2048,
+      "concurrency": 1,
+      "status": "COLD",
+      "prompt_tokens_total": 2050,
+      "aggregate_input_tok_s_e2e_proxy": 1058.3289710989675
+    },
+    {
+      "target_text_tokens": 2048,
+      "concurrency": 4,
+      "status": "COLD",
+      "prompt_tokens_total": 8200,
+      "aggregate_input_tok_s_e2e_proxy": 1256.7773097735833
+    },
+    {
+      "target_text_tokens": 2048,
+      "concurrency": 8,
+      "status": "COLD",
+      "prompt_tokens_total": 16400,
+      "aggregate_input_tok_s_e2e_proxy": 1300.3924219744706
+    },
+    {
+      "target_text_tokens": 8192,
+      "concurrency": 1,
+      "status": "COLD",
+      "prompt_tokens_total": 8195,
+      "aggregate_input_tok_s_e2e_proxy": 1321.3354747932083
+    },
+    {
+      "target_text_tokens": 8192,
+      "concurrency": 4,
+      "status": "COLD",
+      "prompt_tokens_total": 32782,
+      "aggregate_input_tok_s_e2e_proxy": 1353.6354150607979
+    },
+    {
+      "target_text_tokens": 8192,
+      "concurrency": 8,
+      "status": "COLD",
+      "prompt_tokens_total": 65566,
+      "aggregate_input_tok_s_e2e_proxy": 1367.5921700850506
+    }
+  ],
+  "limitations": "One sequential screen per configuration. Fresh random-input batches and cache history confound prefill comparisons. Compound screen changes ring and batched read policy; individual contributions are not isolated. End-to-end input throughput includes queueing and first decode; fixed rates sum per-stream rates."
+}
