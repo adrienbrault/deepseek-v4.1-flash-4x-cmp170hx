@@ -1,6 +1,6 @@
 {
   "date_utc": "2026-10-21",
-  "status": "integration control and TC-MoE prefill complete; served-image comparison running",
+  "status": "initial comparison and served-image reference complete; TC v2 running",
   "image_id": "sha256:cae174260cb6d6c9ab113ecb9db179bf20180662e4e16860252f9b8000bdb916",
   "serial": {
     "75k": {
@@ -38,7 +38,24 @@
         "first_ttft_s": 79.18,
         "warm_ttft_median_s": 0.7
       },
-      "change_pct": -5.4
+      "change_pct": -5.4,
+      "served-r7": {
+        "decode_mean_tok_s": 51.95,
+        "prompt_tokens": [
+          81484,
+          81476,
+          81475,
+          81482
+        ],
+        "completion_tokens": [
+          1500,
+          1500,
+          1500,
+          1500
+        ],
+        "first_ttft_s": 97.17,
+        "warm_ttft_median_s": 0.83
+      }
     },
     "3k": {
       "base": {
@@ -71,7 +88,22 @@
         "first_ttft_s": 0.4,
         "warm_ttft_median_s": 0.38
       },
-      "change_pct": -10.85
+      "change_pct": -10.85,
+      "served-r7": {
+        "decode_mean_tok_s": 51.733,
+        "prompt_tokens": [
+          2767,
+          2759,
+          2758
+        ],
+        "completion_tokens": [
+          1500,
+          1500,
+          1500
+        ],
+        "first_ttft_s": 0.54,
+        "warm_ttft_median_s": 0.53
+      }
     }
   },
   "agent": {
@@ -108,6 +140,23 @@
       "ttft_max_s": 71.66,
       "streams_mean": 6.5,
       "prompt_tokens_median": 12228
+    },
+    "served-r7": {
+      "label": "base",
+      "requests": 51,
+      "failed": 0,
+      "span_s": 348.6,
+      "gen_tokens": 36909,
+      "aggregate_tok_s": 105.9,
+      "decode_median": 21.1,
+      "decode_clean_median": 59.8,
+      "decode_mixed_median": 20.9,
+      "mixed_share": 0.98,
+      "ttft_median_s": 3.761,
+      "ttft_p90_s": 25.034,
+      "ttft_max_s": 79.549,
+      "streams_mean": 6.49,
+      "prompt_tokens_median": 11204
     }
   },
   "serving_check": {
@@ -147,5 +196,6 @@
       "answer": "Red",
       "pass": true
     }
-  }
+  },
+  "served_image_id": "sha256:02590ee3fa3490483cb9038c9a2ddbd8b87414625b7382fe60f2bad3c2f3266b"
 }

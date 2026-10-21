@@ -1,0 +1,16 @@
+{
+  "prefix": {
+    "cold_s": 21.58,
+    "warm_s": 0.941,
+    "prompt_tokens": 12618,
+    "cached_tokens": 12544,
+    "same_text": false,
+    "answer": "Sensor 4 read 481 at minute 599 \u2014 that is the highest among the sensors listed for that minute.",
+    "cached_answer": "Sensor 4 read 481 at minute 599 \u2014 the highest among the sensors listed for that minute.",
+    "cache_reporting_pass": true
+  },
+  "vision": {
+    "answer": "Red",
+    "pass": true
+  }
+}
