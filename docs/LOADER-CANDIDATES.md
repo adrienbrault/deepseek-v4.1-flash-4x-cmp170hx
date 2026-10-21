@@ -15,3 +15,8 @@ The candidate image ID is `sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7c
 
 
 `scripts/build-loader-candidate.py` reproduces the child from the pinned parent image and the numbered patches. Set `DSV41_CACHE_DIR` to the persistent parent cache directory before running it. It checks both source-file hashes before applying either patch and records the child image ID and file hashes in its output manifest. Compiler-cache reuse is limited to this child, whose only filesystem changes are the two loading-only Python modules.
+
+
+## 2026-10-21 hardware screen
+
+The combined allocation-aware reclaim and DSpark file filter reduced total model loading from280.956 to246.656seconds (12.2%), including header selection overhead. Six answers, vision and prefix-cache reporting passed. Fixed decode and the growing-agent replay establish no serving-speed improvement. Workloads, samplers, concurrency and caveats are recorded in `bench/results/2026-10-21T120933Z-dsv41-loader/NOTES.md`; no daily promotion is implied.

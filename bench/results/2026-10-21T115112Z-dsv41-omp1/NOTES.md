@@ -1,0 +1,7 @@
+# One-thread load and agent screen
+
+Measured on 2026-10-21 in `2026-10-21T115112Z-dsv41-omp1`, image `dsv41:int-r17`, TP4 DSpark K5, TC prefill+v2, sparse/indexer off, OMP_NUM_THREADS=1. The startup has no generation workload or sampler. Model loading took 293.91 seconds versus 280.96 for the two-thread reference, 4.6% slower. Main and draft iterators took 215.76 and 26.79 seconds. Readiness was observed at 11:58:49 UTC from a launch at 11:51:14 UTC; that total includes a one-time common-preflight invalidation and is not attributed to thread count. Six known answers, vision and prefix-cache reporting passed.
+
+The same loaded model then ran the frozen growing-agent replay with ten sessions, seeded workload, 10-second think time, a 240-second scored submission window and up to 90 seconds of drain, workload-selected output lengths and temperature 0.6. The result was 65 requests, zero failures, 130.1 aggregate tok/s versus 139.3 for the retained two-thread base (−6.6%). Median decode beside prefill was 24.8 versus 28.0 tok/s, TTFT median/p90 2.254/14.577 seconds, mean overlap 6.49 streams. The two-thread configuration is retained after this single sequential screen. The sampled OpenMP barrier cost did not imply that removing the second thread would improve the whole load.
+
+Retain two threads for the next candidate. The replay completed at 12:09:32 UTC and the queued loading-only patch screen started at 12:09:33 UTC without restoring the other model.

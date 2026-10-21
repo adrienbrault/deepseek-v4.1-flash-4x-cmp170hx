@@ -1,0 +1,17 @@
+{
+ "label": "tc-v2-omp1",
+ "requests": 65,
+ "failed": 0,
+ "span_s": 354.5,
+ "gen_tokens": 46125,
+ "aggregate_tok_s": 130.1,
+ "decode_median": 25.1,
+ "decode_clean_median": 48.2,
+ "decode_mixed_median": 24.8,
+ "mixed_share": 0.985,
+ "ttft_median_s": 2.254,
+ "ttft_p90_s": 14.577,
+ "ttft_max_s": 63.99,
+ "streams_mean": 6.49,
+ "prompt_tokens_median": 12743
+}

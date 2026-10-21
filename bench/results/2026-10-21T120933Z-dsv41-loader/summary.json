@@ -1,0 +1,59 @@
+{
+  "date_utc": "2026-10-21",
+  "image": "dsv41:loader-r1",
+  "image_id": "sha256:e160ba8946628acd473e887f8d8c662cd25ad6c9d15e7cd39eadab7be62d1a31",
+  "configuration": "TP4 DSpark K5, TC prefill+v2, sparse/indexer off, OMP2, allocation-aware reclaim and draft-file filter enabled",
+  "model_load_ranks_s": [
+    244.199623,
+    244.383274,
+    244.835703,
+    246.655599
+  ],
+  "model_load_s": 246.655599,
+  "reference_model_load_s": 280.956165,
+  "saved_s": 34.300566,
+  "reduction_pct": 12.209,
+  "main_iterator_s": 190.76,
+  "draft_iterator_s": 4.57,
+  "reference_main_iterator_s": 202.36,
+  "reference_draft_iterator_s": 27.97,
+  "draft_files_skipped": 85,
+  "draft_files_total": 88,
+  "boot_ready_s": 434,
+  "common_preflight_s": 70.432,
+  "engine_init_s": 31.48,
+  "agent": {
+    "label": "tc-v2-loader",
+    "requests": 66,
+    "failed": 0,
+    "span_s": 354.8,
+    "gen_tokens": 48661,
+    "aggregate_tok_s": 137.2,
+    "decode_median": 25.6,
+    "decode_clean_median": 35.7,
+    "decode_mixed_median": 25.2,
+    "mixed_share": 0.985,
+    "ttft_median_s": 2.707,
+    "ttft_p90_s": 14.504,
+    "ttft_max_s": 64.225,
+    "streams_mean": 6.46,
+    "prompt_tokens_median": 12742.5
+  },
+  "fixed": {
+    "1": {
+      "measured_batches": 3,
+      "aggregate_decode_tok_s": 73.1690939014275,
+      "per_stream_mean_tok_s": 73.1690939014275
+    },
+    "4": {
+      "measured_batches": 3,
+      "aggregate_decode_tok_s": 131.65022724916815,
+      "per_stream_mean_tok_s": 32.91255681229204
+    },
+    "8": {
+      "measured_batches": 3,
+      "aggregate_decode_tok_s": 177.95442236328932,
+      "per_stream_mean_tok_s": 22.244302795411166
+    }
+  }
+}

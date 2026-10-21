@@ -1,0 +1,17 @@
+{
+ "label": "tc-v2-loader",
+ "requests": 66,
+ "failed": 0,
+ "span_s": 354.8,
+ "gen_tokens": 48661,
+ "aggregate_tok_s": 137.2,
+ "decode_median": 25.6,
+ "decode_clean_median": 35.7,
+ "decode_mixed_median": 25.2,
+ "mixed_share": 0.985,
+ "ttft_median_s": 2.707,
+ "ttft_p90_s": 14.504,
+ "ttft_max_s": 64.225,
+ "streams_mean": 6.46,
+ "prompt_tokens_median": 12742.5
+}
