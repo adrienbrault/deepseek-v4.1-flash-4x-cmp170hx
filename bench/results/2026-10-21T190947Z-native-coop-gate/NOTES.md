@@ -1,0 +1,7 @@
+# Native coop kernel screen,2026-10-21
+
+Results directory `2026-10-21T190947Z-native-coop-gate`. One CMP170HX, Torch2.14.0+cu130, exact accepted loader-r2 native extension and a separately built default-off sidecar. This ports branch-free loops, MMA operand swap and aligned512-column down reduction from the pinned GNmac work;640-wide intermediates retain the stock128-column geometry. TC precedence and stock fallback remain. The real5-translation-unit build/link/import ran on an amd64 CPU container in72.73s; no GPU compilation time.
+
+All73 synthetic cases passed in23.62s: K2/3/4, three codebooks, intermediate512/640, rows1/6/24/42 plus shared merge. Same quantized weights/routing compare stock and candidate; changed inputs, inactive/repeated routing, poisoned intermediates, stream ordering and graph replays are included. StageA/swap128 and640 geometry require byte equality;512-wide output differences use the declared case-wide FP32 rounding screen and unchanged dense-reference guard. Maximum observed512 difference0.0007324 and normalized1.30e-7; this bound is experimental and case-wide, not a per-element numerical proof.
+
+For the checkpoint's mul1 codebook, paired CUDA-graph kernel speedups at6rows were1.09–1.13x for512 intermediates and1.14–1.18x for640; at24rows1.34–1.39x and1.13–1.17x. Synthetic weights, fixed shapes and repeated graphs are not model throughput. Full V2 correctness, vision/cache checks and agent/fixed/prefill model comparison remain required. No serving gain or daily promotion follows from this receipt.

@@ -1,0 +1,5 @@
+# NCCL protocol screen,2026-10-21
+
+Results directory `2026-10-21T191019Z-nccl-protocol`. Four CMP170HX, accepted immutable image, installed direct PyNcclCommunicator, BF16 hidden5120, rows6/24/48/128/512/2048. Automatic/Simple/LL128 run in balanced fresh-process order A/B/C/C/B/A. Each shape checks exact integer and bounded fractional references, changed inputs, rank skew, eager calls and graphs on an owned nondefault stream before five timing repeats. CUDA event latency uses the maximum across all four ranks,31operations per sample. This is a synthetic collective comparison, not serving tok/s.
+
+All36 cases across six protocol runs passed in148.8s, with owned-container cleanup proved. Simple graph speedups over automatic at128/512/2048rows were1.008/1.005/0.998x; LL1280.982/0.945/0.938x. No larger-payload gain supports a full model boot. LL128 improved6rows1.126x synthetically, while actual small model all-reduces use FlashInfer; this does not establish a decode gain. Keep automatic NCCL selection for subsequent experiments. No model flags or daily configuration changed.
