@@ -1,0 +1,17 @@
+{
+ "label": "cpu-numa-local",
+ "requests": 79,
+ "failed": 0,
+ "span_s": 345.7,
+ "gen_tokens": 54245,
+ "aggregate_tok_s": 156.9,
+ "decode_median": 27.5,
+ "decode_clean_median": 31.5,
+ "decode_mixed_median": 27.4,
+ "mixed_share": 0.962,
+ "ttft_median_s": 1.309,
+ "ttft_p90_s": 6.258,
+ "ttft_max_s": 12.371,
+ "streams_mean": 6.45,
+ "prompt_tokens_median": 14200
+}

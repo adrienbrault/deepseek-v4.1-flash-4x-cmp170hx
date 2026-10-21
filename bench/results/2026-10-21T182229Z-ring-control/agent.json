@@ -1,0 +1,17 @@
+{
+ "label": "ring-control-r1",
+ "requests": 72,
+ "failed": 0,
+ "span_s": 347.3,
+ "gen_tokens": 51739,
+ "aggregate_tok_s": 149.0,
+ "decode_median": 29.8,
+ "decode_clean_median": 58.1,
+ "decode_mixed_median": 29.7,
+ "mixed_share": 0.986,
+ "ttft_median_s": 1.447,
+ "ttft_p90_s": 12.099,
+ "ttft_max_s": 52.655,
+ "streams_mean": 6.32,
+ "prompt_tokens_median": 13076.0
+}
