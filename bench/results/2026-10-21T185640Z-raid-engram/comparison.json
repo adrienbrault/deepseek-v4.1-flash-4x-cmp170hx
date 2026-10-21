@@ -1,0 +1,69 @@
+{
+  "classification": "sequential same-image storage-placement screen; one fresh batch per prefill point; not a causal confidence interval",
+  "agent": {
+    "old_ssd_tok_s": 149.0,
+    "raid_tok_s": 147.5,
+    "change_pct": -1.0067114093959773
+  },
+  "fixed": {
+    "1": {
+      "old_ssd": 69.66653299735475,
+      "raid": 70.7834495785394,
+      "change_pct": 1.6032326184899581
+    },
+    "4": {
+      "old_ssd": 125.2938983341692,
+      "raid": 126.57567147628008,
+      "change_pct": 1.0230132186423768
+    },
+    "8": {
+      "old_ssd": 173.62877493310594,
+      "raid": 173.06702349148838,
+      "change_pct": -0.32353591265847914
+    }
+  },
+  "prefill": [
+    {
+      "target": 2048,
+      "concurrency": 1,
+      "old_ssd": 998.9224234000443,
+      "raid": 1095.5682715725236,
+      "change_pct": 9.67501038203995
+    },
+    {
+      "target": 2048,
+      "concurrency": 4,
+      "old_ssd": 1030.773827281726,
+      "raid": 1174.9058683247715,
+      "change_pct": 13.982896851692384
+    },
+    {
+      "target": 2048,
+      "concurrency": 8,
+      "old_ssd": 1046.9668746993852,
+      "raid": 1203.2627731460764,
+      "change_pct": 14.928447329488638
+    },
+    {
+      "target": 8192,
+      "concurrency": 1,
+      "old_ssd": 1071.6083605717056,
+      "raid": 1215.8294538354614,
+      "change_pct": 13.458377012550882
+    },
+    {
+      "target": 8192,
+      "concurrency": 4,
+      "old_ssd": 1082.7991113636685,
+      "raid": 1232.6657745953974,
+      "change_pct": 13.840671058825293
+    },
+    {
+      "target": 8192,
+      "concurrency": 8,
+      "old_ssd": 1087.5691212675395,
+      "raid": 1243.1872211854168,
+      "change_pct": 14.308800872951188
+    }
+  ]
+}

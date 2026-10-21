@@ -1,0 +1,17 @@
+{
+ "label": "ring-raid-control-r1",
+ "requests": 72,
+ "failed": 0,
+ "span_s": 346.0,
+ "gen_tokens": 51044,
+ "aggregate_tok_s": 147.5,
+ "decode_median": 28.9,
+ "decode_clean_median": 41.0,
+ "decode_mixed_median": 28.7,
+ "mixed_share": 0.958,
+ "ttft_median_s": 1.608,
+ "ttft_p90_s": 10.504,
+ "ttft_max_s": 51.368,
+ "streams_mean": 6.44,
+ "prompt_tokens_median": 13075.5
+}
