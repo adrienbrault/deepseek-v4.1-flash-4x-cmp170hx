@@ -22,3 +22,6 @@ Startup validation on 2026-10-21 completed with the unchanged TP4 DSpark K5 TC p
 ## Attributing model load time
 
 `bench/boot-telemetry.sh` records disk I/O, per-process CPU/I/O and per-card PCIe transfers at one-second intervals. A supervising screen stops the collector before correctness and performance probes. `bench/test-boot-telemetry.sh` checks that observer termination stops and reaps every collector; it passed on Linux. The current load attribution run combines telemetry with the prefill-indexer reuse and fused-postprocessing candidate so that it does not require a separate reload. Disk bandwidth, CPU activity and PCIe counters must be aligned with weight-loading stages before attributing the bottleneck.
+
+
+Weight-load counters on 2026-10-21 found four loader workers near one CPU core each, main-pass NVMe bandwidth of 1.027 GB/s with bursts to 2.118 GB/s, and per-card PCIe receive of 268–278 MB/s. A native CPU sample identified Python, kernel memory handling and OpenMP barriers as substantial costs. The next experiment exposes `DSV41_OMP_THREADS` (default 2, test 1; integers 1–8 accepted) to select the container OMP_NUM_THREADS setting. It changes the host-thread setting, leaves model flags intact, and requires runtime validation. Full method and limitations: `bench/results/2026-10-21T113641Z-dsv41-indexer/NOTES.md`.

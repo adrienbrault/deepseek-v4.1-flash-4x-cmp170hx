@@ -1,0 +1,145 @@
+{
+  "date_utc": "2026-10-21",
+  "measurement": "one-second counters; disk sample times inferred from collector start (approximately one-second alignment)",
+  "model_load_reported_s": 280.956165,
+  "phases": {
+    "whole_model_load": {
+      "duration_s": 280.0,
+      "utc_start": "2026-10-21T11:37:35+00:00",
+      "disk_samples": 281,
+      "disk_read_GB": 227.85899809792002,
+      "disk_read_mean_MB_s": 810.8861142274733,
+      "disk_read_max_MB_s": 2117.627904,
+      "disk_r_await_mean_ms": 0.27227758007117436,
+      "disk_util_mean_pct": 32.26078291814947,
+      "disk_queue_mean": 2.1323843416370107,
+      "worker_cpu_mean_pct": 97.95650355871886,
+      "worker_usr_mean_pct": 70.78522241992883,
+      "worker_system_mean_pct": 27.171281138790036,
+      "worker_minor_fault_mean_s": 17831.315711743773,
+      "worker_major_fault_mean_s": 915.4905427046264,
+      "pcie_by_gpu": {
+        "0": {
+          "rx_mean_MB_s": 207.16666666666666,
+          "rx_max_MB_s": 1484.0,
+          "tx_mean_MB_s": 32.40416666666667
+        },
+        "1": {
+          "rx_mean_MB_s": 205.625,
+          "rx_max_MB_s": 1408.0,
+          "tx_mean_MB_s": 32.420833333333334
+        },
+        "2": {
+          "rx_mean_MB_s": 212.6,
+          "rx_max_MB_s": 1427.0,
+          "tx_mean_MB_s": 31.3375
+        },
+        "3": {
+          "rx_mean_MB_s": 213.20833333333334,
+          "rx_max_MB_s": 1484.0,
+          "tx_mean_MB_s": 32.954166666666666
+        }
+      }
+    },
+    "weight_iterator_1": {
+      "duration_s": 202.35999989509583,
+      "utc_start": "2026-10-21T11:37:48.640000+00:00",
+      "disk_samples": 203,
+      "disk_read_GB": 208.542711808,
+      "disk_read_mean_MB_s": 1027.3039990541872,
+      "disk_read_max_MB_s": 2117.627904,
+      "disk_r_await_mean_ms": 0.15384236453201972,
+      "disk_util_mean_pct": 39.100985221674875,
+      "disk_queue_mean": 2.450591133004926,
+      "worker_cpu_mean_pct": 98.94348522167488,
+      "worker_usr_mean_pct": 66.57831280788177,
+      "worker_system_mean_pct": 32.365172413793104,
+      "worker_minor_fault_mean_s": 15325.94933497537,
+      "worker_major_fault_mean_s": 1089.0263177339903,
+      "pcie_by_gpu": {
+        "0": {
+          "rx_mean_MB_s": 268.59537572254334,
+          "rx_max_MB_s": 767.0,
+          "tx_mean_MB_s": 32.02312138728324
+        },
+        "1": {
+          "rx_mean_MB_s": 268.0982658959538,
+          "rx_max_MB_s": 808.0,
+          "tx_mean_MB_s": 32.3121387283237
+        },
+        "2": {
+          "rx_mean_MB_s": 276.60115606936415,
+          "rx_max_MB_s": 862.0,
+          "tx_mean_MB_s": 30.67630057803468
+        },
+        "3": {
+          "rx_mean_MB_s": 277.67630057803467,
+          "rx_max_MB_s": 1093.0,
+          "tx_mean_MB_s": 32.872832369942195
+        }
+      }
+    },
+    "weight_iterator_2": {
+      "duration_s": 27.97000002861023,
+      "utc_start": "2026-10-21T11:41:42.030000+00:00",
+      "disk_samples": 28,
+      "disk_read_GB": 17.04903969792,
+      "disk_read_mean_MB_s": 608.8942749257143,
+      "disk_read_max_MB_s": 1481.46176,
+      "disk_r_await_mean_ms": 0.1707142857142857,
+      "disk_util_mean_pct": 32.56357142857143,
+      "disk_queue_mean": 3.523214285714286,
+      "worker_cpu_mean_pct": 88.02678571428571,
+      "worker_usr_mean_pct": 61.69642857142857,
+      "worker_system_mean_pct": 26.330357142857142,
+      "worker_minor_fault_mean_s": 9299.17857142857,
+      "worker_major_fault_mean_s": 1212.875,
+      "pcie_by_gpu": {
+        "0": {
+          "rx_mean_MB_s": 70.29166666666667,
+          "rx_max_MB_s": 452.0,
+          "tx_mean_MB_s": 8.041666666666666
+        },
+        "1": {
+          "rx_mean_MB_s": 61.625,
+          "rx_max_MB_s": 415.0,
+          "tx_mean_MB_s": 7.916666666666667
+        },
+        "2": {
+          "rx_mean_MB_s": 70.79166666666667,
+          "rx_max_MB_s": 492.0,
+          "tx_mean_MB_s": 7.875
+        },
+        "3": {
+          "rx_mean_MB_s": 65.08333333333333,
+          "rx_max_MB_s": 441.0,
+          "tx_mean_MB_s": 8.208333333333334
+        }
+      }
+    }
+  },
+  "native_sample_cpu_percent_by_dso": {
+    "[kernel.kallsyms]": 30.319999999999897,
+    "python3.12": 30.259999999999877,
+    "libgomp.so.1": 16.33,
+    "libtorch_cpu.so": 10.259999999999968,
+    "libc.so.6": 2.160000000000001,
+    "libtorch_python.so": 2.0800000000000014,
+    "libcuda.so.615.71.09": 2.0600000000000014,
+    "libc10.so": 1.610000000000001,
+    "_regex.cpython-312-x86_64-linux-gnu.so": 1.21,
+    "_safetensors_rust.abi3.so": 0.5500000000000002,
+    "ld-linux-x86-64.so.2": 0.5300000000000001,
+    "libc10_cuda.so": 0.3400000000000001,
+    "libstdc++.so.6.0.33": 0.33000000000000007,
+    "libcudart.so.13": 0.31,
+    "libtorch_cuda.so": 0.13,
+    "_ctypes.cpython-312-x86_64-linux-gnu.so": 0.08,
+    "libcufile.so.0": 0.06,
+    "libffi.so.8.1.4": 0.06,
+    "[vdso]": 0.04,
+    "libucm-f6ca5dec.so.0.0.0": 0.02,
+    "libtorch.so": 0.02,
+    "libnccl.so.2": 0.0
+  }
+}
