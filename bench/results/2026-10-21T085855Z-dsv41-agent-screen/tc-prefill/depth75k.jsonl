@@ -1,0 +1,4 @@
+{"q": 0, "prompt_tokens": 81484, "completion_tokens": 1500, "ttft_s": 79.18, "decode_tok_s": 47.9}
+{"q": 1, "prompt_tokens": 81476, "completion_tokens": 1500, "ttft_s": 0.7, "decode_tok_s": 58.6}
+{"q": 2, "prompt_tokens": 81475, "completion_tokens": 1500, "ttft_s": 0.68, "decode_tok_s": 53.1}
+{"q": 3, "prompt_tokens": 81482, "completion_tokens": 1500, "ttft_s": 0.72, "decode_tok_s": 43.5}

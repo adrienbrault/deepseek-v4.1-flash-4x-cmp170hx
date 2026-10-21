@@ -1,6 +1,6 @@
 # DeepSeek agent screen, 2026-10-21 UTC
 
-Results directory: `2026-10-21T085855Z-dsv41-agent-screen`. Status: integration control complete; TC-MoE prefill running; previously served image comparison queued. No serving promotion follows these measurements.
+Results directory: `2026-10-21T085855Z-dsv41-agent-screen`. Status: integration control and TC-MoE prefill complete; previously served image comparison running. No serving promotion follows these measurements.
 
 The control uses image `sha256:cae174260cb6d6c9ab113ecb9db179bf20180662e4e16860252f9b8000bdb916`, LibertAI hybrid weights, TP4, DSpark K=5, cooperative EXL3 MoE, arenas, async scheduling, NCCL P2P and tuned FlashInfer PCIe IPC. Vision, prefix caching and cached-token reporting are enabled. Limits: 262,144 context tokens, eight request slots, 1,024 batched tokens, 0.95 memory utilization, full and piecewise CUDA graphs. New TC-MoE, overlap, INT8 collective, sparse-decode, distributed-sampling, mHC and adaptive-verification candidates are off in the control; they were not part of the previously served configuration.
 
@@ -11,3 +11,5 @@ The concurrent replay uses ten staggered growing sessions, mean tool delay ten s
 Six known-answer checks passed. The prefix probe reports 12,544 cached tokens out of 12,618, taking 21.113 seconds cold and 0.667 seconds warm; both answers identify sensor 4 and value 481. The generated red-image probe passed. These checks do not qualify the integration image as the daily.
 
 The earlier 76.4 tok/s figure used short prose at concurrency one on the previously served image. Its 32k-context decode was 55.4 tok/s. Comparing either figure directly with this replay’s 21.0 tok/s mixed per-stream median changes both context and concurrency. The identical replay on the previously served image is queued to test the remaining image-regression hypothesis.
+
+TC-MoE prefill completed at 09:44:55 UTC on the same image and settings, changing only the MoE prefill dispatch. All six known answers, vision and cache checks passed. The replay completed 57 requests with zero failures: 119.2 aggregate tok/s (+7.48%), 22.5 mixed per-stream tok/s (+7.14%), TTFT median 3.578 seconds (+8.89%) and p90 20.789 seconds (-22.93%). This is a single sequential comparison. Long-code mean decode was 50.775 tok/s (-5.40%); short-code mean was 53.700 tok/s (-10.85%), with all three short completions reaching 1,500 tokens, unlike the control’s 241-token second completion. Long cold TTFT was 79.18 seconds (-18.51%). The observed concurrent benefit coexists with lower isolated decode; it is not a universal speedup. The user selected prefill-only TC-MoE as the next experiment baseline.

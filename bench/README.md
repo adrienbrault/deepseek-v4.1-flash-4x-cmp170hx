@@ -21,3 +21,10 @@ python3 bench/agent_score.py results/agent.jsonl control --json results/agent-su
 The scorer reports completed tokens divided by the full request span, per-request decode rates, time to first token and observed overlap with other requests’ prefill. Its aggregate includes prefill and the drain period; it is distinct from a sum of concurrent stream decode rates. Synthetic sessions describe arrival shape and cache reuse; they do not evaluate completed coding tasks.
 
 `quality-probe.py 8001` checks six known answers and repetition. `serving-check.py results/serving.json` checks exact-answer prefix reuse, reported cache hits and a generated red image on port 8001. Both fail on unmet checks. Each measurement directory records its model, image identity, runtime settings, sampler and UTC date.
+
+`cpu-clock-screen.py` compares the same loaded model at normal CPU frequency limits and a temporary 1.6 GHz maximum. It alternates three normal and three limited rounds at concurrency one and four, using 400-token raw completions, temperature zero, seed 15 and ignored EOS. It saves each policy’s original maximum before changing it, restores every policy on exit, and records frequency samples and request receipts. Run this on an otherwise unoccupied Linux host with `acpi-cpufreq` and permission to write its frequency policies. A lower-clock comparison measures clock sensitivity; it does not predict the gain from a different CPU architecture.
+
+```bash
+sudo python3 bench/cpu-clock-screen.py --snapshot results/cpu-original.json --out results/cpu-clock.json
+sudo python3 bench/cpu-clock-screen.py --restore results/cpu-original.json
+```
