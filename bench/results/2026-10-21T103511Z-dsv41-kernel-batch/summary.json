@@ -1,0 +1,213 @@
+{
+  "date_utc": "2026-10-21",
+  "image_id": "sha256:cae174260cb6d6c9ab113ecb9db179bf20180662e4e16860252f9b8000bdb916",
+  "overlap": {
+    "overlap-nccl-mixed0": {
+      "all_four_ranks_pass": true,
+      "timings_ms": {
+        "12": {
+          "synthetic_serial_graph": 12.7402392578125,
+          "synthetic_serial_split_graph": 16.35557373046875,
+          "synthetic_tbo_graph": 21.76481201171875,
+          "tbo_vs_unsplit_pct": 70.84,
+          "tbo_vs_serial_split_pct": 33.07
+        },
+        "24": {
+          "synthetic_serial_graph": 22.12810791015625,
+          "synthetic_serial_split_graph": 25.51171142578125,
+          "synthetic_tbo_graph": 35.683984375,
+          "tbo_vs_unsplit_pct": 61.26,
+          "tbo_vs_serial_split_pct": 39.87
+        },
+        "48": {
+          "synthetic_serial_graph": 41.3500634765625,
+          "synthetic_serial_split_graph": 44.3,
+          "synthetic_tbo_graph": 58.8585791015625,
+          "tbo_vs_unsplit_pct": 42.34,
+          "tbo_vs_serial_split_pct": 32.86
+        }
+      }
+    },
+    "overlap-nccl-mixed1": {
+      "all_four_ranks_pass": true,
+      "timings_ms": {
+        "12": {
+          "synthetic_serial_graph": 33.9373876953125,
+          "synthetic_serial_split_graph": 39.6914892578125,
+          "synthetic_tbo_graph": 52.107900390625,
+          "tbo_vs_unsplit_pct": 53.54,
+          "tbo_vs_serial_split_pct": 31.28
+        },
+        "24": {
+          "synthetic_serial_graph": 62.222890625,
+          "synthetic_serial_split_graph": 68.049755859375,
+          "synthetic_tbo_graph": 99.98921875,
+          "tbo_vs_unsplit_pct": 60.7,
+          "tbo_vs_serial_split_pct": 46.94
+        },
+        "48": {
+          "synthetic_serial_graph": 120.00623046875,
+          "synthetic_serial_split_graph": 124.728486328125,
+          "synthetic_tbo_graph": 172.9285546875,
+          "tbo_vs_unsplit_pct": 44.1,
+          "tbo_vs_serial_split_pct": 38.64
+        }
+      }
+    },
+    "overlap-fi-mixed0": {
+      "all_four_ranks_pass": true,
+      "timings_ms": {
+        "12": {
+          "synthetic_serial_graph": 12.183839111328124,
+          "synthetic_serial_split_graph": 14.6511669921875,
+          "synthetic_tbo_graph": 14.23384521484375,
+          "tbo_vs_unsplit_pct": 16.83,
+          "tbo_vs_serial_split_pct": -2.85
+        },
+        "24": {
+          "synthetic_serial_graph": 21.6572314453125,
+          "synthetic_serial_split_graph": 24.37146728515625,
+          "synthetic_tbo_graph": 24.02537353515625,
+          "tbo_vs_unsplit_pct": 10.93,
+          "tbo_vs_serial_split_pct": -1.42
+        },
+        "48": {
+          "synthetic_serial_graph": 40.90525634765625,
+          "synthetic_serial_split_graph": 43.226953125,
+          "synthetic_tbo_graph": 42.858330078125,
+          "tbo_vs_unsplit_pct": 4.77,
+          "tbo_vs_serial_split_pct": -0.85
+        }
+      }
+    },
+    "overlap-fi-mixed1": {
+      "all_four_ranks_pass": true,
+      "timings_ms": {
+        "12": {
+          "synthetic_serial_graph": 33.38659912109375,
+          "synthetic_serial_split_graph": 37.79842041015625,
+          "synthetic_tbo_graph": 47.26263671875,
+          "tbo_vs_unsplit_pct": 41.56,
+          "tbo_vs_serial_split_pct": 25.04
+        },
+        "24": {
+          "synthetic_serial_graph": 61.5754150390625,
+          "synthetic_serial_split_graph": 66.4966162109375,
+          "synthetic_tbo_graph": 87.655732421875,
+          "tbo_vs_unsplit_pct": 42.36,
+          "tbo_vs_serial_split_pct": 31.82
+        },
+        "48": {
+          "synthetic_serial_graph": 120.953037109375,
+          "synthetic_serial_split_graph": 123.247373046875,
+          "synthetic_tbo_graph": 173.07224609375,
+          "tbo_vs_unsplit_pct": 43.09,
+          "tbo_vs_serial_split_pct": 40.43
+        }
+      }
+    }
+  },
+  "sampling": {
+    "status": "PASS",
+    "dspark_step": [
+      {
+        "requests": 1,
+        "verify_rows": 6,
+        "K": 5,
+        "temperature": 0.0,
+        "full_gather": {
+          "max_rank_device_ms": 2.3025662899017334,
+          "max_rank_wall_ms": 2.3036646842956543
+        },
+        "distributed": {
+          "max_rank_device_ms": 4.473569393157959,
+          "max_rank_wall_ms": 4.474856376647949
+        },
+        "saved_device_ms": -2.1710031032562256
+      },
+      {
+        "requests": 1,
+        "verify_rows": 6,
+        "K": 5,
+        "temperature": 0.7,
+        "full_gather": {
+          "max_rank_device_ms": 2.340003728866577,
+          "max_rank_wall_ms": 2.3410634994506836
+        },
+        "distributed": {
+          "max_rank_device_ms": 6.7603254318237305,
+          "max_rank_wall_ms": 6.761535167694092
+        },
+        "saved_device_ms": -4.420321702957153
+      },
+      {
+        "requests": 2,
+        "verify_rows": 12,
+        "K": 5,
+        "temperature": 0.0,
+        "full_gather": {
+          "max_rank_device_ms": 2.9899778366088867,
+          "max_rank_wall_ms": 2.9910290241241455
+        },
+        "distributed": {
+          "max_rank_device_ms": 4.559728622436523,
+          "max_rank_wall_ms": 4.560841083526611
+        },
+        "saved_device_ms": -1.5697507858276367
+      },
+      {
+        "requests": 2,
+        "verify_rows": 12,
+        "K": 5,
+        "temperature": 0.7,
+        "full_gather": {
+          "max_rank_device_ms": 3.0031256675720215,
+          "max_rank_wall_ms": 3.0041589736938477
+        },
+        "distributed": {
+          "max_rank_device_ms": 6.980546474456787,
+          "max_rank_wall_ms": 6.981634140014648
+        },
+        "saved_device_ms": -3.9774208068847656
+      },
+      {
+        "requests": 8,
+        "verify_rows": 48,
+        "K": 5,
+        "temperature": 0.0,
+        "full_gather": {
+          "max_rank_device_ms": 11.033578872680664,
+          "max_rank_wall_ms": 11.034770011901855
+        },
+        "distributed": {
+          "max_rank_device_ms": 4.5807204246521,
+          "max_rank_wall_ms": 4.581717491149902
+        },
+        "saved_device_ms": 6.4528584480285645
+      },
+      {
+        "requests": 8,
+        "verify_rows": 48,
+        "K": 5,
+        "temperature": 0.7,
+        "full_gather": {
+          "max_rank_device_ms": 11.121746063232422,
+          "max_rank_wall_ms": 11.125874519348145
+        },
+        "distributed": {
+          "max_rank_device_ms": 6.950317859649658,
+          "max_rank_wall_ms": 6.9519758224487305
+        },
+        "saved_device_ms": 4.171428203582764
+      }
+    ],
+    "verdict": "slower at c1/c2; saves device time at c8; no global enable without model screen"
+  },
+  "sparse": {
+    "cases": 20,
+    "median_kernel_speedup": 2.549453727158168,
+    "min_kernel_speedup": 1.083456182699254,
+    "max_kernel_speedup": 5.659779061247812,
+    "verdict": "selected for model agent screen; kernel speedup is not model throughput"
+  }
+}

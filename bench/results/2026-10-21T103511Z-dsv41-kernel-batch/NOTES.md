@@ -1,0 +1,9 @@
+# Kernel screen, 2026-10-21 UTC
+
+Results directory: `2026-10-21T103511Z-dsv41-kernel-batch`. No model weights were loaded. The same integration image as the TC screens ran synthetic operator tests, seed policies and graph timing. The first batch ran 10:35:12–10:42:49 UTC; the sampling harness retry completed at 10:43:28 UTC. Every job had a timeout and retained its result independently. This is kernel evidence, not end-to-end token throughput or a serving qualification.
+
+All four repaired TBO variants passed on every rank: NCCL and FlashInfer, each with and without mixed compute-stream collectives. The reference used serial microbatches of matching geometry. At 48 rows with FlashInfer plus mixed collectives, unsplit/split/overlapped graph times were 120.953/123.247/173.072 ms. That workload gives no performance reason for a full model boot of the overlap flag in this screen.
+
+The sampling harness initially failed because its graph-capture call omitted the required device argument. After passing the current CUDA device explicitly, its mathematical checks and benchmark passed. In the synthetic DSpark sampling step, distributed sampling cost 4.474 versus 2.303 ms at c1 greedy, and 6.760 versus 2.340 ms at c1 temperature 0.7. At c8 it saved 6.453 ms greedy and 4.171 ms at temperature 0.7. These exclude model forward and head projection; the global switch is not selected from this mixed result.
+
+Sparse attention used the serving seed policy at rows 6/24/48, valid sequence counts 1/4/8, context 32,768, 16 local heads, top-k 512, main widths 128/192, compression ratios 1/2 and 30 graph repetitions. All 20 cases passed their numerical comparisons. Kernel speedup median/min/max was 2.549/1.083/5.660 relative to the legacy path. That selects sparse attention for the next model screen; it does not predict a 2.549x model speedup. Existing independent numerical gate receipts remain separate.
