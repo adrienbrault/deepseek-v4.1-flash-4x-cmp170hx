@@ -17,3 +17,8 @@ The generic `sharded_state` loader is deferred: the EXL3 plugin constructs packe
 
 
 Startup validation on 2026-10-21 completed with the unchanged TP4 DSpark K5 TC prefill+v2 numerical configuration: launch-to-readiness fell from 591 to 446 seconds, with engine initialization falling from 181.92 to 36.86 seconds and model loading remaining near 279 seconds. A real preflight receipt hit took 0.289 seconds versus its 74.052-second miss. The next unchanged full boot is estimated at 372 seconds, not yet measured. Results, method and correctness checks: `bench/results/2026-10-21T112351Z-dsv41-startup/NOTES.md`. DeepSeek was left loaded after the validation.
+
+
+## Attributing model load time
+
+`bench/boot-telemetry.sh` records disk I/O, per-process CPU/I/O and per-card PCIe transfers at one-second intervals. A supervising screen stops the collector before correctness and performance probes. `bench/test-boot-telemetry.sh` checks that observer termination stops and reaps every collector; it passed on Linux. The current load attribution run combines telemetry with the prefill-indexer reuse and fused-postprocessing candidate so that it does not require a separate reload. Disk bandwidth, CPU activity and PCIe counters must be aligned with weight-loading stages before attributing the bottleneck.
