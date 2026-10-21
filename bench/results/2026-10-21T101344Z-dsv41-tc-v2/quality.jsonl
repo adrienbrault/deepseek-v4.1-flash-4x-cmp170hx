@@ -1,0 +1,7 @@
+{"case": "raw-paris", "pass": true, "text": " Paris."}
+{"case": "raw-apollo", "pass": true, "text": " was the first manned spacecraft to land on the moon. The crew consisted of Neil Armstrong, Edwin \"Buzz\" Aldrin, and Michael Collins. Armstrong and Aldrin were the first men to walk on the moon. Colli"}
+{"case": "raw-fib", "pass": true, "text": "    if n < 2:\n        return n\n    return fibonacci(n - 1) + fibonacci(n - 2)\n"}
+{"case": "chat-mult", "pass": true, "text": "391"}
+{"case": "chat-canberra", "pass": true, "text": "Canberra"}
+{"case": "chat-reverse", "pass": true, "text": "TNAHPELE"}
+{"quality": "PASS", "failed": 0}

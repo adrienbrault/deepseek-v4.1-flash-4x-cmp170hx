@@ -1,0 +1,17 @@
+{
+ "label": "tc-prefill-v2",
+ "requests": 69,
+ "failed": 0,
+ "span_s": 356.0,
+ "gen_tokens": 49589,
+ "aggregate_tok_s": 139.3,
+ "decode_median": 28.1,
+ "decode_clean_median": 41.0,
+ "decode_mixed_median": 28.0,
+ "mixed_share": 0.986,
+ "ttft_median_s": 2.518,
+ "ttft_p90_s": 11.512,
+ "ttft_max_s": 62.608,
+ "streams_mean": 6.29,
+ "prompt_tokens_median": 12819
+}

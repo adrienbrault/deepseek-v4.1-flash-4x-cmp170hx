@@ -28,3 +28,10 @@ The scorer reports completed tokens divided by the full request span, per-reques
 sudo python3 bench/cpu-clock-screen.py --snapshot results/cpu-original.json --out results/cpu-clock.json
 sudo python3 bench/cpu-clock-screen.py --restore results/cpu-original.json
 ```
+
+`decode-probe.py` measures fixed-concurrency chat decode with exact server token usage, temperature zero and ignored EOS. `DECODE_PROBE_SEED` seeds prompt generation and the server request; `DECODE_PROBE_WARMUP=1` excludes one batch before the three measured batches. `DECODE_PROBE_OUT` stores numeric request receipts without generated text. The reasoning setting is the server default. Each fixed batch reports individual stream rates and their directly measured sum; this differs from the growing replay’s tokens per full wall-clock span.
+
+```bash
+DECODE_PROBE_SEED=15 DECODE_PROBE_WARMUP=1 DECODE_PROBE_OUT=results/c4.jsonl python3 bench/decode-probe.py 8001 400 3 4 prose
+python3 bench/cpu-clock-screen.py --check-only
+```

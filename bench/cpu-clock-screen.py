@@ -10,6 +10,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+def active_policies(cpu_root=Path('/sys/devices/system/cpu')):
+    online = set()
+    for part in (cpu_root / 'online').read_text().strip().split(','):
+        ends = part.split('-')
+        online.update(range(int(ends[0]), int(ends[-1]) + 1))
+    policies = sorted({(cpu_root / f'cpu{i}/cpufreq/scaling_max_freq').resolve() for i in online})
+    assert policies and all((p.exists() for p in policies))
+    return policies
+
 def restore(snapshot):
     if snapshot.exists():
         settings = json.loads(snapshot.read_text())
@@ -30,17 +39,20 @@ def main():
     p.add_argument('--restore', type=Path)
     p.add_argument('--snapshot', type=Path)
     p.add_argument('--out', type=Path)
+    p.add_argument('--check-only', action='store_true')
     a = p.parse_args()
     if a.restore:
         restore(a.restore)
         return
-    assert a.snapshot and a.out
-    policies = sorted(Path('/sys/devices/system/cpu/cpufreq').glob('policy*/scaling_max_freq'))
-    assert policies
+    policies = active_policies()
     originals = {str(f): f.read_text() for f in policies}
     cap = 1600000
     assert all((int(v) > cap for v in originals.values()))
     assert all((int((f.parent / 'scaling_min_freq').read_text()) <= cap for f in policies))
+    if a.check_only:
+        print(json.dumps({'active_policies': len(policies), 'original_max_khz': sorted(set(map(int, originals.values()))), 'cap_khz': cap, 'status': 'PASS'}))
+        return
+    assert a.snapshot and a.out
     a.snapshot.write_text(json.dumps(originals, indent=2) + '\n')
     spec = importlib.util.spec_from_file_location('serve_bench', Path(__file__).with_name('serve_bench.py'))
     bench = importlib.util.module_from_spec(spec)

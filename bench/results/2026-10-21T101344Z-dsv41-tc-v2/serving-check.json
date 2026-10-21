@@ -1,0 +1,16 @@
+{
+  "prefix": {
+    "cold_s": 17.885,
+    "warm_s": 0.537,
+    "prompt_tokens": 12618,
+    "cached_tokens": 12544,
+    "same_text": true,
+    "answer": "Sensor 4 read 481 at minute 599.",
+    "cached_answer": "Sensor 4 read 481 at minute 599.",
+    "cache_reporting_pass": true
+  },
+  "vision": {
+    "answer": "Red",
+    "pass": true
+  }
+}
