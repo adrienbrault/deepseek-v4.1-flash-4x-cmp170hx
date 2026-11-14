@@ -1,0 +1,1163 @@
+From ea41e5a737220edabbdb1902e05deff3e479a643 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 21:01:09 +0200
+Subject: [PATCH 20/20] Add opt-in SM80 kernels for delayed mHC decode seams
+
+Fuse post mapping with a SIMT split-K projection and use a vectorized
+carried-mix RMSNorm epilogue for V4.1 decode rows. Add tiled standalone
+post, fixed configuration selection, CPU arithmetic checks and an offline
+GPU correctness/graph benchmark and tuner. Keep the existing path by
+default and for large rows. GPU qualification is pending.
+
+Origin: dsv41-mhc-r14
+Upstream: Not submitted; SM80 hardware qualification pending
+---
+ benchmarks/kernels/benchmark_mhc_sm80.py      | 339 ++++++++++++++++++
+ tests/kernels/mhc/test_mhc_sm80_cpu.py        | 284 +++++++++++++++
+ vllm/envs.py                                  |   6 +
+ vllm/model_executor/kernels/mhc/sm80.py       | 299 +++++++++++++++
+ .../model_executor/kernels/mhc/sm80_config.py |  73 ++++
+ vllm/model_executor/kernels/mhc/tilelang.py   |  59 +++
+ 6 files changed, 1060 insertions(+)
+ create mode 100644 benchmarks/kernels/benchmark_mhc_sm80.py
+ create mode 100644 tests/kernels/mhc/test_mhc_sm80_cpu.py
+ create mode 100644 vllm/model_executor/kernels/mhc/sm80.py
+ create mode 100644 vllm/model_executor/kernels/mhc/sm80_config.py
+
+diff --git a/benchmarks/kernels/benchmark_mhc_sm80.py b/benchmarks/kernels/benchmark_mhc_sm80.py
+new file mode 100644
+index 0000000000..582ac4290e
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_mhc_sm80.py
+@@ -0,0 +1,339 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SM80 mHC correctness gate, graph benchmark, and offline configuration search.
++
++Run from an installed vLLM checkout. --output is always written, including on
++failure. Tuning emits a separate JSON table for VLLM_MHC_SM80_CONFIG; null means
++retain the upstream implementation. No candidate is selected without checking
++against both upstream and FP32 torch. No GPU results are bundled with this tool.
++"""
++
++import argparse
++import itertools
++import json
++import math
++import os
++import statistics
++import time
++import traceback
++from functools import partial
++from pathlib import Path
++from unittest.mock import patch
++
++# This process owns its switch: baseline calls must always be upstream.
++os.environ["VLLM_MHC_SM80"] = "0"
++
++import torch
++import torch.nn.functional as F
++
++from vllm import envs
++from vllm.model_executor.kernels.mhc.sm80 import mhc_post_sm80, mhc_pre_sm80
++from vllm.model_executor.kernels.mhc.sm80_config import (
++    SM80Config,
++    config_key,
++    select_config,
++)
++from vllm.model_executor.kernels.mhc.tilelang import (
++    mhc_fused_post_pre_delayed_tilelang,
++    mhc_post_tilelang,
++    mhc_pre_delayed_tilelang,
++)
++from vllm.model_executor.kernels.mhc.torch import (
++    mhc_post_torch,
++    mhc_pre_delayed_torch,
++)
++
++
++def row_list(raw):
++    result = set()
++    for item in raw.split(","):
++        if ":" in item:
++            lo, hi = map(int, item.split(":"))
++            result.update(range(lo, hi + 1))
++        else:
++            result.add(int(item))
++    if not result or min(result) < 1:
++        raise ValueError("Rows must be positive")
++    return sorted(result)
++
++
++def make_case(rows, op, width, seed=0, variant="normal"):
++    torch.manual_seed(seed)
++    device = "cuda"
++    r = torch.randn(rows, 4, 5120, device=device, dtype=torch.bfloat16)
++    x = torch.randn(rows, 5120, device=device, dtype=torch.bfloat16)
++    fn = torch.randn(24, width, device=device) / math.sqrt(width)
++    scale = torch.randn(3, device=device) * (1 if variant == "stress" else 0.1)
++    base = torch.randn(24, device=device) * 0.1
++    prev_post = torch.rand(rows, 4, 1, device=device) * 2
++    prev_comb = torch.softmax(torch.randn(rows, 4, 4, device=device), -1)
++    pre = torch.rand(rows, 4, device=device) + 0.5
++    norm = (1 + torch.randn(5120, device=device) * 0.1).bfloat16()
++    if variant == "zero":
++        r.zero_()
++        x.zero_()
++    if width == 5120:
++        r = x.unsqueeze(1).expand(-1, 4, -1).contiguous()
++    kwargs = dict(
++        pre_mix=None if width == 5120 or variant == "identity" else pre,
++        norm_weight=None if variant == "no_norm" else norm,
++        norm_eps=1e-6,
++    )
++    if op == "pre" and width == 5120:
++        kwargs["x"] = x
++    args = (r, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20)
++    if op == "fused":
++        kwargs["capture_aux"] = variant == "aux"
++        old = (x, r, prev_post, prev_comb)
++        baseline = lambda: mhc_fused_post_pre_delayed_tilelang(
++            *old, *args[1:], **kwargs
++        )
++        candidate = lambda cfg: mhc_pre_sm80(
++            *args,
++            **kwargs,
++            sublayer_out=x,
++            post_layer_mix=prev_post,
++            comb_res_mix=prev_comb,
++            config=cfg,
++        )
++        updated = mhc_post_torch(*old)
++    elif op == "pre":
++        baseline = lambda: mhc_pre_delayed_tilelang(*args, **kwargs)
++        candidate = lambda cfg: mhc_pre_sm80(*args, **kwargs, config=cfg)[1:5]
++        updated = r
++    else:
++        baseline = lambda: mhc_post_tilelang(x, r, prev_post, prev_comb)
++        candidate = lambda cfg: mhc_post_sm80(x, r, prev_post, prev_comb, cfg)
++        return baseline, candidate, mhc_post_torch(x, r, prev_post, prev_comb), r
++
++    ref_kwargs = {k: v for k, v in kwargs.items() if k in ("x", "pre_mix")}
++    reference = list(mhc_pre_delayed_torch(updated, *args[1:], **ref_kwargs))
++    if kwargs["norm_weight"] is not None:
++        reference[2] = F.rms_norm(reference[2], (5120,), norm, 1e-6)
++    if op == "fused":
++        aux = updated.mean(1) if kwargs["capture_aux"] else updated.new_empty(0, 5120)
++        reference = [updated, *reference, aux]
++    return baseline, candidate, reference, r
++
++
++def check_close(actual, reference, op):
++    if op == "post":
++        actual, reference = [actual], [reference]
++    errors = []
++    for got, want in zip(actual, reference, strict=True):
++        assert got.shape == want.shape and got.dtype == want.dtype
++        assert torch.isfinite(got).all().item(), "Nonfinite output"
++        if got.dtype == torch.float32:
++            atol, rtol = 5e-4, 1e-3
++        else:
++            atol, rtol = 2e-2, 1e-2
++        torch.testing.assert_close(got, want, atol=atol, rtol=rtol)
++        errors.append(
++            (got.float() - want.float()).abs().max().item() if got.numel() else 0.0
++        )
++    return errors
++
++
++def graph_us(functions, rows, repeats):
++    # Rotate independent weights/inputs so a one-layer L2-hot loop does not
++    # masquerade as the 80-seam target model. Use --weight-ring 1 for hot timing.
++    fn = functions[0]
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    batch = max(len(functions), 32 if rows <= 48 else 4)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for i in range(batch):
++            output = functions[i % len(functions)]()
++    graph.replay()
++    torch.cuda.synchronize()
++    samples = []
++    for _ in range(5):
++        start, end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
++        start.record()
++        for _ in range(repeats):
++            graph.replay()
++        end.record()
++        end.synchronize()
++        samples.append(start.elapsed_time(end) * 1000 / (batch * repeats))
++    # Keep the final outputs alive until all event timing is complete.
++    del output
++    return statistics.median(samples)
++
++
++def graph_gate(baseline, candidate, cfg, reference, op, residual):
++    candidate(cfg)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        output = candidate(cfg)
++    graph.replay()
++    check_close(output, reference, op)
++    # A second replay with different data catches stale / partially written output.
++    saved = residual.clone()
++    residual.mul_(0.75)
++    graph.replay()
++    check_close(output, baseline(), op)
++    residual.copy_(saved)
++
++
++def atomic_json(path, data):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp = path.with_suffix(path.suffix + ".tmp")
++    temp.write_text(json.dumps(data, indent=2) + "\n")
++    temp.replace(path)
++
++
++def run(args, report):
++    assert torch.cuda.is_available(), "CUDA is required"
++    assert torch.cuda.get_device_capability() == (8, 0), "Run on SM80"
++    torch.backends.cuda.matmul.allow_tf32 = False
++    torch.backends.cudnn.allow_tf32 = False
++    props = torch.cuda.get_device_properties(0)
++    report["device"] = dict(
++        name=props.name,
++        sms=props.multi_processor_count,
++        capability=[8, 0],
++        torch=torch.__version__,
++    )
++    configs = {}
++    report["weight_ring_decode"] = args.weight_ring
++    report["weight_ring_prefill"] = min(args.weight_ring, 4)
++    configs_raw = Path(args.config).read_text() if args.config else ""
++    candidates = [
++        SM80Config(k, n, w)
++        for k, n, w in itertools.product((512, 1024, 2048), (2, 4, 8), (4, 8))
++    ]
++    for rows in row_list(args.rows):
++        for op, width in (
++            ("pre", 5120),
++            ("pre", 20480),
++            ("fused", 20480),
++            ("post", 5120),
++        ):
++            key = config_key(op, rows, width)
++            entry = dict(key=key, trials=[])
++            report["cases"].append(entry)
++            baseline, candidate, reference, residual = make_case(rows, op, width)
++            check_close(baseline(), reference, op)
++            timing = []
++            if args.mode != "check":
++                ring = args.weight_ring if rows <= 48 else min(args.weight_ring, 4)
++                timing = [
++                    make_case(rows, op, width, seed=1000 + i)[:2] for i in range(ring)
++                ]
++            old_timing = [item[0] for item in timing]
++            cfg = select_config(op, rows, width, configs_raw)
++            if cfg is None:
++                entry["route"] = "upstream"
++                if rows <= 48:
++                    configs[key] = None
++                if args.mode != "check":
++                    entry["upstream_us"] = graph_us(old_timing, rows, args.repeats)
++                # Exercise the actual enabled wrapper on prefill / null configs.
++                with (
++                    patch.object(envs, "VLLM_MHC_SM80", True),
++                    patch.object(envs, "VLLM_MHC_SM80_CONFIG", configs_raw),
++                ):
++                    check_close(baseline(), reference, op)
++                atomic_json(args.output, report)
++                continue
++            baseline_us = (
++                graph_us(old_timing, rows, args.repeats)
++                if args.mode != "check"
++                else None
++            )
++            entry["upstream_us"] = baseline_us
++            choices = candidates if args.mode == "tune" and op != "post" else [cfg]
++            if args.mode == "tune" and op == "post":
++                choices = [
++                    SM80Config(block_h=b, num_warps=w)
++                    for b, w in itertools.product((128, 256, 512, 1024), (4, 8))
++                ]
++            best, best_us = None, baseline_us
++            variants = ("normal", "identity", "no_norm", "zero", "stress")
++            if op == "fused":
++                variants += ("aux",)
++            validation = [
++                make_case(rows, op, width, seed, variant)
++                for seed in range(args.seeds)
++                for variant in variants
++            ]
++            for choice in choices:
++                trial = dict(config=choice.to_dict())
++                entry["trials"].append(trial)
++                try:
++                    validation_errors = []
++                    for old, new, ref, _ in validation:
++                        original = old()
++                        actual = new(choice)
++                        validation_errors.append(
++                            dict(
++                                torch=check_close(actual, ref, op),
++                                upstream=check_close(actual, original, op),
++                            )
++                        )
++                    trial["max_abs_errors"] = validation_errors
++                    graph_gate(baseline, candidate, choice, reference, op, residual)
++                    # Confirm public routing (the same entry points the model uses).
++                    raw = json.dumps(dict(version=1, configs={key: choice.to_dict()}))
++                    with (
++                        patch.object(envs, "VLLM_MHC_SM80", True),
++                        patch.object(envs, "VLLM_MHC_SM80_CONFIG", raw),
++                    ):
++                        check_close(baseline(), reference, op)
++                    trial["correct"] = True
++                    if args.mode != "check":
++                        new_timing = [partial(item[1], choice) for item in timing]
++                        trial["us"] = graph_us(new_timing, rows, args.repeats)
++                        # Require a 3% margin over upstream, then minimize latency.
++                        if trial["us"] < baseline_us * 0.97 and trial["us"] < best_us:
++                            best, best_us = choice, trial["us"]
++                except Exception as exc:
++                    trial["correct"] = False
++                    trial["error"] = str(exc)
++                    if args.mode != "tune":
++                        raise
++            entry["selected"] = None if best is None else best.to_dict()
++            configs[key] = entry["selected"]
++            entry["selected_us"] = best_us
++            print(key, "upstream_us=", baseline_us, "selected_us=", best_us, flush=True)
++            atomic_json(args.output, report)
++    report["status"] = "passed"
++    if args.mode == "tune":
++        report["status"] = "completed; only passing faster candidates selected"
++        atomic_json(
++            args.config_output,
++            dict(version=1, configs=configs, device=report["device"]),
++        )
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--mode", choices=("check", "bench", "tune"), default="check")
++    parser.add_argument("--rows", default="1:48,64,128,256,512,1024,2048")
++    parser.add_argument("--seeds", type=int, default=2)
++    parser.add_argument("--repeats", type=int, default=20)
++    parser.add_argument("--weight-ring", type=int, default=32)
++    parser.add_argument("--config", help="Read an offline configuration table")
++    parser.add_argument("--config-output", default="mhc-sm80-config.json")
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    if args.seeds < 1 or args.repeats < 1 or args.weight_ring < 1:
++        parser.error("seeds, repeats and weight-ring must be positive")
++    report = dict(status="running", mode=args.mode, cases=[], started=time.time())
++    try:
++        run(args, report)
++    except Exception:
++        report["status"] = "failed"
++        report["error"] = traceback.format_exc()
++        raise
++    finally:
++        report["finished"] = time.time()
++        atomic_json(args.output, report)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/mhc/test_mhc_sm80_cpu.py b/tests/kernels/mhc/test_mhc_sm80_cpu.py
+new file mode 100644
+index 0000000000..e9082deed6
+--- /dev/null
++++ b/tests/kernels/mhc/test_mhc_sm80_cpu.py
+@@ -0,0 +1,284 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU gates, runnable with unittest without importing vLLM's GPU test fixtures.
++
++The small torch interpreter executes the actual Triton function bodies. It
++checks indexing, split tails and BF16 boundaries; compilation and GPU reduction
++order still require benchmark_mhc_sm80.py --mode check on SM80.
++"""
++
++import importlib.util
++import itertools
++import json
++import sys
++import types
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import torch
++import torch.nn.functional as F
++
++ROOT = Path(__file__).resolve().parents[3]
++KERNELS = ROOT / "vllm/model_executor/kernels/mhc"
++
++
++def load_file(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++config_module = load_file("mhc_sm80_cpu_config", KERNELS / "sm80_config.py")
++reference = load_file("mhc_sm80_cpu_reference", KERNELS / "torch.py")
++
++
++class Pointer:
++    def __init__(self, tensor, offset=0):
++        self.tensor, self.offset = tensor.flatten(), offset
++
++    def __add__(self, offset):
++        return Pointer(self.tensor, self.offset + offset)
++
++
++class TorchLanguage:
++    constexpr = object
++    float32, bfloat16 = torch.float32, torch.bfloat16
++    arange = staticmethod(torch.arange)
++    static_range = staticmethod(range)
++    sum = staticmethod(torch.sum)
++    exp = staticmethod(torch.exp)
++    rsqrt = staticmethod(torch.rsqrt)
++    sigmoid = staticmethod(torch.sigmoid)
++    where = staticmethod(torch.where)
++    ids = (0, 0, 0)
++
++    def program_id(self, axis):
++        return self.ids[axis]
++
++    @staticmethod
++    def full(shape, value, dtype):
++        return torch.full(shape, value, dtype=dtype)
++
++    @staticmethod
++    def max(value, axis):
++        return value.max(axis).values
++
++    @staticmethod
++    def gather(value, index, axis):
++        return torch.gather(value, axis, index)
++
++    @staticmethod
++    def fma(a, b, c):
++        return (a.double() * b.double() + c.double()).float()
++
++    @staticmethod
++    def load(ptr, mask=None, other=0):
++        index = torch.as_tensor(ptr.offset, dtype=torch.int64)
++        if mask is None:
++            return ptr.tensor[index]
++        index, mask = torch.broadcast_tensors(index, torch.as_tensor(mask))
++        return torch.where(mask, ptr.tensor[torch.where(mask, index, 0)], other)
++
++    @staticmethod
++    def store(ptr, value, mask=None):
++        index, value = torch.broadcast_tensors(torch.as_tensor(ptr.offset), value)
++        if mask is None:
++            ptr.tensor[index] = value.to(ptr.tensor.dtype)
++        else:
++            mask = torch.broadcast_to(mask, index.shape)
++            ptr.tensor[index[mask]] = value[mask].to(ptr.tensor.dtype)
++
++
++language = TorchLanguage()
++
++
++class Jit:
++    def __init__(self, fn):
++        self.fn = fn
++
++    def __call__(self, *args, **kwargs):
++        return self.fn(*args, **kwargs)
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            args = [Pointer(x) if isinstance(x, torch.Tensor) else x for x in args]
++            for ids in itertools.product(*(range(n) for n in grid)):
++                language.ids = ids
++                self.fn(*args)
++
++        return launch
++
++
++fake_vllm = types.ModuleType("vllm")
++fake_vllm.envs = types.SimpleNamespace(VLLM_MHC_SM80_CONFIG="")
++fake_triton = types.SimpleNamespace(
++    jit=Jit,
++    cdiv=lambda a, b: (a + b - 1) // b,
++    next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
++)
++with patch.dict(
++    sys.modules,
++    {
++        "vllm": fake_vllm,
++        "vllm.triton_utils": types.SimpleNamespace(tl=language, triton=fake_triton),
++        "vllm.model_executor.kernels.mhc.sm80_config": config_module,
++    },
++):
++    kernels = load_file("mhc_sm80_cpu_kernel", KERNELS / "sm80.py")
++
++
++class SM80ConfigTests(unittest.TestCase):
++    def test_device_and_layout_guards_do_not_send_other_gpus_to_sm80(self):
++        tensor = types.SimpleNamespace(
++            ndim=3,
++            shape=(6, 4, 5120),
++            dtype=torch.bfloat16,
++            is_contiguous=lambda: True,
++            is_cuda=True,
++            device="cuda",
++        )
++        for capability in ((8, 6), (9, 0), (10, 0)):
++            with patch.object(
++                torch.cuda, "get_device_capability", return_value=capability
++            ):
++                self.assertIsNone(kernels.get_sm80_config(tensor, "fused", 20480))
++        with patch.object(torch.cuda, "get_device_capability", return_value=(8, 0)):
++            self.assertIsNotNone(kernels.get_sm80_config(tensor, "fused", 20480))
++        self.assertIsNone(
++            kernels.get_sm80_config(torch.empty(6, 4, 5120), "fused", 20480)
++        )
++
++    def test_every_decode_row_has_config_but_prefill_and_other_shapes_decline(self):
++        for rows in range(1, 49):
++            for op, width in (
++                ("pre", 5120),
++                ("pre", 20480),
++                ("fused", 20480),
++                ("post", 5120),
++            ):
++                self.assertIsNotNone(config_module.select_config(op, rows, width))
++        for rows in (0, 49, 64, 128, 2048):
++            self.assertIsNone(config_module.select_config("fused", rows, 20480))
++        self.assertIsNone(config_module.select_config("pre", 6, 28672))
++
++    def test_offline_selection_can_keep_upstream_per_shape(self):
++        raw = json.dumps(
++            {
++                "version": 1,
++                "configs": {
++                    "fused:6:20480": None,
++                    "pre:6:5120": {"block_k": 512, "tile_n": 2},
++                },
++            }
++        )
++        self.assertIsNone(config_module.select_config("fused", 6, 20480, raw))
++        self.assertEqual(config_module.select_config("pre", 6, 5120, raw).tile_n, 2)
++        self.assertIsNotNone(config_module.select_config("fused", 7, 20480, raw))
++
++    def test_bad_tuning_tables_fail_before_launch(self):
++        for raw in (
++            "{",
++            '{"version":2,"configs":{}}',
++            '{"version":1,"configs":{"pre:49:5120":{}}}',
++            '{"version":1,"configs":{"pre:6:5120":{"block_k":1000}}}',
++            '{"version":1,"configs":{"pre:6:5120":{"num_warps":true}}}',
++        ):
++            with self.assertRaises((ValueError, TypeError)):
++                config_module.parse_configs(raw)
++
++
++class SM80ArithmeticTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.previous_threads = torch.get_num_threads()
++        torch.set_num_threads(1)
++
++    @classmethod
++    def tearDownClass(cls):
++        torch.set_num_threads(cls.previous_threads)
++
++    def setUp(self):
++        context = torch.device("cpu")
++        context.__enter__()
++        self.addCleanup(context.__exit__, None, None, None)
++
++    def test_actual_kernel_bodies_match_torch_at_real_shapes(self):
++        for rows, width, fused, carried, norm, aux, block in (
++            (1, 5120, False, False, True, False, 2048),  # masked split tail
++            (6, 20480, False, True, False, False, 1024),
++            (6, 20480, True, True, True, True, 1024),
++            (48, 20480, True, False, True, False, 2048),
++        ):
++            with self.subTest(rows=rows, width=width, fused=fused, carried=carried):
++                torch.manual_seed(11)
++                residual = torch.randn(rows, 4, 5120).bfloat16()
++                x = torch.randn(rows, 5120).bfloat16()
++                fn = torch.randn(24, width) / width**0.5
++                scale, base = torch.randn(3) * 0.1, torch.randn(24) * 0.1
++                pre = torch.rand(rows, 4) if carried else None
++                norm_weight = torch.ones(5120).bfloat16() if norm else None
++                post = torch.rand(rows, 4, 1) * 2
++                comb = torch.softmax(torch.randn(rows, 4, 4), -1)
++                cfg = config_module.SM80Config(block_k=block)
++                updated = (
++                    reference.mhc_post_torch(x, residual, post, comb)
++                    if fused
++                    else residual
++                )
++                kwargs = dict(
++                    pre_mix=pre, norm_weight=norm_weight, capture_aux=aux, config=cfg
++                )
++                ref_kwargs = dict(pre_mix=pre)
++                if width == 5120:
++                    kwargs["x"] = ref_kwargs["x"] = x
++                if fused:
++                    kwargs.update(
++                        sublayer_out=x, post_layer_mix=post, comb_res_mix=comb
++                    )
++                actual = kernels.mhc_pre_sm80(
++                    residual, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20, **kwargs
++                )
++                expected = list(
++                    reference.mhc_pre_delayed_torch(
++                        updated,
++                        fn,
++                        scale,
++                        base,
++                        1e-6,
++                        1e-6,
++                        1e-6,
++                        2.0,
++                        20,
++                        **ref_kwargs,
++                    )
++                )
++                if norm:
++                    expected[2] = F.rms_norm(expected[2], (5120,), norm_weight, 1e-6)
++                expected = [
++                    updated,
++                    *expected,
++                    updated.mean(1) if aux else updated.new_empty(0, 5120),
++                ]
++                for got, want in zip(actual, expected, strict=True):
++                    atol = 5e-4 if got.dtype == torch.float32 else 2e-2
++                    torch.testing.assert_close(got, want, atol=atol, rtol=1e-2)
++
++    def test_tiled_post_writes_every_element_without_mutating_inputs(self):
++        torch.manual_seed(3)
++        residual = torch.randn(6, 4, 5120).bfloat16()
++        saved = residual.clone()
++        x = torch.randn(6, 5120).bfloat16()
++        post, comb = torch.rand(6, 4, 1), torch.rand(6, 4, 4)
++        got = kernels.mhc_post_sm80(
++            x, residual, post, comb, config_module.SM80Config(block_h=512)
++        )
++        want = reference.mhc_post_torch(x, residual, post, comb)
++        torch.testing.assert_close(got, want, atol=2e-2, rtol=1e-2)
++        torch.testing.assert_close(residual, saved, atol=0, rtol=0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f9d7f07ea2..c48e6a398d 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -194,6 +194,8 @@ if TYPE_CHECKING:
+     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+     VLLM_V1_USE_OUTLINES_CACHE: bool = False
+     VLLM_TPU_USING_PATHWAYS: bool = False
++    VLLM_MHC_SM80: bool = False
++    VLLM_MHC_SM80_CONFIG: str = ""
+     VLLM_USE_DEEP_GEMM: bool = True
+     VLLM_MOE_USE_DEEP_GEMM: bool = True
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+@@ -1582,6 +1584,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_TPU_USING_PATHWAYS": lambda: bool(
+         "proxy" in os.getenv("JAX_PLATFORMS", "").lower()
+     ),
++    # Inline offline-tuned JSON is included in the compilation cache hash.
++    # Set both before starting workers / graph capture.
++    "VLLM_MHC_SM80": lambda: bool(int(os.getenv("VLLM_MHC_SM80", "0"))),
++    "VLLM_MHC_SM80_CONFIG": lambda: os.getenv("VLLM_MHC_SM80_CONFIG", ""),
+     # Allow use of DeepGemm kernels for fused moe ops.
+     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
+     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
+diff --git a/vllm/model_executor/kernels/mhc/sm80.py b/vllm/model_executor/kernels/mhc/sm80.py
+new file mode 100644
+index 0000000000..64eadfd17c
+--- /dev/null
++++ b/vllm/model_executor/kernels/mhc/sm80.py
+@@ -0,0 +1,299 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in SIMT mHC for V4.1's delayed pre-mix, hc=4, hidden=5120, SM80."""
++
++import torch
++
++from vllm import envs
++from vllm.model_executor.kernels.mhc.sm80_config import SM80Config, select_config
++from vllm.triton_utils import tl, triton
++
++
++def get_sm80_config(residual, op, width):
++    if (
++        residual.ndim != 3
++        or residual.shape[1:] != (4, 5120)
++        or residual.dtype != torch.bfloat16
++        or not residual.is_contiguous()
++        or not residual.is_cuda
++        or torch.cuda.get_device_capability(residual.device) != (8, 0)
++    ):
++        return None
++    return select_config(op, residual.shape[0], width, envs.VLLM_MHC_SM80_CONFIG)
++
++
++@triton.jit
++def _post_values(X, R, P, C, row, k, valid, H: tl.constexpr):
++    stream = k // H
++    h = k % H
++    value = tl.load(P + row * 4 + stream, valid, 0) * tl.load(
++        X + row * H + h, valid, 0
++    ).to(tl.float32)
++    for i in tl.static_range(4):
++        coeff = tl.load(C + row * 16 + i * 4 + stream, valid, 0)
++        residual = tl.load(R + row * 4 * H + i * H + h, valid, 0).to(tl.float32)
++        value = tl.fma(coeff, residual, value)
++    # Projection and collapse must both see the serialized BF16 residual.
++    return value.to(tl.bfloat16).to(tl.float32)
++
++
++@triton.jit
++def _project(
++    X,
++    R,
++    P,
++    C,
++    W,
++    R_OUT,
++    MIX,
++    SQR,
++    ROWS: tl.constexpr,
++    H: tl.constexpr,
++    K: tl.constexpr,
++    SPLITS: tl.constexpr,
++    BK: tl.constexpr,
++    BN: tl.constexpr,
++    POST: tl.constexpr,
++):
++    row = tl.program_id(0)
++    tile = tl.program_id(1)
++    split = tl.program_id(2)
++    k = split * BK + tl.arange(0, BK)
++    n = tile * BN + tl.arange(0, BN)
++    if POST:
++        value = _post_values(X, R, P, C, row, k, k < K, H)
++        if tile == 0:
++            tl.store(R_OUT + row * K + k, value, k < K)
++    else:
++        value = tl.load(X + row * K + k, k < K, 0).to(tl.float32)
++    weight = tl.load(
++        W + n[:, None] * K + k[None, :], (n[:, None] < 24) & (k[None, :] < K), 0
++    )
++    dot = tl.sum(weight * value[None, :], 1)
++    tl.store(MIX + (split * ROWS + row) * 24 + n, dot, n < 24)
++    if tile == 0:
++        tl.store(SQR + split * ROWS + row, tl.sum(value * value, 0))
++
++
++@triton.jit
++def _finish(
++    R,
++    MIX,
++    SQR,
++    SCALE,
++    BASE,
++    PRE,
++    NORM,
++    POST,
++    COMB,
++    INPUT,
++    NEXT_PRE,
++    AUX,
++    ROWS: tl.constexpr,
++    H: tl.constexpr,
++    K: tl.constexpr,
++    SPLITS: tl.constexpr,
++    BS: tl.constexpr,
++    BH: tl.constexpr,
++    RMS_EPS: tl.constexpr,
++    PRE_EPS: tl.constexpr,
++    SINK_EPS: tl.constexpr,
++    POST_MULT: tl.constexpr,
++    REPEAT: tl.constexpr,
++    NORM_EPS: tl.constexpr,
++    CARRIED: tl.constexpr,
++    NORMALIZE: tl.constexpr,
++    WRITE_AUX: tl.constexpr,
++):
++    row = tl.program_id(0)
++    s = tl.arange(0, BS)
++    n = tl.arange(0, 32)
++    sqr = tl.sum(tl.load(SQR + s * ROWS + row, s < SPLITS, 0), 0)
++    parts = tl.load(
++        MIX + (s[:, None] * ROWS + row) * 24 + n[None, :],
++        (s[:, None] < SPLITS) & (n[None, :] < 24),
++        0,
++    )
++    mix = tl.sum(parts, 0) * tl.rsqrt(sqr / K + RMS_EPS)
++    group = tl.where(n < 4, 0, tl.where(n < 8, 1, 2))
++    logits = mix * tl.load(SCALE + group) + tl.load(BASE + n, n < 24, 0)
++    j = tl.arange(0, 4)
++    pre = tl.sigmoid(tl.gather(logits, j, 0)) + PRE_EPS
++    post = tl.sigmoid(tl.gather(logits, j + 4, 0)) * POST_MULT
++    tl.store(NEXT_PRE + row * 4 + j, pre)
++    tl.store(POST + row * 4 + j, post)
++    ij = tl.arange(0, 16)
++    comb = tl.gather(logits, ij + 8, 0).reshape(4, 4)
++    comb = tl.exp(comb - tl.max(comb, 1)[:, None])
++    comb = comb / tl.sum(comb, 1)[:, None] + SINK_EPS
++    comb = comb / (tl.sum(comb, 0)[None, :] + SINK_EPS)
++    for _ in range(REPEAT - 1):
++        comb = comb / (tl.sum(comb, 1)[:, None] + SINK_EPS)
++        comb = comb / (tl.sum(comb, 0)[None, :] + SINK_EPS)
++    tl.store(COMB + row * 16 + ij, comb.reshape(16))
++
++    h = tl.arange(0, BH)
++    collapsed = tl.full((BH,), 0, tl.float32)
++    mean = tl.full((BH,), 0, tl.float32)
++    for i in tl.static_range(4):
++        value = tl.load(R + row * 4 * H + i * H + h, h < H, 0).to(tl.float32)
++        if CARRIED:
++            coeff = tl.load(PRE + row * 4 + i)
++            collapsed = tl.fma(coeff, value, collapsed)
++        elif i == 0:
++            collapsed = value
++        if WRITE_AUX:
++            mean += value
++    rounded = collapsed.to(tl.bfloat16).to(tl.float32)
++    if NORMALIZE:
++        rstd = tl.rsqrt(tl.sum(rounded * rounded, 0) / H + NORM_EPS)
++        rounded = rounded * rstd * tl.load(NORM + h, h < H, 0).to(tl.float32)
++    tl.store(INPUT + row * H + h, rounded, h < H)
++    if WRITE_AUX:
++        tl.store(AUX + row * H + h, mean * 0.25, h < H)
++
++
++@triton.jit
++def _post(X, R, P, C, OUT, H: tl.constexpr, B: tl.constexpr):
++    row = tl.program_id(0)
++    k = tl.program_id(1) * B + tl.arange(0, B)
++    value = _post_values(X, R, P, C, row, k, k < 4 * H, H)
++    tl.store(OUT + row * 4 * H + k, value, k < 4 * H)
++
++
++def mhc_post_sm80(x, residual, post, comb, config: SM80Config):
++    rows, _, hidden = residual.shape
++    assert residual.shape[1:] == (4, 5120) and 1 <= rows <= 48
++    assert residual.is_contiguous() and residual.dtype == torch.bfloat16
++    assert x.shape == (rows, hidden) and x.is_contiguous()
++    assert x.dtype == torch.bfloat16
++    assert post.shape in ((rows, 4), (rows, 4, 1)) and post.is_contiguous()
++    assert comb.shape == (rows, 4, 4) and comb.is_contiguous()
++    assert post.dtype == comb.dtype == torch.float32
++    out = torch.empty_like(residual)
++    _post[(rows, triton.cdiv(4 * hidden, config.block_h))](
++        x,
++        residual,
++        post,
++        comb,
++        out,
++        hidden,
++        config.block_h,
++        num_warps=config.num_warps,
++    )
++    return out
++
++
++def mhc_pre_sm80(
++    residual,
++    fn,
++    scale,
++    base,
++    rms_eps,
++    pre_eps,
++    sink_eps,
++    post_mult,
++    repeat,
++    pre_mix=None,
++    x=None,
++    norm_weight=None,
++    norm_eps=1e-6,
++    *,
++    sublayer_out=None,
++    post_layer_mix=None,
++    comb_res_mix=None,
++    capture_aux=False,
++    config: SM80Config,
++):
++    """Return the six delayed-seam outputs; standalone pre drops first/last."""
++    rows, _, hidden = residual.shape
++    fused = sublayer_out is not None
++    projection = residual.flatten(1) if x is None else x
++    width = projection.shape[1]
++    assert residual.is_contiguous() and residual.dtype == torch.bfloat16
++    assert residual.shape[1:] == (4, 5120) and 1 <= rows <= 48
++    assert projection.is_contiguous() and projection.dtype == torch.bfloat16
++    assert width in (hidden, 4 * hidden) and (not fused or x is None)
++    assert fn.shape == (24, width) and fn.dtype == torch.float32
++    assert fn.is_contiguous() and scale.is_contiguous() and base.is_contiguous()
++    assert scale.shape == (3,) and base.shape == (24,)
++    assert scale.dtype == base.dtype == torch.float32
++    assert repeat >= 1
++    if pre_mix is not None:
++        assert pre_mix.shape == (rows, 4) and pre_mix.is_contiguous()
++        assert pre_mix.dtype == torch.float32
++    if norm_weight is not None:
++        assert norm_weight.shape == (hidden,) and norm_weight.is_contiguous()
++        assert norm_weight.dtype == torch.bfloat16
++    if fused:
++        assert sublayer_out.shape == (rows, hidden)
++        assert sublayer_out.dtype == torch.bfloat16 and sublayer_out.is_contiguous()
++        assert post_layer_mix.shape in ((rows, 4), (rows, 4, 1))
++        assert comb_res_mix.shape == (rows, 4, 4)
++        assert post_layer_mix.is_contiguous() and comb_res_mix.is_contiguous()
++        assert post_layer_mix.dtype == comb_res_mix.dtype == torch.float32
++
++    splits = triton.cdiv(width, config.block_k)
++    mix = torch.empty((splits, rows, 24), device=residual.device, dtype=torch.float32)
++    sqr = torch.empty((splits, rows), device=residual.device, dtype=torch.float32)
++    updated = torch.empty_like(residual) if fused else residual
++    post = torch.empty((rows, 4, 1), device=residual.device, dtype=torch.float32)
++    comb = torch.empty((rows, 4, 4), device=residual.device, dtype=torch.float32)
++    next_pre = torch.empty((rows, 4), device=residual.device, dtype=torch.float32)
++    layer_input = torch.empty(
++        (rows, hidden), device=residual.device, dtype=torch.bfloat16
++    )
++    aux = torch.empty(
++        (rows if capture_aux else 0, hidden),
++        device=residual.device,
++        dtype=torch.bfloat16,
++    )
++    _project[(rows, triton.cdiv(24, config.tile_n), splits)](
++        sublayer_out if fused else projection,
++        residual,
++        post_layer_mix if fused else post,
++        comb_res_mix if fused else comb,
++        fn,
++        updated,
++        mix,
++        sqr,
++        rows,
++        hidden,
++        width,
++        splits,
++        config.block_k,
++        config.tile_n,
++        fused,
++        num_warps=config.num_warps,
++    )
++    _finish[(rows,)](
++        updated,
++        mix,
++        sqr,
++        scale,
++        base,
++        pre_mix if pre_mix is not None else next_pre,
++        norm_weight if norm_weight is not None else layer_input,
++        post,
++        comb,
++        layer_input,
++        next_pre,
++        aux,
++        rows,
++        hidden,
++        width,
++        splits,
++        triton.next_power_of_2(splits),
++        triton.next_power_of_2(hidden),
++        rms_eps,
++        pre_eps,
++        sink_eps,
++        post_mult,
++        repeat,
++        norm_eps,
++        pre_mix is not None,
++        norm_weight is not None,
++        capture_aux,
++        num_warps=4,
++    )
++    return updated, post, comb, layer_input, next_pre, aux
+diff --git a/vllm/model_executor/kernels/mhc/sm80_config.py b/vllm/model_executor/kernels/mhc/sm80_config.py
+new file mode 100644
+index 0000000000..77a21ecdb9
+--- /dev/null
++++ b/vllm/model_executor/kernels/mhc/sm80_config.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fixed decode configurations; offline tuning never runs in a serving process."""
++
++import json
++from dataclasses import asdict, dataclass
++from functools import cache
++
++
++@dataclass(frozen=True)
++class SM80Config:
++    block_k: int = 1024
++    tile_n: int = 4
++    num_warps: int = 4
++    block_h: int = 256
++
++    def __post_init__(self):
++        for name, allowed in (
++            ("block_k", (256, 512, 1024, 2048)),
++            ("tile_n", (2, 4, 8)),
++            ("num_warps", (4, 8)),
++            ("block_h", (128, 256, 512, 1024)),
++        ):
++            value = getattr(self, name)
++            if type(value) is not int or value not in allowed:
++                raise ValueError(f"Invalid SM80 mHC {name}: {value!r}")
++
++    def to_dict(self):
++        return asdict(self)
++
++
++def config_key(op: str, rows: int, width: int) -> str:
++    return f"{op}:{rows}:{width}"
++
++
++@cache
++def parse_configs(raw: str) -> dict[str, SM80Config | None]:
++    if not raw:
++        return {}
++    data = json.loads(raw)
++    if (
++        not isinstance(data, dict)
++        or type(data.get("version")) is not int
++        or data.get("version") != 1
++        or not isinstance(data.get("configs"), dict)
++    ):
++        raise ValueError("SM80 mHC configuration requires version=1 and configs")
++    result = {}
++    for key, value in data["configs"].items():
++        op, rows, width = key.split(":")
++        if not supported_shape(op, int(rows), int(width)) or key != config_key(
++            op, int(rows), int(width)
++        ):
++            raise ValueError(f"Unsupported SM80 mHC configuration key: {key}")
++        result[key] = None if value is None else SM80Config(**value)
++    return result
++
++
++def supported_shape(op: str, rows: int, width: int) -> bool:
++    widths = {"pre": (5120, 20480), "fused": (20480,), "post": (5120,)}
++    return 1 <= rows <= 48 and width in widths.get(op, ())
++
++
++def select_config(op: str, rows: int, width: int, raw: str = ""):
++    if not supported_shape(op, rows, width):
++        return None
++    # Starting points, not measured winners. The tuner can select upstream
++    # (JSON null) independently for every row count and operation.
++    default = SM80Config(
++        block_k=512 if rows <= 2 else 1024 if rows <= 8 else 2048,
++        tile_n=4 if rows <= 8 else 8,
++    )
++    return parse_configs(raw).get(config_key(op, rows, width), default)
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index 2c0f4c12a0..c8af533201 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import torch
+ 
++from vllm import envs
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+@@ -98,6 +99,29 @@ def mhc_pre_delayed_tilelang(
+         (tokens, hc_mult, hc_mult), (tokens, hidden_size), and (tokens, hc_mult).
+ 
+     """
++    if envs.VLLM_MHC_SM80:
++        from vllm.model_executor.kernels.mhc.sm80 import get_sm80_config, mhc_pre_sm80
++
++        width = residual.shape[-1] * residual.shape[-2] if x is None else x.shape[-1]
++        config = get_sm80_config(residual, "pre", width)
++        if config is not None:
++            return mhc_pre_sm80(
++                residual,
++                fn,
++                hc_scale,
++                hc_base,
++                rms_eps,
++                hc_pre_eps,
++                hc_sinkhorn_eps,
++                hc_post_mult_value,
++                sinkhorn_repeat,
++                pre_mix,
++                x,
++                norm_weight,
++                norm_eps,
++                config=config,
++            )[1:5]
++
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+         _HC_PRENORM_GEMM_TILELANG_KERNEL,
+         mhc_pre_big_fuse_tilelang,
+@@ -310,6 +334,31 @@ def mhc_fused_post_pre_delayed_tilelang(
+         and (tokens, hidden_size).
+ 
+     """
++    if envs.VLLM_MHC_SM80:
++        from vllm.model_executor.kernels.mhc.sm80 import get_sm80_config, mhc_pre_sm80
++
++        config = get_sm80_config(residual, "fused", residual.shape[-1] * 4)
++        if config is not None:
++            return mhc_pre_sm80(
++                residual,
++                fn,
++                hc_scale,
++                hc_base,
++                rms_eps,
++                hc_pre_eps,
++                hc_sinkhorn_eps,
++                hc_post_mult_value,
++                sinkhorn_repeat,
++                pre_mix=pre_mix,
++                norm_weight=norm_weight,
++                norm_eps=norm_eps,
++                sublayer_out=x,
++                post_layer_mix=post_layer_mix,
++                comb_res_mix=comb_res_mix,
++                capture_aux=capture_aux,
++                config=config,
++            )
++
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+         _HC_PRENORM_GEMM_TILELANG_KERNEL,
+         _MHC_FUSED_TILELANG_KERNEL,
+@@ -781,6 +830,16 @@ def mhc_post_tilelang(
+     post_layer_mix: torch.Tensor,
+     comb_res_mix: torch.Tensor,
+ ) -> torch.Tensor:
++    if envs.VLLM_MHC_SM80:
++        from vllm.model_executor.kernels.mhc.sm80 import (
++            get_sm80_config,
++            mhc_post_sm80,
++        )
++
++        config = get_sm80_config(residual, "post", residual.shape[-1])
++        if config is not None:
++            return mhc_post_sm80(x, residual, post_layer_mix, comb_res_mix, config)
++
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+         _MHC_POST_TILELANG_KERNEL,
+     )
+-- 
+2.55.0
+

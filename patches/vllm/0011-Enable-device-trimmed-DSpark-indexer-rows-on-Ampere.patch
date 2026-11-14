@@ -1,0 +1,187 @@
+From 41c4a3eeec8bb25b3545bd28b5d564f1ae1eb1d6 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 20:51:37 +0200
+Subject: [PATCH 11/20] Enable device-trimmed DSpark indexer rows on Ampere
+
+Advertise device/host query-length mismatch support for the V4.1 Ampere
+indexer. Reuse the existing device metadata kernel to expand each query's
+causal bound and block-table row into persistent buffers, including graph
+padding, before the Triton MQA fallback consumes single-query rows.
+
+Keep native DeepGEMM varlen support separate and retain the original
+metadata path when adaptive verification is disabled. Force flattening
+for adaptive two-row batches as well as the usual six-row DSpark shape.
+Cover the architecture, model and opt-in gates with CPU unit tests.
+
+Origin: new
+Upstream: none
+---
+ .../attention/test_sm80_adaptive_indexer.py   | 47 ++++++++++++++++
+ vllm/v1/attention/backends/mla/indexer.py     | 55 ++++++++++++++++---
+ 2 files changed, 93 insertions(+), 9 deletions(-)
+ create mode 100644 tests/v1/attention/test_sm80_adaptive_indexer.py
+
+diff --git a/tests/v1/attention/test_sm80_adaptive_indexer.py b/tests/v1/attention/test_sm80_adaptive_indexer.py
+new file mode 100644
+index 0000000000..71499b1d01
+--- /dev/null
++++ b/tests/v1/attention/test_sm80_adaptive_indexer.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.platforms import current_platform
++from vllm.v1.attention.backends.mla import indexer
++
++
++@pytest.mark.parametrize("family", [8, 9, 10, 12])
++@pytest.mark.parametrize("adaptive", [False, True])
++@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v32"])
++def test_sm80_device_metadata_is_scoped_to_adaptive_v41(
++    monkeypatch, family, adaptive, model_type
++):
++    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
++    monkeypatch.setattr(
++        current_platform, "is_device_capability_family", lambda n: n // 10 == family
++    )
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(enable_adaptive_verification=adaptive),
++        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
++    )
++    assert indexer._sm80_adaptive_device_query_lens(config) == (
++        family == 8 and adaptive and model_type == "deepseek_v41"
++    )
++
++
++def test_sm80_adaptive_flattens_even_a_two_row_verification(monkeypatch):
++    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
++    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
++    monkeypatch.setattr(
++        current_platform, "is_device_capability_family", lambda n: n == 80
++    )
++    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: False)
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(enable_adaptive_verification=True),
++        model_config=SimpleNamespace(
++            hf_config=SimpleNamespace(model_type="deepseek_v41")
++        ),
++        num_speculative_tokens=1,
++    )
++    assert indexer.DeepseekV41IndexerBackend.supports_device_cpu_query_lens_mismatch()
++    assert indexer._use_flattening(config)
++    config.speculative_config.enable_adaptive_verification = False
++    assert not indexer._use_flattening(config)
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index c0153f9c16..6c086479e8 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -356,6 +356,13 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
+ 
+ 
+ class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
++    @classmethod
++    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
++        return (
++            current_platform.is_cuda()
++            and current_platform.is_device_capability_family(80)
++        ) or super().supports_device_cpu_query_lens_mismatch()
++
+     @staticmethod
+     def get_name() -> str:
+         return "DEEPSEEK_V41_INDEXER"
+@@ -953,6 +960,22 @@ def _rocm_supports_flattened_device_query_lens(vllm_config: VllmConfig) -> bool:
+     )
+ 
+ 
++def _sm80_adaptive_device_query_lens(vllm_config: VllmConfig) -> bool:
++    """Use device-built single-query rows for the Ampere V4.1 fallback."""
++    spec_config = vllm_config.speculative_config
++    if not (
++        spec_config is not None
++        and spec_config.enable_adaptive_verification
++        and current_platform.is_cuda()
++        and current_platform.is_device_capability_family(80)
++    ):
++        return False
++    model_config = vllm_config.model_config
++    return bool(
++        model_config is not None and model_config.hf_config.model_type == "deepseek_v41"
++    )
++
++
+ def _supports_native_decode(next_n: int) -> bool:
+     """Whether decode can pass `next_n` Q rows per request to the kernel
+     instead of flattening to one single-token row per query, which re-reads
+@@ -970,12 +993,16 @@ def _supports_native_decode(next_n: int) -> bool:
+ def _use_flattening(vllm_config: VllmConfig) -> bool:
+     speculative_config = vllm_config.speculative_config
+     next_n = 1 + vllm_config.num_speculative_tokens
+-    return not _supports_native_decode(next_n) or (
+-        speculative_config is not None
+-        and speculative_config.enable_adaptive_verification
+-        and (
+-            _supports_flattened_device_query_lens()
+-            or _rocm_supports_flattened_device_query_lens(vllm_config)
++    return (
++        _sm80_adaptive_device_query_lens(vllm_config)
++        or not _supports_native_decode(next_n)
++        or (
++            speculative_config is not None
++            and speculative_config.enable_adaptive_verification
++            and (
++                _supports_flattened_device_query_lens()
++                or _rocm_supports_flattened_device_query_lens(vllm_config)
++            )
+         )
+     )
+ 
+@@ -1030,6 +1057,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         self.reorder_batch_threshold = None
+         self.use_flattening = _use_flattening(self.vllm_config)
+         self.supports_varlen = _supports_varlen_paged_mqa_logits()
++        # The Triton logits fallback consumes one query per expanded block-table
++        # row. Reuse the device metadata kernel without claiming DeepGEMM's
++        # native varlen logits support. Fixed-budget launches keep their old path.
++        self.use_device_decode_metadata = self.supports_varlen or (
++            _sm80_adaptive_device_query_lens(self.vllm_config)
++        )
++        if _sm80_adaptive_device_query_lens(self.vllm_config):
++            logger.info_once(
++                "SM80 adaptive indexer: device query metadata, single-query Triton rows"
++            )
+         logger.info_once(
+             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
+             "(next_n=%d, use_fp4_cache=%s)",
+@@ -1596,7 +1633,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+ 
+         decode_metadata = None
+         if num_decodes > 0:
+-            if not self.supports_varlen:
++            if not self.use_device_decode_metadata:
+                 torch.diff(
+                     common_attn_metadata.query_start_loc[: num_decodes + 1],
+                     out=self.decode_lens_buffer[:num_decodes],
+@@ -1639,7 +1676,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 and step_next_n_ok
+             )
+ 
+-            if not self.supports_varlen:
++            if not self.use_device_decode_metadata:
+                 global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
+                     global_seq_lens=global_seq_lens_for_decode,
+                     decode_lens=decode_lens,
+@@ -1651,7 +1688,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 )
+ 
+             decode_indices = None
+-            if self.supports_varlen:
++            if self.use_device_decode_metadata:
+                 from vllm.v1.attention.ops.metadata import (
+                     _indexer_decode_metadata_kernel,
+                 )
+-- 
+2.55.0
+

@@ -1,0 +1,49 @@
+From f816d50a44231f4010bfdc72836eadfb95043fac Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 21:00:46 +0200
+Subject: [PATCH 12/20] Add exact bit-based E4M3FN decode for sparse attention
+
+Provide an opt-in decoder using exponent rebiasing and exact subnormal conversion. Keep the existing software decoder as the default.
+
+Origin: Local SM80 sparse attention optimization
+Upstream: Not submitted; GPU qualification pending
+---
+ vllm/v1/attention/ops/fp8_sm80.py | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/vllm/v1/attention/ops/fp8_sm80.py b/vllm/v1/attention/ops/fp8_sm80.py
+index c8b23de727..057e122522 100644
+--- a/vllm/v1/attention/ops/fp8_sm80.py
++++ b/vllm/v1/attention/ops/fp8_sm80.py
+@@ -147,6 +147,28 @@ def _e4m3fn_to_f32_alu(u):
+     return tl.where((u32 & 0x7F) == 0x7F, float("nan"), val)
+ 
+ 
++@triton.jit
++def _e4m3fn_to_f32_bits(u):
++    """Exact E4M3FN decode without a table or transcendental instructions."""
++    bits = u.to(tl.uint32)
++    magnitude = bits & 0x7F
++    normal = (magnitude << 20) + (120 << 23)
++    subnormal = (bits & 7).to(tl.float32) * 0.001953125
++    value = tl.where(magnitude < 8, subnormal.to(tl.uint32, bitcast=True), normal)
++    value = tl.where(magnitude == 127, 0x7FC00000, value)
++    return (value | ((bits & 0x80) << 24)).to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _decode_sparse_fp8(u, USE_FNUZ: tl.constexpr, lut_ptr, MODE: tl.constexpr):
++    if MODE == 1:
++        return _e4m3fn_to_f32_bits(u)
++    elif MODE == 2:
++        return tl.load(lut_ptr + u.to(tl.uint32)).to(tl.float32)
++    else:
++        return _decode_fp8_f32(u, USE_FNUZ)
++
++
+ @triton.jit
+ def _decode_fp8_f32(u, USE_FNUZ: tl.constexpr):
+     """FNUZ-aware byte decode to f32, without a LUT."""
+-- 
+2.55.0
+

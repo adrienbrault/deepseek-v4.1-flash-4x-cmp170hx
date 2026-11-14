@@ -1,0 +1,103 @@
+--- a/quant/opera_coop.cu
++++ b/quant/opera_coop.cu
+@@ -110,6 +110,18 @@
+ static bool opera_down_wide = true;
+ void opera_coop_set_wide_v1(bool enabled) { opera_down_wide = enabled; }
+ 
++// Bias tables, shared-expert pointers, strides and act_limit stay dynamic.
++// Do not infer nullable semantics from one capture; all unsupported modes fall back.
++static bool trim_fixed_ok(const MoeCoopParams& p, float Kg, float Kd, int cb,
++                          bool wide_a, int geometry_b)
++{
++    return Kg == 3 && Kd == 3 && cb == 2 && p.bsz == 16 && p.topk == 6 &&
++           p.H == 5120 && p.Hi == 5120 && p.Ho == 5120 && p.H_out == 5120 &&
++           p.ksplit_a == 1 && p.ksplit_b == 1 && p.gated && p.a_global &&
++           !p.gu_f32 && p.act == MOE_COOP_ACT_SILU && p.dbg == 0 && wide_a &&
++           ((p.I == 512 && geometry_b == 2) || (p.I == 640 && geometry_b == 1));
++}
++
+ void opera_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
+ {
+     TORCH_CHECK(at::cuda::getDeviceProperties(device)->major == 8 && at::cuda::getDeviceProperties(device)->minor == 0, "Opera coop requires SM80");
+@@ -138,8 +150,6 @@
+     const int geometry_b = !wide_b ? 0 : (opera_down_wide && p.Ho % 512 == 0 && p.I % 256 == 0 && p.topk <= 8 ? 2 : 1);
+     MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
+     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, geometry_b);
+-    moe_coop_smem_optin(ka.kernel, ka.smem);
+-    moe_coop_smem_optin(kb.kernel, kb.smem);
+ 
+     const int base_a = slots * nproj * (p.I / (wide_a ? 128 : MOE_COOP_COLS));
+     const int base_b = slots * (p.Ho / (geometry_b == 2 ? 512 : wide_b ? 128 : MOE_COOP_COLS));
+@@ -148,6 +158,17 @@
+     p.ksplit_b = moe_coop_pick_ksplit(base_b, p.I / 16, max_split, device);
+     const int grid_a = base_a * p.ksplit_a;
+     const int grid_b = base_b * p.ksplit_b;
++
++    if (p.I == 512 && trim_fixed_ok(p, K_gu, K_d, cb, wide_a, geometry_b))
++    {
++        ka = {(void*) opera_coop_ns::opera_coop_a_kernel<3,2,true,false,512>,
++              opera_coop_ns::smem_a_bytes<3,false,1>(p.Hi)};
++        kb = {(void*) opera_coop_ns::opera_coop_b_kernel<3,2,2,false,512>,
++              opera_coop_ns::smem_b_bytes<3,false,2>()};
++    }
++    // TRIM_FIXED_DISPATCH: unsupported shapes retain ka/kb from the generic selectors.
++    moe_coop_smem_optin(ka.kernel, ka.smem);
++    moe_coop_smem_optin(kb.kernel, kb.smem);
+ 
+     void* args[] = { (void*) &p };
+     if (p.a_global)
+--- a/quant/opera_coop_kernel.cuh
++++ b/quant/opera_coop_kernel.cuh
+@@ -828,13 +828,34 @@
+ #endif
+ 
+ // ---------------------------------------------------------------------------------------------
++// DESK item 3: overwrite only integer/boolean fields proved by the host guard.
++// Arithmetic bodies, initial 0+value operations, fences and atomics are unchanged.
++template <int I>
++__device__ __forceinline__ MoeCoopParams fixed_params(MoeCoopParams p)
++{
++    if constexpr (I != 0)
++    {
++        p.topk = 6;
++        p.H = p.Hi = p.Ho = p.H_out = 5120;
++        p.I = I;
++        p.ksplit_a = p.ksplit_b = 1;
++        p.gated = true;
++        p.a_global = true;
++        p.gu_f32 = false;
++        p.act = MOE_COOP_ACT_SILU;
++        p.dbg = 0;
++    }
++    return p;
++}
++
+ // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
+ // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
+ 
+-template <int bits, int cb, bool WIDE, bool HALF = false>
++template <int bits, int cb, bool WIDE, bool HALF = false, int FIXED_I = 0>
+ __global__ __launch_bounds__(THREADS)
+-void opera_coop_a_kernel(const MoeCoopParams p)
+-{
++void opera_coop_a_kernel(const MoeCoopParams p_in)
++{
++    const MoeCoopParams p = fixed_params<FIXED_I>(p_in);
+     constexpr int TCOLS = tile_cols<WIDE>();
+     constexpr int GPC = tile_gpc<WIDE>();
+     constexpr int CPB = tile_cpb<WIDE>();
+@@ -967,10 +988,11 @@
+ // token's slots (rotation * svh, down bias, routing weight) in a fixed order, merges the shared
+ // expert and stores the trimmed row
+ 
+-template <int bits, int cb, int WIDE, bool HALF = false>
++template <int bits, int cb, int WIDE, bool HALF = false, int FIXED_I = 0>
+ __global__ __launch_bounds__(THREADS)
+-void opera_coop_b_kernel(const MoeCoopParams p)
+-{
++void opera_coop_b_kernel(const MoeCoopParams p_in)
++{
++    const MoeCoopParams p = fixed_params<FIXED_I>(p_in);
+     constexpr int GB = WIDE;  // Opera: 0=narrow,1=stock128,2=wide512
+     constexpr int TCOLS = tile_cols<GB>();
+     constexpr int GPC = tile_gpc<GB>();

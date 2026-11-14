@@ -1,0 +1,376 @@
+From 16493f6600e1b9156474aadffbf5089f9b622111 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 19:17:23 +0200
+Subject: [PATCH 05/10] Forward V4.1 shared cache sources across pipeline cuts
+
+Instantiate attention-only shadows before local consumers, ship their
+normalized source inputs and candidate blocks, and load duplicated
+source weights under shadow names. Use the V2 runner aux-state relay
+for DSpark instead of maintaining a separate V1 proposer.
+
+Origin: dsv41reap-pp; new
+Upstream: none
+---
+ .../deepseek_v41/ampere/ampere_sparse.py      |   4 +
+ vllm/models/deepseek_v41/nvidia/model.py      | 107 +++++++++++--
+ vllm/models/deepseek_v41/pp_shadow.py         | 148 ++++++++++++++++++
+ 3 files changed, 242 insertions(+), 17 deletions(-)
+ create mode 100644 vllm/models/deepseek_v41/pp_shadow.py
+
+diff --git a/vllm/models/deepseek_v41/ampere/ampere_sparse.py b/vllm/models/deepseek_v41/ampere/ampere_sparse.py
+index 0ea9ca6052..4f75eb2e2c 100644
+--- a/vllm/models/deepseek_v41/ampere/ampere_sparse.py
++++ b/vllm/models/deepseek_v41/ampere/ampere_sparse.py
+@@ -8,6 +8,7 @@ from vllm.models.deepseek_v41.amd.rocm import (
+     DeepseekV41ROCMAiterSparseSWABackend,
+ )
+ from vllm.platforms.interface import DeviceCapability
++from vllm.models.deepseek_v41.attention import DeepseekV4Indexer
+ 
+ 
+ class DeepseekV41AmpereMLASparseBackend(DeepseekV41ROCMAiterMLASparseBackend):
+@@ -34,6 +35,9 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
+     backend_cls = DeepseekV41AmpereMLASparseBackend
+     swa_backend_cls = DeepseekV41AmpereSparseSWABackend
+ 
++    def _indexer_cls(self, k_cache):
++        return DeepseekV4Indexer
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         # Preserve the grouped-BMM weight layout. The MXFP8 selector falls
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index c7e779cba2..7b3373659a 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -99,6 +99,13 @@ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
++from ..pp_shadow import (
++    CAND_KEY as _DSV41_CAND_KEY,
++    SRC_KEY as _DSV41_SRC_KEY,
++    PPShadowPlan as _DSV41PPShadowPlan,
++    ShadowSource as _DSV41ShadowSource,
++    remap_shadow_weight_name as _dsv41_remap_shadow_weight_name,
++)
+ from ..common.engram import (
+     Engram,
+     EngramBatch,
+@@ -628,6 +635,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+         if self.use_sequence_parallel:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
++        if getattr(self, "_dsv41_ship_attn_input", False):
++            self._dsv41_shipped_x = x
+         x = self.attn(positions, x, None)
+         # With GEMM-RS bound, the attention output is already this rank's
+         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
+@@ -700,6 +709,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+ 
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
++    supports_aux_hidden_states_over_pp = True
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -820,6 +831,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # ranks to belong to one NVLink domain. Collective: run before layers.
+         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
+ 
++        # PP cuts inside kv-sharing groups (overlay): shadow kv sources.
++        from vllm.distributed.utils import get_pp_indices as _dsv41_get_pp_indices
++
++        _pp_start, _pp_end = _dsv41_get_pp_indices(
++            config.num_hidden_layers,
++            get_pp_group().rank_in_group,
++            get_pp_group().world_size,
++        )
++        self._pp_plan = _DSV41PPShadowPlan(
++            config, config.num_hidden_layers, _pp_start, _pp_end
++        )
++        self.shadow_sources = nn.ModuleDict()
++        for s in self._pp_plan.shadow_ids:
++            attn = _select_dsv4_attn_cls(vllm_config)(
++                vllm_config,
++                prefix=f"{prefix}.layers.{s}.attn",
++                topk_indices_buffer=self.topk_indices_buffer,
++                aux_stream_list=aux_stream_list,
++                candidate_block_buffer=self.candidate_block_buffer,
++            )
++            self.shadow_sources[str(s)] = _DSV41ShadowSource(attn, s)
++
+         self.start_layer, self.end_layer, self.layers = make_layers(
+             config.num_hidden_layers,
+             lambda prefix: DeepseekV4DecoderLayer(
+@@ -836,6 +869,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             ),
+             prefix=f"{prefix}.layers",
+         )
++        assert (self.start_layer, self.end_layer) == (_pp_start, _pp_end)
++        for source in self._pp_plan.owned_ship_ids:
++            self.layers[source]._dsv41_ship_attn_input = True
+         self.engram_batch = EngramBatch.create(
+             [
+                 layer.engram
+@@ -952,20 +988,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # layer and keeps that shape until the final hc collapse — plus the
+         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
+         # for its attention collapse.
+-        return IntermediateTensors(
+-            {
+-                "hidden_states": torch.zeros(
+-                    (batch_size, self.hc_mult, self.config.hidden_size),
+-                    dtype=dtype,
+-                    device=device,
+-                ),
+-                "pre_mix": torch.zeros(
+-                    (batch_size, self.hc_mult),
+-                    dtype=torch.float32,
+-                    device=device,
+-                ),
+-            }
+-        )
++        tensors = {
++            "hidden_states": torch.zeros(
++                (batch_size, self.hc_mult, self.config.hidden_size),
++                dtype=dtype,
++                device=device,
++            ),
++            "pre_mix": torch.zeros(
++                (batch_size, self.hc_mult),
++                dtype=torch.float32,
++                device=device,
++            ),
++        }
++        plan = self._pp_plan
++        # Declare exactly what the previous rank sends (dummy runs read these).
++        for s in plan.recv_ids:
++            tensors[_DSV41_SRC_KEY.format(s)] = torch.zeros(
++                (batch_size, self.config.hidden_size), dtype=dtype, device=device
++            )
++        if plan.ship_cand or plan.recv_cand:
++            tensors[_DSV41_CAND_KEY] = torch.zeros(
++                (batch_size, plan.cand_blocks), dtype=torch.int32, device=device
++            )
++        return IntermediateTensors(tensors)
+ 
+     def forward(
+         self,
+@@ -1073,6 +1118,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         if not get_pp_group().is_first_rank:
+             assert intermediate_tensors is not None
+             pre_mix = intermediate_tensors["pre_mix"]
++            plan = self._pp_plan
++            num_tokens = positions.shape[0]
++            if plan.recv_cand:
++                self.candidate_block_buffer[:num_tokens].copy_(
++                    intermediate_tensors[_DSV41_CAND_KEY][:num_tokens]
++                )
++            for s in plan.shadow_ids:
++                self.shadow_sources[str(s)].run(
++                    intermediate_tensors[_DSV41_SRC_KEY.format(s)][:num_tokens],
++                    positions,
++                    plan.shadow_needs[s],
++                )
+         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
+         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+             range(self.start_layer, self.decoder_replay_start),
+@@ -1115,9 +1172,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         ] + late_aux
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
+-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+-            )
++            out = {"hidden_states": hidden_states, "pre_mix": pre_mix}
++            plan = self._pp_plan
++            num_tokens = positions.shape[0]
++            for s in plan.ship_ids:
++                key = _DSV41_SRC_KEY.format(s)
++                if s in plan.owned_ship_ids:
++                    out[key] = self.layers[s]._dsv41_shipped_x
++                else:
++                    assert intermediate_tensors is not None
++                    out[key] = intermediate_tensors[key][:num_tokens]
++            if plan.ship_cand:
++                assert self.candidate_block_buffer is not None
++                out[_DSV41_CAND_KEY] = self.candidate_block_buffer[:num_tokens]
++            out.update(self.pack_local_aux_hidden_states(aux_hidden_states))
++            return IntermediateTensors(out)
+ 
+         # MTP needs full HC states; otherwise collapse and normalize locally
+         # before gathering to reduce communication.
+@@ -1137,6 +1206,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
+             # Without MTP, gather only the collapsed and normalized hidden states.
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
++        aux_hidden_states = (
++            self.collect_remote_aux_hidden_states(intermediate_tensors) + aux_hidden_states
++        )
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+@@ -1328,6 +1400,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         )
+ 
+         for name, loaded_weight in weights:
++            name = _dsv41_remap_shadow_weight_name(name, self._pp_plan.shadow_ids)
+             if name.startswith(("vision.", "aligner.", "image_")):
+                 # Vision weights are loaded by the outer multimodal wrapper.
+                 logger.warning_once("Skipping non-text weight: %s", name)
+diff --git a/vllm/models/deepseek_v41/pp_shadow.py b/vllm/models/deepseek_v41/pp_shadow.py
+new file mode 100644
+index 0000000000..89921ca1fc
+--- /dev/null
++++ b/vllm/models/deepseek_v41/pp_shadow.py
+@@ -0,0 +1,148 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Forward shared attention-source inputs across DeepSeek V4.1 pipeline cuts.
++
++A later stage instantiates attention-only shadows of the KV and index sources
++its local layers need. The owning stage ships the normalized attention input
++(BF16 [T, hidden]); each shadow recomputes the compressed latent and index K,
++plus top-k when needed. Candidate blocks are forwarded alongside those inputs.
++"""
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from vllm.distributed import get_pp_group
++from vllm.distributed.utils import get_pp_indices
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++SRC_KEY = "dsv41_src{}"
++CAND_KEY = "dsv41_cand"
++
++
++def _rank_ranges(num_layers: int) -> list[tuple[int, int]]:
++    pp = get_pp_group().world_size
++    return [get_pp_indices(num_layers, r, pp) for r in range(pp)]
++
++
++def shadow_needs_for(config, start: int, end: int) -> dict[int, bool]:
++    """{source layer -> needs_topk} for the sources of [start, end) that live on
++    an earlier rank. kv sources provide the compressed-KV + indexer K caches;
++    index sources additionally publish top-k indices (and candidate blocks)."""
++    kv_sources = tuple(getattr(config, "kv_source_layer_ids", ()) or ())
++    idx_sources = tuple(getattr(config, "index_source_layer_ids", ()) or ())
++    ratios = list(getattr(config, "compress_ratios", []) or [])
++    needed: dict[int, bool] = {}
++    for layer in range(start, end):
++        if layer >= len(ratios) or ratios[layer] == 0:
++            continue
++        kv_src = max(s for s in kv_sources if s <= layer)
++        if kv_src < start:
++            needed.setdefault(kv_src, False)
++        idx_src = max(s for s in idx_sources if s <= layer)
++        if idx_src < start:
++            needed[idx_src] = True
++    return needed
++
++
++def shadow_ids_for(config, start: int, end: int) -> list[int]:
++    return sorted(shadow_needs_for(config, start, end))
++
++
++class PPShadowPlan:
++    """Per-rank plan: which sources to shadow, which inputs to ship."""
++
++    def __init__(self, config, num_layers: int, start: int, end: int) -> None:
++        self.start, self.end = start, end
++        pp = get_pp_group()
++        self.rank = pp.rank_in_group
++        ranges = _rank_ranges(num_layers)
++        self.shadow_needs = shadow_needs_for(config, start, end) if self.rank > 0 else {}
++        self.shadow_ids = sorted(self.shadow_needs)
++        # sources some later rank needs -> this rank must emit them (own or forward)
++        later_needs: set[int] = set()
++        for r in range(self.rank + 1, len(ranges)):
++            later_needs.update(shadow_ids_for(config, *ranges[r]))
++        # only sources already produced by this or an earlier rank can be shipped
++        self.ship_ids = sorted(s for s in later_needs if s < end)
++        self.owned_ship_ids = [s for s in self.ship_ids if start <= s < end]
++        # what the previous rank hands us (= what our forward reads before its layers)
++        self.recv_ids = sorted(set(self.shadow_ids) | {s for s in self.ship_ids if s < start})
++        cand_src = getattr(config, "candidate_source_layer_id", -1)
++        self.cand_blocks = getattr(config, "candidate_topk_blocks", 0) or 0
++        has_cand = cand_src >= 0 and self.cand_blocks > 0
++        # later ranks hold layers after the candidate source -> ship candidates
++        self.ship_cand = has_cand and cand_src < end and any(
++            ranges[r][1] > cand_src + 1 for r in range(self.rank + 1, len(ranges))
++        )
++        self.recv_cand = has_cand and start > cand_src
++        logger.info(
++            "PP shadow plan rank %d layers [%d, %d): shadow sources %s, ship %s "
++            "(owned %s), candidates ship=%s recv=%s",
++            self.rank, start, end, self.shadow_needs, self.ship_ids,
++            self.owned_ship_ids, self.ship_cand, self.recv_cand,
++        )
++
++    @property
++    def active(self) -> bool:
++        return bool(self.shadow_ids or self.ship_ids or self.ship_cand or self.recv_cand)
++
++
++class ShadowSource(nn.Module):
++    """A kv-source layer's attention module, re-instantiated on a later rank
++    under the source's prefix, driven by the shipped attention input."""
++
++    def __init__(self, attn: nn.Module, layer_id: int) -> None:
++        super().__init__()
++        self.attn = attn
++        self.layer_id = layer_id
++
++    @torch.no_grad()
++    def run(self, x: torch.Tensor, positions: torch.Tensor, need_topk: bool) -> None:
++        """Recompute what consumers read from this source: the compressed-KV
++        cache and indexer K cache (always), plus the top-k indices / candidate
++        blocks when a local layer uses this source's indexer.
++
++        Runs as a breakable-cudagraph *eager* segment: the compressor insert and
++        indexer K store are gated on attention metadata, which is absent during
++        PIECEWISE capture, so a captured copy would be a permanent no-op."""
++        fns = self.__dict__.setdefault("_dsv41_eager_fns", {})
++        fn = fns.get(bool(need_topk))
++        if fn is None:
++            # tensors only cross the eager-break boundary; bind self/need_topk here
++            impl = self._run_impl
++            if need_topk:
++                fn = _eager_break(lambda x_, p_: impl(x_, p_, True))
++            else:
++                fn = _eager_break(lambda x_, p_: impl(x_, p_, False))
++            fns[bool(need_topk)] = fn
++        fn(x, positions)
++
++    def _run_impl(self, x: torch.Tensor, positions: torch.Tensor, need_topk: bool) -> None:
++        attn = self.attn
++        qr_kv, kv_score, indexer_weights = attn._run_parallel_input_projections(x)
++        qr, qr_scale, _kv = attn._split_qkv_and_norm(qr_kv)
++        latent = attn.compressor(kv_score, positions) if attn.compressor is not None else None
++        index_q = index_q_scale = index_weights_out = None
++        if attn.indexer is not None:
++            # produces the K cache rows (owns_k) and the quantized index query
++            index_q, index_q_scale, index_weights_out = attn.indexer(
++                qr, latent, indexer_weights, positions, attn.indexer_rotary_emb, qr_scale
++            )
++        if attn.compressor is not None:
++            attn.compressor.insert_cache(latent, positions, attn.rotary_emb)
++        if need_topk and attn.indexer is not None and index_q is not None:
++            q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
++            attn.indexer.indexer_op(x, q_quant, None, index_weights_out)
++
++
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture as _eager_break
++
++
++def remap_shadow_weight_name(name: str, shadow_ids: list[int]) -> str:
++    for s in shadow_ids:
++        pfx = f"layers.{s}.attn."
++        if name.startswith(pfx):
++            return f"shadow_sources.{s}.attn." + name[len(pfx):]
++    return name

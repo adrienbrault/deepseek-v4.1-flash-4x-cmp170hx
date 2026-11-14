@@ -1,0 +1,35 @@
+# Purpose: Fail closed when the requested header prescan cannot direct-fill GPU trellis arenas; log final arena storage.
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -3689,6 +3689,13 @@
+             and os.environ.get("VLLM_EXL3_ARENA_PRESCAN", "1") != "0"
+         ):
+             shapes = _try_prescan_trellis_shapes(layer, int(num_experts))
++            if shapes is None and os.environ.get("VLLM_EXL3_REQUIRE_ARENA_PRESCAN", "0") == "1":
++                raise RuntimeError(
++                    "EXL3 arena prescan failed for "
++                    f"{getattr(layer, 'layer_name', None) or getattr(layer, 'prefix', '?')}; "
++                    "refusing whole-model host staging. Check VLLM_EXL3_MODEL_DIR, "
++                    "the checkpoint index and trellis headers."
++                )
+             if shapes is not None:
+                 layer._exl3_trellis_shapes_pending = shapes
+                 logger.info(
+@@ -4014,6 +4021,17 @@
+                     stats.get("final_bytes"),
+                     stats.get("temp_peak_bytes"),
+                 )
++
++        if os.environ.get("VLLM_EXL3_REQUIRE_ARENA_PRESCAN", "0") == "1":
++            stats = getattr(layer, "_exl3_trellis_arena_stats", {})
++            if not stats.get("planned") or staged_n:
++                raise RuntimeError("EXL3 required direct-fill arenas were not used")
++            logger.info(
++                "EXL3_ARENA layer=%s storages=%d bytes=%d planned=%s staging=%d",
++                getattr(layer, "layer_name", None) or getattr(layer, "prefix", "?"),
++                _count_trellis_storages(layer), _trellis_nbytes(layer),
++                stats.get("planned"), staged_n,
++            )
+ 
+         # Bind owner for any late loads; stitch LinearEXL3 handles.
+         for name in (

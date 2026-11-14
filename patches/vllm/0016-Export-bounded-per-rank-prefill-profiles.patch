@@ -1,0 +1,100 @@
+From abdf4dc9f2a6b19c339297fe919051a4d30fd933 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 20:52:15 +0200
+Subject: [PATCH 16/20] Export bounded per-rank prefill profiles
+
+Allow selecting matching worker calls and archive Chrome traces, tables and synchronized wall timing without changing the default capture schedule.
+
+Origin: Local prefill profiling study
+
+Upstream: Not submitted; operator GPU validation pending
+
+
+Signed-off-by: Adrien Brault <adrien.brault@gmail.com>
+---
+ vllm/utils/dsv41_diagnostics.py | 47 +++++++++++++++++++++++++++++++--
+ 1 file changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/utils/dsv41_diagnostics.py b/vllm/utils/dsv41_diagnostics.py
+index abedaa2b02..13ce17ded2 100644
+--- a/vllm/utils/dsv41_diagnostics.py
++++ b/vllm/utils/dsv41_diagnostics.py
+@@ -3,14 +3,49 @@
+ """Opt-in startup accounting and bounded serving diagnostics."""
+ 
+ import functools
++import json
+ import os
+ import time
++from pathlib import Path
+ 
+ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+ 
+ 
++def profile_steps() -> set[int]:
++    """Matching worker calls to capture; defaults retain the decode diagnostic."""
++    steps = {int(s) for s in os.environ.get(
++        "DSV41_DEBUG_PROFILE_STEPS", "40,41"
++    ).split(",")}
++    if not steps or min(steps) < 1:
++        raise ValueError("DSV41_DEBUG_PROFILE_STEPS must contain positive integers")
++    return steps
++
++
++def export_profile(profiler, tokens: int, hit: int, elapsed_ms: float) -> None:
++    """Export separate traces for every distributed rank when requested."""
++    directory = os.environ.get("DSV41_DEBUG_PROFILE_DIR")
++    if not directory:
++        return
++    import torch.distributed as dist
++
++    rank = dist.get_rank() if dist.is_initialized() else 0
++    root = Path(directory)
++    root.mkdir(parents=True, exist_ok=True)
++    stem = root / f"prefill-rank{rank}-t{tokens}-hit{hit}"
++    profiler.export_chrome_trace(str(stem) + ".trace.json")
++    table = profiler.key_averages().table(
++        sort_by="self_cuda_time_total", row_limit=200
++    )
++    Path(str(stem) + ".txt").write_text(table)
++    Path(str(stem) + ".meta.json").write_text(json.dumps({
++        "rank": rank, "scheduled_tokens": tokens, "matching_call": hit,
++        "synchronized_wall_ms": elapsed_ms,
++        "profile_steps": sorted(profile_steps()),
++    }, indent=2) + "\n")
++
++
+ def memory_census(phase, device):
+     if os.environ.get("DSV41_MEMORY_CENSUS", "0") != "1":
+         return
+@@ -58,15 +93,23 @@ def debug_call(label, *switches):
+             if profile:
+                 count = getattr(self, "_dsv41_profile_count", 0) + 1
+                 self._dsv41_profile_count = count
+-                profile = count in (40, 41)
++                profile = count in profile_steps()
+             if sync:
+                 torch.cuda.synchronize()
+             start = time.perf_counter()
+             if profile:
+                 from torch.profiler import ProfilerActivity, profile as torch_profile
+ 
+-                with torch_profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
++                torch.cuda.synchronize()
++                profile_start = time.perf_counter()
++                with torch_profile(
++                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
++                    record_shapes=True,
++                ) as p:
+                     result = fn(self, *args, **kwargs)
++                    torch.cuda.synchronize()
++                elapsed_ms = (time.perf_counter() - profile_start) * 1e3
++                export_profile(p, tokens, count, elapsed_ms)
+                 logger.info("DSV41 PROFILE %s", p.key_averages().table(
+                     sort_by="self_cuda_time_total", row_limit=40,
+                 ))
+-- 
+2.55.0
+

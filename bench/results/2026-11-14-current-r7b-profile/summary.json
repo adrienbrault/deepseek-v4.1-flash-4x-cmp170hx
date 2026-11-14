@@ -1,0 +1,41 @@
+{
+  "date_utc": "2026-11-14",
+  "configuration": "current-r7b",
+  "status": "PARTIAL, one profiling boot",
+  "source": "rounds/profile-r7b-r1/REPORT-20261114T111118Z.md",
+  "cells": [
+    {
+      "cell": "c4k3",
+      "rank": 0,
+      "share_percent": {
+        "all_reduce_ring": 26.6,
+        "drafter": 4.9,
+        "routed_moe": 34.8,
+        "attention": 2.8,
+        "mhc": 4.8
+      }
+    },
+    {
+      "cell": "c8k2",
+      "rank": 0,
+      "share_percent": {
+        "all_reduce_ring": 29.6,
+        "drafter": 4.7,
+        "routed_moe": 35.6,
+        "attention": 2.6,
+        "mhc": 4.2
+      }
+    },
+    {
+      "cell": "c1k5",
+      "rank": 0,
+      "share_percent": {
+        "all_reduce_ring": 20.3,
+        "drafter": 8.3,
+        "routed_moe": 28.7,
+        "attention": 3.5,
+        "mhc": 5.3
+      }
+    }
+  ]
+}

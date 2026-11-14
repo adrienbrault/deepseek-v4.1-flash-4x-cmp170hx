@@ -1,0 +1,13 @@
+--- a/vllm/models/deepseek_v41/ssd/engram_ssd.py
++++ b/vllm/models/deepseek_v41/ssd/engram_ssd.py
+@@ -217,6 +217,10 @@
+             raise RuntimeError(f"cudaLaunchHostFunc failed: {err}")
+         dw[:count].copy_(w[:count], non_blocking=True)
+         ds[:count].copy_(s[:count], non_blocking=True)
++        if os.environ.get("DSV41_EG_DEQUANT", "0") == "1":
++            from dsv41_engram_gap.dequant import dequant
++            dequant(dw[:count], ds[:count], out.view(-1, self.dim)[:count])
++            return
+         # Dequant on the device: fp8 e4m3 * 2^(e8m0 - 127), per 32 columns.
+         vals = dw[:count].view(torch.float8_e4m3fn).to(torch.float32)
+         scale = (ds[:count].to(torch.int32) << self._exp_shift).view(torch.float32)

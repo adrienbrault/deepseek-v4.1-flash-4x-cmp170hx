@@ -1,0 +1,38 @@
+From e2298a23bf8fb532c1b5c5d490184d3360df279f Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 22:23:46 +0200
+Subject: [PATCH] Apply the inverse RoPE in the un-tuned sparse decode fallback
+
+The fallback decode kernel used on Ampere (and on ROCm parts other than
+gfx942/gfx950) has no rotating epilogue, yet rocm_sparse_attn_decode returns
+the full row count as rotated whenever inv_rope_positions is supplied. The
+caller then skips its standalone inverse RoPE, so every decode row reaches
+wo_a unrotated. On 4x SM80 cards with DSpark this produced degenerate greedy
+text after the prefill tokens and a mean acceptance length of about 1.3.
+
+Rotate the fallback's output rows in place when positions are supplied.
+
+Origin: new
+---
+ vllm/v1/attention/ops/rocm_aiter_mla_sparse.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index 8ac0afc966..8aec039b24 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -4177,7 +4177,10 @@ def _rocm_sparse_attn_decode_ragged_triton(
+             num_warps=warps if use_sm80 else 8,
+             **({"num_stages": stages} if use_sm80 else {}),
+         )
+-        if sm80_requested and inv_rope_positions is not None:
++        # This kernel has no rotating epilogue, but rocm_sparse_attn_decode reports
++        # every row rotated whenever positions are supplied, so the caller skips its
++        # own inverse RoPE. Rotate here on every path that reaches it.
++        if inv_rope_positions is not None:
+             assert inv_rope_cos_sin_cache is not None
+             rocm_inverse_rope_rows_(
+                 out, inv_rope_positions, inv_rope_cos_sin_cache, rope_head_dim
+-- 
+2.55.0
+

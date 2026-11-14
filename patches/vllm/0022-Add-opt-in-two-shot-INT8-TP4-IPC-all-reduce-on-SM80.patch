@@ -1,0 +1,401 @@
+From 5b581ec8ad78d1e8acea9fd308519c60a31184ec Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 22:03:15 +0200
+Subject: [PATCH 22/22] Add opt-in two-shot INT8 TP4 IPC all-reduce on SM80
+
+Quantize finite BF16 partials in blocks of 256 with FP32 scales. Reduce rank-owned quarters in FP32, requantize and gather the quarters. Reuse the CUDA IPC allocation API with dedicated buffers and device epochs so graph replays cannot overwrite unread payloads. Include an independent codec and absolute error-budget CPU test.
+
+Origin: dsv41 overlap round r17
+Upstream: local numerics-changing experiment
+---
+ tests/distributed/test_custom_all_reduce.py   |  24 ++
+ .../device_communicators/cuda_communicator.py |  20 ++
+ .../dsv41_int8_all_reduce.py                  | 278 ++++++++++++++++++
+ vllm/envs.py                                  |   2 +
+ 4 files changed, 324 insertions(+)
+ create mode 100644 vllm/distributed/device_communicators/dsv41_int8_all_reduce.py
+
+diff --git a/tests/distributed/test_custom_all_reduce.py b/tests/distributed/test_custom_all_reduce.py
+index 84ff524499..2874ce9185 100644
+--- a/tests/distributed/test_custom_all_reduce.py
++++ b/tests/distributed/test_custom_all_reduce.py
+@@ -725,3 +725,27 @@ def test_custom_allreduce(
+     if world_size > torch.accelerator.device_count():
+         pytest.skip("Not enough GPUs to run the test.")
+     multi_process_parallel(monkeypatch, tp_size, pipeline_parallel_size, test_target)
++
++
++def test_dsv41_int8_block_error_bound_cpu():
++    """Bound absolute error even for outliers, cancellation and zero blocks."""
++    from vllm.distributed.device_communicators.dsv41_int8_all_reduce import (
++        int8_reference,
++    )
++
++    generator = torch.Generator().manual_seed(170)
++    for rows in (1, 6, 24, 48):
++        x = torch.randn(4, rows, 5120, generator=generator).bfloat16()
++        for case in range(4):
++            values = x.clone()
++            if case == 1:
++                values[:, ::2, ::256] *= 64
++            elif case == 2:
++                values[1] = -values[0]
++                values[3] = -values[2]
++            elif case == 3:
++                values.zero_()
++            got, ref, bound = int8_reference(values)
++            assert ((got.float() - ref.float()).abs() <= bound + 1.e-6).all()
++            if case >= 2:
++                assert torch.equal(got, ref)
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index b752a4b2f1..22a7e351b2 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -117,6 +117,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         self.symm_mem_comm: SymmMemCommunicator | None = None
+         self.fi_ar_comm: FlashInferAllReduce | None = None
+         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
++        self.int8_ar_comm = None
++        if envs.VLLM_DSV41_INT8_AR and unique_name.split(":")[0] == "tp":
++            from .dsv41_int8_all_reduce import DSV41Int8AllReduce
++
++            if envs.VLLM_BATCH_INVARIANT:
++                raise ValueError(
++                    "INT8 all-reduce changes numerics; "
++                    "batch invariant mode is incompatible"
++                )
++            self.int8_ar_comm = DSV41Int8AllReduce(self.cpu_group, self.device)
++            logger.warning_once(
++                "Experimental INT8 TP4 all-reduce enabled: "
++                "256-value scales, FP32 sums, finite BF16 inputs only"
++            )
+         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+         self.use_aiter_ag_rs: bool = False
+ 
+@@ -379,6 +393,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         return self._all_reduce(input_)
+ 
+     def _all_reduce(self, input_):
++        int8_comm = getattr(self, "int8_ar_comm", None)
++        if int8_comm is not None and int8_comm.supports(input_):
++            return int8_comm.all_reduce(input_)
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+@@ -823,6 +840,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             raise ValueError("No PyNCCL communicator found")
+ 
+     def destroy(self):
++        if self.int8_ar_comm is not None:
++            self.int8_ar_comm.destroy()
++            self.int8_ar_comm = None
+         if self.pynccl_comm is not None:
+             self.pynccl_comm.destroy()
+             self.pynccl_comm = None
+diff --git a/vllm/distributed/device_communicators/dsv41_int8_all_reduce.py b/vllm/distributed/device_communicators/dsv41_int8_all_reduce.py
+new file mode 100644
+index 0000000000..387c8c76c9
+--- /dev/null
++++ b/vllm/distributed/device_communicators/dsv41_int8_all_reduce.py
+@@ -0,0 +1,278 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Experimental TP4 INT8 IPC all-reduce, with FP32 block scales and sums.
++
++Two-shot pull: publish quantized input, reduce each rank's quarter in FP32,
++requantize the sums, then gather the quantized quarters. Three rendezvous
++protect both phases and storage reuse. Uses vLLM's CUDA IPC allocator, with
++dedicated storage rather than aliasing FlashInfer's opaque mailbox.
++"""
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
++from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.triton_utils import tl, triton
++
++WIDTH = 5120
++MAX_ROWS = 48
++BLOCK = 256
++PAYLOAD = MAX_ROWS * WIDTH
++SCALES = PAYLOAD // BLOCK
++# Header: input-ready, shard-ready, consumed epochs; data/scales follow it.
++HEADER = 256
++SCALE_OFFSET = HEADER + PAYLOAD
++SECOND_OFFSET = SCALE_OFFSET + SCALES * 4
++SECOND_SCALE_OFFSET = SECOND_OFFSET + PAYLOAD // 4
++BUFFER_BYTES = SECOND_SCALE_OFFSET + SCALES
++
++
++def int8_reference(inputs):
++    """Independent torch codec and conservative elementwise BF16 error budget.
++
++    Inputs are four finite BF16 rank tensors. The bound includes quantization,
++    FP32 dequantization/addition, and final/reference BF16 rounding.
++    """
++    values = inputs.float().reshape(4, -1, BLOCK)
++    scales = (values.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1.0e-30)
++    quantized = torch.round(values / scales).clamp(-127, 127)
++    decoded = quantized * scales
++    total = torch.zeros_like(decoded[0])
++    exact = torch.zeros_like(values[0])
++    for rank in range(4):
++        total = total + decoded[rank]
++        exact = exact + values[rank]
++    output_scales = (total.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1.0e-30)
++    requantized = torch.round(total / output_scales).clamp(-127, 127)
++    decoded_total = requantized * output_scales
++    result = decoded_total.to(torch.bfloat16).reshape(inputs.shape[1:])
++    reference = exact.to(torch.bfloat16).reshape(inputs.shape[1:])
++    fp32_budget = 1.0e-6 * values.abs().sum(0)
++    bound = (
++        0.5 * (scales.sum(0) + output_scales)
++        + fp32_budget
++        + (decoded_total.abs() + exact.abs()) / 256.0
++    )
++    return result, reference, bound.expand_as(total).reshape(inputs.shape[1:])
++
++
++@triton.jit
++def _quantize(
++    X,
++    Ptrs,
++    RANK: tl.constexpr,
++    HEADER: tl.constexpr,
++    SCALE_OFFSET: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    block = tl.program_id(0)
++    lane = tl.arange(0, BLOCK)
++    x = tl.load(X + block * BLOCK + lane).to(tl.float32)
++    scale = tl.maximum(tl.div_rn(tl.max(tl.abs(x), 0), 127.0), 1.0e-30)
++    # Explicit round-to-nearest-even; no FP8 instructions on Ampere.
++    q = tl.inline_asm_elementwise(
++        "cvt.rni.s32.f32 $0, $1;",
++        constraints="=r,f",
++        args=[tl.div_rn(x, scale)],
++        dtype=tl.int32,
++        is_pure=True,
++        pack=1,
++    )
++    base = tl.load(Ptrs + RANK)
++    values = (base + HEADER).to(tl.pointer_type(tl.int8))
++    scales = (base + SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++    tl.store(values + block * BLOCK + lane, tl.minimum(127, tl.maximum(-127, q)))
++    tl.store(scales + block, scale)
++
++
++@triton.jit
++def _rendezvous(Ptrs, RANK: tl.constexpr, PHASE: tl.constexpr):
++    # One CTA only. Stream order completes quantize/reduce before publishing.
++    # Separate ready/consumed epochs prevent a fast rank overwriting a slow
++    # reader's payload. No host reset or capture-time sequence constants.
++    local = (tl.load(Ptrs + RANK) + PHASE * 8).to(tl.pointer_type(tl.uint64))
++    previous = tl.inline_asm_elementwise(
++        "ld.global.acquire.sys.u64 $0, [$1];", constraints="=l,l",
++        args=[local], dtype=tl.uint64, is_pure=False, pack=1)
++    epoch = previous + 1
++    tl.inline_asm_elementwise(
++        "st.global.release.sys.u64 [$1], $2; mov.u32 $0, 0;",
++        constraints="=r,l,l",
++        args=[local, epoch],
++        dtype=tl.uint32,
++        is_pure=False,
++        pack=1,
++    )
++    for peer in tl.static_range(4):
++        signal = (tl.load(Ptrs + peer) + PHASE * 8).to(tl.pointer_type(tl.uint64))
++        seen = tl.inline_asm_elementwise(
++            "ld.global.acquire.sys.u64 $0, [$1];",
++            constraints="=l,l",
++            args=[signal],
++            dtype=tl.uint64,
++            is_pure=False,
++            pack=1,
++        )
++        while seen < epoch:
++            seen = tl.inline_asm_elementwise(
++                "ld.global.acquire.sys.u64 $0, [$1];",
++                constraints="=l,l",
++                args=[signal],
++                dtype=tl.uint64,
++                is_pure=False,
++                pack=1,
++            )
++
++
++@triton.jit
++def _reduce_quantize(
++    Ptrs,
++    RANK: tl.constexpr,
++    SHARD_BLOCKS: tl.constexpr,
++    HEADER: tl.constexpr,
++    SCALE_OFFSET: tl.constexpr,
++    SECOND_OFFSET: tl.constexpr,
++    SECOND_SCALE_OFFSET: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    local_block = tl.program_id(0)
++    block = RANK * SHARD_BLOCKS + local_block
++    lane = tl.arange(0, BLOCK)
++    total = tl.full((BLOCK,), 0.0, tl.float32)
++    for rank in tl.static_range(4):
++        base = tl.load(Ptrs + rank)
++        values = (base + HEADER).to(tl.pointer_type(tl.int8))
++        scales = (base + SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++        q = tl.load(values + block * BLOCK + lane, cache_modifier=".cg").to(tl.float32)
++        scale = tl.load(scales + block, cache_modifier=".cg")
++        total = total + q * scale
++    scale = tl.maximum(tl.div_rn(tl.max(tl.abs(total), 0), 127.0), 1.0e-30)
++    q = tl.inline_asm_elementwise(
++        "cvt.rni.s32.f32 $0, $1;",
++        constraints="=r,f",
++        args=[tl.div_rn(total, scale)],
++        dtype=tl.int32,
++        is_pure=True,
++        pack=1,
++    )
++    base = tl.load(Ptrs + RANK)
++    values = (base + SECOND_OFFSET).to(tl.pointer_type(tl.int8))
++    scales = (base + SECOND_SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++    tl.store(values + local_block * BLOCK + lane, tl.minimum(127, tl.maximum(-127, q)))
++    tl.store(scales + local_block, scale)
++
++
++@triton.jit
++def _gather(
++    Ptrs,
++    Out,
++    SHARD_BLOCKS: tl.constexpr,
++    SECOND_OFFSET: tl.constexpr,
++    SECOND_SCALE_OFFSET: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    block = tl.program_id(0)
++    rank = block // SHARD_BLOCKS
++    local_block = block % SHARD_BLOCKS
++    lane = tl.arange(0, BLOCK)
++    base = tl.load(Ptrs + rank)
++    values = (base + SECOND_OFFSET).to(tl.pointer_type(tl.int8))
++    scales = (base + SECOND_SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++    q = tl.load(values + local_block * BLOCK + lane, cache_modifier=".cg").to(
++        tl.float32
++    )
++    scale = tl.load(scales + local_block, cache_modifier=".cg")
++    tl.store(Out + block * BLOCK + lane, q * scale)
++
++
++class DSV41Int8AllReduce:
++    """Single serialized stream across eager/capture/replay, like FI IPC.
++
++    TBO's comm stream is joined back to its compute stream on every handoff;
++    that also orders storage reuse against subsequent non-TBO forwards.
++    """
++
++    def __init__(self, group, device):
++        if dist.get_world_size(group) != 4:
++            raise ValueError("INT8 IPC all-reduce requires TP4")
++        if not all(in_the_same_node_as(group, source_rank=0)):
++            raise ValueError("INT8 IPC all-reduce requires a single node")
++        self.rank = dist.get_rank(group)
++        self.group = group
++        self.device = torch.device(device)
++        supported = torch.cuda.get_device_capability(device) == (8, 0)
++        # Agree before allocating: a local-only refusal would strand the peers.
++        supported = supported and all(
++            peer == self.device.index
++            or torch.cuda.can_device_access_peer(self.device.index, peer)
++            for peer in range(torch.cuda.device_count())
++        )
++        votes = [None] * 4
++        dist.all_gather_object(votes, supported, group=group)
++        if not all(votes):
++            raise ValueError("INT8 IPC requires SM80 and complete GPU peer access")
++        self.pointers = CustomAllreduce.create_shared_buffer(BUFFER_BYTES, group)
++        self.ptrs = torch.tensor(self.pointers, device=device, dtype=torch.uint64)
++        self.closed = False
++        torch.cuda.synchronize(device)
++        dist.barrier(group=group)
++
++    @staticmethod
++    def supports(x):
++        return (
++            x.is_cuda
++            and x.dtype == torch.bfloat16
++            and x.is_contiguous()
++            and x.ndim == 2
++            and x.shape[1] == WIDTH
++            and 1 <= x.shape[0] <= MAX_ROWS
++        )
++
++    def all_reduce(self, x):
++        assert self.supports(x)
++        output = torch.empty_like(x)
++        blocks = x.numel() // BLOCK
++        _quantize[(blocks,)](
++            x,
++            self.ptrs,
++            self.rank,
++            HEADER,
++            SCALE_OFFSET,
++            BLOCK,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _rendezvous[(1,)](self.ptrs, self.rank, 0, num_warps=1)
++        _reduce_quantize[(blocks // 4,)](
++            self.ptrs,
++            self.rank,
++            blocks // 4,
++            HEADER,
++            SCALE_OFFSET,
++            SECOND_OFFSET,
++            SECOND_SCALE_OFFSET,
++            BLOCK,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _rendezvous[(1,)](self.ptrs, self.rank, 1, num_warps=1)
++        _gather[(blocks,)](
++            self.ptrs,
++            output,
++            blocks // 4,
++            SECOND_OFFSET,
++            SECOND_SCALE_OFFSET,
++            BLOCK,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _rendezvous[(1,)](self.ptrs, self.rank, 2, num_warps=1)
++        return output
++
++    def destroy(self):
++        if not self.closed:
++            torch.cuda.synchronize(self.device)
++            dist.barrier(group=self.group)
++            CustomAllreduce.free_shared_buffer(self.pointers, rank=self.rank)
++            self.closed = True
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d044daea8d..3a5dcfff26 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -12,6 +12,7 @@ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any, Literal
+ 
+ if TYPE_CHECKING:
++    VLLM_DSV41_INT8_AR: bool = False
+     VLLM_DSV41_TBO_CHECK: bool = False
+     VLLM_DSV41_TBO: bool = False
+     VLLM_DSV41_TBO_MIN_ROWS: int = 12
+@@ -620,6 +621,7 @@ def _resolve_rust_cli_path() -> str | None:
+ 
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    "VLLM_DSV41_INT8_AR": lambda: bool(int(os.getenv("VLLM_DSV41_INT8_AR", "0"))),
+     "VLLM_DSV41_TBO_CHECK": lambda: bool(int(os.getenv("VLLM_DSV41_TBO_CHECK", "0"))),
+     "VLLM_DSV41_TBO": lambda: bool(int(os.getenv("VLLM_DSV41_TBO", "0"))),
+     "VLLM_DSV41_TBO_MIN_ROWS": lambda: int(os.getenv("VLLM_DSV41_TBO_MIN_ROWS", "12")),
+-- 
+2.55.0
+

@@ -1,0 +1,31 @@
+From 672fbd59ce844fef579d873b2309b95fe8c73a40 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 19:26:43 +0200
+Subject: [PATCH 10/10] Allocate only local layers in projected KV cache groups
+
+An empty pipeline projection can retain a global uniform spec. Filter
+that spec by the projected layer names when allocating tensors, avoiding
+nonlocal cache tensors on stages with no layers in the group.
+
+Origin: dsv41reap-pp
+Upstream: none
+---
+ vllm/v1/core/kv_cache_planning.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/core/kv_cache_planning.py b/vllm/v1/core/kv_cache_planning.py
+index 4d73f4303e..49931450fe 100644
+--- a/vllm/v1/core/kv_cache_planning.py
++++ b/vllm/v1/core/kv_cache_planning.py
+@@ -698,8 +698,10 @@ def get_kv_cache_config_from_groups(
+         group_spec = group.kv_cache_spec
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
++            local_names = set(group.layer_names)
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                if layer_name in local_names:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 

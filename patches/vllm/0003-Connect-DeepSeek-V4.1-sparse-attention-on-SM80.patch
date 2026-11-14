@@ -1,0 +1,132 @@
+From 74e748bbb0a42baebbae013295203bd05cd6fed5 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 19:14:32 +0200
+Subject: [PATCH 03/10] Connect DeepSeek V4.1 sparse attention on SM80
+
+Select the BF16 Triton sparse path on SM80 and retain grouped WO_A
+weights for MXFP8 emulation. Share current metadata and attention fixes
+with ROCm without probing AMD devices on CUDA. Keep upstream mHC dispatch.
+
+Origin: dsv41reap-pp; new
+Upstream: none
+---
+ vllm/models/deepseek_v41/amd/rocm.py          |  5 ++-
+ vllm/models/deepseek_v41/ampere/__init__.py   |  2 +
+ .../deepseek_v41/ampere/ampere_sparse.py      | 45 +++++++++++++++++++
+ vllm/models/deepseek_v41/nvidia/model.py      |  6 +++
+ vllm/v1/attention/backends/registry.py        |  8 ++++
+ 5 files changed, 65 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/models/deepseek_v41/ampere/__init__.py
+ create mode 100644 vllm/models/deepseek_v41/ampere/ampere_sparse.py
+
+diff --git a/vllm/models/deepseek_v41/amd/rocm.py b/vllm/models/deepseek_v41/amd/rocm.py
+index 08a3e66b65..eb2cf47074 100644
+--- a/vllm/models/deepseek_v41/amd/rocm.py
++++ b/vllm/models/deepseek_v41/amd/rocm.py
+@@ -39,7 +39,10 @@ from vllm.models.deepseek_v41.sparse_mla import (
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
+ from vllm.platforms import current_platform
+-from vllm.platforms.rocm import _ON_GFX950
++if current_platform.is_rocm():
++    from vllm.platforms.rocm import _ON_GFX950
++else:
++    _ON_GFX950 = False
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.multi_stream_utils import execute_in_parallel
+ from vllm.v1.attention.backend import (
+diff --git a/vllm/models/deepseek_v41/ampere/__init__.py b/vllm/models/deepseek_v41/ampere/__init__.py
+new file mode 100644
+index 0000000000..208f01a7cb
+--- /dev/null
++++ b/vllm/models/deepseek_v41/ampere/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/models/deepseek_v41/ampere/ampere_sparse.py b/vllm/models/deepseek_v41/ampere/ampere_sparse.py
+new file mode 100644
+index 0000000000..0ea9ca6052
+--- /dev/null
++++ b/vllm/models/deepseek_v41/ampere/ampere_sparse.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Ampere sparse MLA using the shared BF16 Triton attention implementation."""
++
++from vllm.models.deepseek_v41.amd.rocm import (
++    DeepseekV41ROCMAiterMLAAttention,
++    DeepseekV41ROCMAiterMLASparseBackend,
++    DeepseekV41ROCMAiterSparseSWABackend,
++)
++from vllm.platforms.interface import DeviceCapability
++
++
++class DeepseekV41AmpereMLASparseBackend(DeepseekV41ROCMAiterMLASparseBackend):
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_MLA_SPARSE_DSV41"
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major == 8
++
++
++class DeepseekV41AmpereSparseSWABackend(DeepseekV41ROCMAiterSparseSWABackend):
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_SPARSE_SWA_DSV41"
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major == 8
++
++
++class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
++    backend_cls = DeepseekV41AmpereMLASparseBackend
++    swa_backend_cls = DeepseekV41AmpereSparseSWABackend
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Preserve the grouped-BMM weight layout. The MXFP8 selector falls
++        # back to load-time BF16 emulation for BMM on devices below SM90.
++        self.wo_a.is_bmm = True
++
++    def prepare_attn_preshuffle(self) -> None:
++        self._wqa_wkv_scale = None
++        self._wo_b_scale = None
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 354e7e23db..c812030992 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -205,6 +205,12 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
+     FlashMLA path.
+     """
+     backend = vllm_config.attention_config.backend
++    if current_platform.is_device_capability(80):
++        from ..ampere.ampere_sparse import DeepseekV41AmpereMLAAttention
++
++        if backend not in (None, AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41):
++            raise ValueError("SM80 V4.1 requires TRITON_MLA_SPARSE_DSV41")
++        return DeepseekV41AmpereMLAAttention
+     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+         if backend not in (
+             None,
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 0499c46902..8b2e63bc86 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -90,6 +90,14 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+         "vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90."
+         "FlashInferMLASparseSM90Backend"
+     )
++    TRITON_MLA_SPARSE_DSV41 = (
++        "vllm.models.deepseek_v41.ampere.ampere_sparse."
++        "DeepseekV41AmpereMLASparseBackend"
++    )
++    TRITON_SPARSE_SWA_DSV41 = (
++        "vllm.models.deepseek_v41.ampere.ampere_sparse."
++        "DeepseekV41AmpereSparseSWABackend"
++    )
+     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
+     CUTLASS_MLA = "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"
+     FLASHMLA = "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"

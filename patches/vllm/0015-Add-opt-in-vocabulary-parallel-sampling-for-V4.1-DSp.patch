@@ -1,0 +1,1665 @@
+From 77b9d6c1c02ced0fd93484049e0446b9d6bc39cb Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 21:06:49 +0200
+Subject: [PATCH 15/20] Add opt-in vocabulary-parallel sampling for V4.1 DSpark
+
+Keep target and draft head logits sharded for greedy and seeded Gumbel
+sampling. Merge bounded top-k/nucleus candidates only when coverage is
+certified, otherwise retain the dense batch path. Compute rejection token
+probabilities and residual draws with scalar reductions and local logits.
+
+Share request seeds, preserve raw local proposal caches, and materialize
+them for unsupported batches. Include CPU math gates, GPU integration
+checks, and a four-rank sampling-stage benchmark. Defaults are unchanged.
+
+Origin: Local offline TP4 sampling implementation
+Upstream: Not submitted; requires GPU qualification and human review
+---
+ benchmarks/kernels/bench_tp_sampling.py       | 430 ++++++++++++++++++
+ tests/v1/worker/test_gpu_sampler_flags.py     |  33 ++
+ .../v1/worker/test_vocab_parallel_sampling.py | 256 +++++++++++
+ vllm/envs.py                                  |   8 +
+ vllm/models/deepseek_v41/nvidia/dspark.py     |  11 +-
+ vllm/models/deepseek_v41/nvidia/model.py      |  34 +-
+ vllm/v1/worker/gpu/model_runner.py            |  38 +-
+ vllm/v1/worker/gpu/sample/distributed.py      | 188 ++++++++
+ .../worker/gpu/sample/distributed_sampler.py  | 191 ++++++++
+ vllm/v1/worker/gpu/sample/gumbel.py           |  14 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |  35 +-
+ .../gpu/spec_decode/dspark/speculator.py      |  88 +++-
+ .../gpu/spec_decode/rejection_sampler.py      |   4 +-
+ 13 files changed, 1302 insertions(+), 28 deletions(-)
+ create mode 100644 benchmarks/kernels/bench_tp_sampling.py
+ create mode 100644 tests/v1/worker/test_vocab_parallel_sampling.py
+ create mode 100644 vllm/v1/worker/gpu/sample/distributed.py
+ create mode 100644 vllm/v1/worker/gpu/sample/distributed_sampler.py
+
+diff --git a/benchmarks/kernels/bench_tp_sampling.py b/benchmarks/kernels/bench_tp_sampling.py
+new file mode 100644
+index 0000000000..b8fd214e81
+--- /dev/null
++++ b/benchmarks/kernels/bench_tp_sampling.py
+@@ -0,0 +1,430 @@
++#!/usr/bin/env python
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Four-GPU synthetic correctness gate and sampling-stage microbenchmark.
++
++Run with torchrun in the patched vLLM environment. Writes JSON even on failure.
++No model weights required. --bench measures collectives + sampling from logits;
++LM-head/model forward and scheduler time are excluded.
++"""
++
++# Closures below are consumed synchronously within each parameter iteration.
++# ruff: noqa: B023
++
++import argparse
++import json
++import os
++import time
++import traceback
++from pathlib import Path
++
++import torch
++
++from vllm.distributed import (
++    get_tp_group,
++    init_distributed_environment,
++    initialize_model_parallel,
++)
++from vllm.distributed.parallel_state import graph_capture, set_custom_all_reduce
++from vllm.v1.worker.gpu.sample.distributed import VocabParallelSampler
++from vllm.v1.worker.gpu.sample.distributed_sampler import acceptance_uniform
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++
++
++def setup():
++    rank, local = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
++    torch.cuda.set_device(local)
++    set_custom_all_reduce(False)
++    init_distributed_environment(
++        world_size=int(os.environ["WORLD_SIZE"]),
++        rank=rank,
++        local_rank=local,
++    )
++    initialize_model_parallel(tensor_model_parallel_size=4)
++    group = get_tp_group()
++    assert group.world_size == 4
++    return rank, group
++
++
++def fixture(group, rows, vocab, temp=0.0, fp64=False):
++    # Real head shards are padded to multiples of 64 before partitioning.
++    width = ((vocab + 255) // 256) * 64
++    start = group.rank_in_group * width
++    s = VocabParallelSampler(group, start, vocab)
++    g = torch.Generator(device="cuda").manual_seed(91 + group.rank_in_group)
++    local = s.mask_padding(
++        torch.randn(rows, width, generator=g, device="cuda", dtype=torch.bfloat16)
++    )
++    full = group.all_gather(local, dim=-1)[:, :vocab]
++    mapping = torch.arange(rows, dtype=torch.int64, device="cuda")
++    seeds = mapping * 917 + 0x123456789ABC
++    pos = mapping + 70000
++    temperature = torch.full((rows,), temp, device="cuda")
++
++    def draw(x, offset=start):
++        return gumbel_sample(
++            x,
++            mapping,
++            temperature,
++            seeds,
++            pos,
++            apply_temperature=False,
++            is_drafting=False,
++            use_fp64=fp64,
++            vocab_start=offset,
++            return_max=True,
++        )
++
++    return s, local, full, draw, (mapping, temperature, seeds, pos)
++
++
++def gate(group, vocab):
++    checks = []
++    for rows in (1, 6, 12, 48):
++        for temp in (0.0, 0.7, 1.3):
++            for fp64 in (False, True):
++                s, local, full, draw, _ = fixture(group, rows, vocab, temp, fp64)
++                scale = temp or 1
++                actual = s.sample(local.float() / scale, draw)
++                expected = draw(full.float() / scale, 0)[1]
++                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
++                if temp == 0:
++                    torch.testing.assert_close(actual, full.argmax(-1), atol=0, rtol=0)
++                checks.append(f"rows={rows},temperature={temp},fp64={fp64}")
++    # A tie straddling rank boundaries must match today's argmax.
++    s, local, full, draw, state = fixture(group, 6, vocab)
++    local.zero_()
++    local = s.mask_padding(local)
++    assert bool((s.sample(local, draw) == 0).all())
++    # Verify captured tiny all-gather and global-id RNG on repeated replay.
++    s, local, full, draw, state = fixture(group, 6, vocab, 0.7)
++    for _ in range(3):
++        s.sample(local, draw)
++    graph = torch.cuda.CUDAGraph()
++    with graph_capture() as ctx, torch.cuda.graph(graph, stream=ctx.stream):
++        captured = s.sample(local, draw)
++    for _ in range(3):
++        graph.replay()
++        torch.testing.assert_close(captured, draw(full, 0)[1], atol=0, rtol=0)
++    checks.append("graph replay")
++    # The stored draft cache must preserve raw logits and global noise keys.
++    mapping, temperature, seeds, pos = state
++    cache = torch.empty(6, 5, local.shape[-1], device="cuda", dtype=local.dtype)
++    full_cache = torch.empty(6, 5, vocab, device="cuda", dtype=full.dtype)
++    col = torch.tensor(3, dtype=torch.int32, device="cuda")
++
++    def draft_draw(x, offset=s.start, dest=cache):
++        scaled = x.float() / torch.where(temperature == 0, 1, temperature)[:, None]
++        return gumbel_sample(
++            scaled,
++            mapping,
++            temperature,
++            seeds,
++            pos,
++            apply_temperature=False,
++            is_drafting=True,
++            logits_cache=dest,
++            logits_cache_source=x,
++            logits_cache_col=col,
++            vocab_start=offset,
++            return_max=True,
++        )
++
++    sampled = s.sample(local, draft_draw)
++    expected = draft_draw(full, 0, full_cache)[1]
++    torch.testing.assert_close(sampled, expected, atol=0, rtol=0)
++    torch.testing.assert_close(cache[:, 3], local, atol=0, rtol=0)
++    checks.append("draft cache and independent draft RNG")
++    # Top-p certification must reject a broad distribution at a small bound.
++    k = torch.full((6,), vocab, dtype=torch.int32, device="cuda")
++    p = torch.full((6,), 0.99, device="cuda")
++    assert s.filter(s.mask_padding(torch.zeros_like(local)), k, p, 32) is None
++    # Concentrated top-p must agree exactly with the defined dense ordering.
++    keys = torch.arange(local.shape[-1], device="cuda") + s.start
++    peaked = (keys.float() - vocab).repeat(6, 1)
++    peaked = s.mask_padding(peaked)
++    filtered = s.filter(peaked, k, p, 32)
++    assert filtered is not None
++    dense = group.all_gather(peaked, dim=-1)[:, :vocab]
++    values, ids = dense.sort(dim=-1, descending=True, stable=True)
++    mass = values.double().softmax(-1)
++    keep = mass.cumsum(-1) - mass < p[:, None]
++    ref = torch.full_like(dense, -torch.inf).scatter(
++        -1, ids, values.masked_fill(~keep, -torch.inf)
++    )
++    got = group.all_gather(filtered, dim=-1)[:, :vocab]
++    torch.testing.assert_close(got, ref, atol=0, rtol=0)
++    checks.append("bounded top-p coverage and fallback")
++    # Actual production Gumbel RNG: moderate and heavy-tail categorical laws.
++    trials = 65536
++    for probabilities in ([0.1, 0.2, 0.3, 0.4], [0.999, 0.0004, 0.0003, 0.0003]):
++        s, local, full, draw, _ = fixture(group, trials, 4, 1.0)
++        # fixture pads to 64; only one token per rank is needed for this test.
++        s.start = group.rank_in_group
++        prob = torch.tensor(probabilities, device="cuda")
++        local = prob[s.start].log().expand(trials, 1).contiguous()
++        # The draw closure's original offset is overridden explicitly.
++        sample = s.sample(local, lambda x: draw(x, s.start))
++        freq = sample.bincount(minlength=4).double() / trials
++        sigma = (prob.double() * (1 - prob.double()) / trials).sqrt()
++        assert bool(((freq - prob).abs() < 7 * sigma + 1 / trials).all())
++        checks.append({"distribution": probabilities, "observed": freq.tolist()})
++    # Scalar partitions, owning-rank probabilities, and residuals against dense.
++    for with_q in (False, True):
++        s, local, full, draw, state = fixture(group, 12, vocab, 0.7)
++        q = local.flip(0).contiguous()
++        qfull = group.all_gather(q, dim=-1)[:, :vocab]
++        proposed = torch.arange(12, device="cuda") * (vocab // 12)
++        bonus = torch.arange(12, device="cuda") % 6 == 5
++        cu = torch.tensor([0, 6, 12], device="cuda", dtype=torch.int32)
++        uniform = acceptance_uniform(state[0], state[2], state[3])
++        args = (proposed, bonus, torch.zeros_like(bonus), uniform)
++        actual = s.verify(local, q if with_q else None, *args, draw, cu, 5)
++
++        class IdentityGroup:
++            def all_gather(self, x, dim=-1):
++                return x
++
++            def all_reduce(self, x):
++                return x
++
++        ref = VocabParallelSampler(IdentityGroup(), 0, vocab)
++        expected = ref.verify(
++            full, qfull if with_q else None, *args, lambda x: draw(x, 0), cu, 5
++        )
++        for a, b in zip(actual, expected):
++            torch.testing.assert_close(a, b, atol=0, rtol=0)
++    checks.append("point-mass and probabilistic rejection")
++    return checks
++
++
++def timing(fn, group, iterations):
++    for _ in range(10):
++        fn()
++    torch.cuda.synchronize()
++    torch.distributed.barrier()
++    begin, end = (
++        torch.cuda.Event(enable_timing=True),
++        torch.cuda.Event(enable_timing=True),
++    )
++    wall = time.perf_counter()
++    begin.record()
++    for _ in range(iterations):
++        fn()
++    end.record()
++    end.synchronize()
++    elapsed = torch.tensor(
++        [
++            begin.elapsed_time(end) / iterations,
++            (time.perf_counter() - wall) * 1000 / iterations,
++        ],
++        device="cuda",
++    )
++    all_times = group.all_gather(elapsed, dim=0).view(4, 2)
++    return {
++        "max_rank_device_ms": all_times[:, 0].max().item(),
++        "max_rank_wall_ms": all_times[:, 1].max().item(),
++    }
++
++
++def bench(group, vocab, iterations):
++    results = []
++    for rows in (1, 6, 12, 48):
++        for temp in (0.0, 0.7):
++            s, local, _, draw, _ = fixture(group, rows, vocab, temp)
++
++            def dense():
++                full = group.all_gather(local, dim=-1)[:, :vocab]
++                return draw(full, 0)[1]
++
++            def sharded():
++                return s.sample(local, draw)
++
++            old, new = (
++                timing(dense, group, iterations),
++                timing(sharded, group, iterations),
++            )
++            results.append(
++                {
++                    "rows": rows,
++                    "temperature": temp,
++                    "full_gather": old,
++                    "distributed": new,
++                    "saved_device_ms": old["max_rank_device_ms"]
++                    - new["max_rank_device_ms"],
++                }
++            )
++    return results
++
++
++def step_bench(group, vocab, iterations):
++    """DSpark sampling step from precomputed target/base/Markov logits, K=5."""
++    from vllm.v1.worker.gpu.sample.distributed import finish_verification
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
++
++    results = []
++    for requests in (1, 2, 8):
++        for temp in (0.0, 0.7):
++            rows, steps = requests * 6, 5
++            s, target, _, _, _ = fixture(group, rows, vocab, temp)
++            _, base, _, _, _ = fixture(group, requests * 5, vocab, temp)
++            width = base.shape[-1]
++            base = base.view(requests, steps, width)
++            bias = torch.zeros(requests, steps, vocab, device="cuda", dtype=base.dtype)
++            mapping = torch.arange(requests, device="cuda", dtype=torch.int64)
++            expanded = mapping.repeat_interleave(6)
++            local_pos = torch.arange(6, device="cuda").repeat(requests)
++            cu = torch.arange(requests + 1, device="cuda", dtype=torch.int32) * 6
++            positions = local_pos + 100
++            seeds = mapping + 987654321
++            temperature = torch.full((requests,), temp, device="cuda")
++            columns = torch.arange(5, dtype=torch.int32, device="cuda")
++            bonus = local_pos == 5
++            greedy = torch.full((rows,), temp == 0, device="cuda")
++            uniforms = acceptance_uniform(expanded, seeds, positions)
++            local_cache = torch.empty_like(base)
++            full_cache = torch.empty(
++                requests, steps, vocab, device="cuda", dtype=base.dtype
++            )
++
++            def run(distributed):
++                draft_base = (
++                    base if distributed else group.all_gather(base, dim=-1)[..., :vocab]
++                )
++                cache = local_cache if distributed else full_cache
++                offset = s.start if distributed else 0
++                proposals = []
++                for i in range(steps):
++                    local_bias = bias[:, i, offset : offset + draft_base.shape[-1]]
++                    local_bias = torch.nn.functional.pad(
++                        local_bias, (0, draft_base.shape[-1] - local_bias.shape[-1])
++                    )
++                    logits = draft_base[:, i] + local_bias
++
++                    def draft_draw(x, i=i):
++                        source = x
++                        if distributed:
++                            x = x.float() / (temp or 1)
++                        return gumbel_sample(
++                            x,
++                            mapping,
++                            temperature,
++                            seeds,
++                            torch.full_like(mapping, 100 + i),
++                            apply_temperature=not distributed,
++                            is_drafting=True,
++                            logits_cache=cache if temp else None,
++                            logits_cache_source=source if temp else None,
++                            logits_cache_col=columns[i] if temp else None,
++                            vocab_start=offset,
++                            return_max=True,
++                        )
++
++                    if distributed:
++                        sampled = s.sample(logits, draft_draw)
++                    else:
++                        sampled = draft_draw(logits)[1]
++                    proposals.append(sampled)
++                # Current verifier reads proposals in the next logits row.
++                previous = torch.zeros(requests, 6, device="cuda", dtype=torch.int64)
++                previous[:, 1:] = torch.stack(proposals, -1)
++                proposed = previous.flatten().roll(-1)
++                x = target.float() / (temp or 1)
++
++                def draw(a):
++                    return gumbel_sample(
++                        a,
++                        expanded,
++                        temperature,
++                        seeds,
++                        positions,
++                        apply_temperature=False,
++                        is_drafting=False,
++                        vocab_start=s.start if distributed else 0,
++                        return_max=True,
++                    )
++
++                if not distributed:
++                    full = group.all_gather(target, dim=-1)[:, :vocab].float() / (
++                        temp or 1
++                    )
++                    return rejection_sample(
++                        full,
++                        cache if temp else None,
++                        previous.flatten(),
++                        cu,
++                        positions,
++                        mapping,
++                        expanded,
++                        local_pos,
++                        temperature,
++                        seeds,
++                        steps,
++                    )
++                if not temp:
++                    recovered = s.sample(x, draw)
++                    return finish_verification(
++                        (recovered == proposed) & ~bonus, proposed, recovered, cu, steps
++                    )
++                draft = cache[expanded, local_pos.clamp_max(4)].float() / temp
++                return s.verify(
++                    x, draft.float(), proposed, bonus, greedy, uniforms, draw, cu, steps
++                )
++
++            if temp == 0:
++                old, new = run(False), run(True)
++                for i in range(requests):
++                    count = int(old[1][i])
++                    torch.testing.assert_close(
++                        old[0][i, :count], new[0][i, :count], rtol=0, atol=0
++                    )
++                torch.testing.assert_close(old[1], new[1], rtol=0, atol=0)
++            old = timing(lambda: run(False), group, iterations)
++            new = timing(lambda: run(True), group, iterations)
++            results.append(
++                {
++                    "requests": requests,
++                    "verify_rows": rows,
++                    "K": steps,
++                    "temperature": temp,
++                    "full_gather": old,
++                    "distributed": new,
++                    "saved_device_ms": old["max_rank_device_ms"]
++                    - new["max_rank_device_ms"],
++                }
++            )
++    return results
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--vocab", type=int, default=129280)
++    parser.add_argument("--bench", action="store_true")
++    parser.add_argument("--iterations", type=int, default=200)
++    args = parser.parse_args()
++    rank = int(os.environ.get("RANK", "0"))
++    result = {"status": "FAIL", "torch": torch.__version__, "vocab": args.vocab}
++    try:
++        rank, group = setup()
++        result["device"] = torch.cuda.get_device_name()
++        result["checks"] = gate(group, args.vocab)
++        if args.bench:
++            result["sampling_stage_benchmark"] = bench(
++                group, args.vocab, args.iterations
++            )
++            result["dspark_sampling_step_benchmark"] = step_bench(
++                group, args.vocab, args.iterations
++            )
++        result["status"] = "PASS"
++    except Exception:
++        result["error"] = traceback.format_exc()
++        raise
++    finally:
++        if rank == 0:
++            args.output.parent.mkdir(parents=True, exist_ok=True)
++            args.output.write_text(json.dumps(result, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_sampler_flags.py b/tests/v1/worker/test_gpu_sampler_flags.py
+index 7982be1938..183136a546 100644
+--- a/tests/v1/worker/test_gpu_sampler_flags.py
++++ b/tests/v1/worker/test_gpu_sampler_flags.py
+@@ -143,3 +143,36 @@ def test_logits_processing_cache_only_checks_active_requests():
+ 
+     assert not np.any(sampler.needs_logits_processing[sampling_only])
+     assert np.any(sampler.needs_logits_processing[with_processing])
++
++
++@pytest.mark.parametrize(
++    "params, expected",
++    [
++        (SamplingParams(temperature=0), True),
++        (SamplingParams(temperature=0.7, top_k=16, top_p=0.9), True),
++        (SamplingParams(logprobs=0), False),
++        (SamplingParams(logprob_token_ids=[1]), False),
++        (SamplingParams(prompt_logprobs=1), False),
++        (SamplingParams(min_p=0.1), False),
++        (SamplingParams(repetition_penalty=1.1), False),
++        (SamplingParams(allowed_token_ids=[1]), False),
++        (SamplingParams(_bad_words_token_ids=[[1]]), False),
++        (SamplingParams(logit_bias={1: 2}), False),
++        (SamplingParams(thinking_token_budget=3), False),
++    ],
++)
++def test_distributed_sampling_falls_back_for_whole_mixed_batch(params, expected):
++    from vllm.v1.worker.gpu.sample.distributed_sampler import eligible
++
++    sampler = _make_sampler()
++    sampler.add_request(0, SamplingParams(temperature=0))
++    sampler.add_request(1, params)
++    batch = SimpleNamespace(
++        num_reqs=2,
++        idx_mapping_np=np.array([0, 1], dtype=np.int32),
++        has_structured_output_reqs=False,
++        num_draft_tokens=0,
++    )
++    assert eligible(sampler, batch) == expected
++    batch.has_structured_output_reqs = True
++    assert not eligible(sampler, batch)
+diff --git a/tests/v1/worker/test_vocab_parallel_sampling.py b/tests/v1/worker/test_vocab_parallel_sampling.py
+new file mode 100644
+index 0000000000..6adb9e31e2
+--- /dev/null
++++ b/tests/v1/worker/test_vocab_parallel_sampling.py
+@@ -0,0 +1,256 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU math gates. Run directly to avoid importing the GPU-only vLLM package.
++
++Contract: shards plus shared draws produce the same token/prefix as a dense
++reference. Exercise the production math, with four synchronized CPU ranks;
++catch missing tail mass, token-id RNG mistakes, padding and q/residual errors.
++"""
++
++import importlib.util
++import unittest
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from threading import Barrier
++
++import torch
++
++_PATH = Path(__file__).resolve().parents[3] / (
++    "vllm/v1/worker/gpu/sample/distributed.py"
++)
++_spec = importlib.util.spec_from_file_location("tp_sampling_math", _PATH)
++math = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(math)
++torch.set_num_threads(1)
++
++
++class Collective:
++    def __init__(self, ranks):
++        self.barrier = Barrier(ranks, timeout=30)
++        self.values = [None] * ranks
++
++    def group(self, rank):
++        parent = self
++
++        class Group:
++            def exchange(self, x, reduce, dim=-1):
++                parent.values[rank] = x
++                parent.barrier.wait()
++                out = (
++                    torch.stack(parent.values).sum(0)
++                    if reduce
++                    else torch.cat(parent.values, dim)
++                )
++                parent.barrier.wait()
++                return out
++
++            def all_gather(self, x, dim=-1):
++                return self.exchange(x, False, dim)
++
++            def all_reduce(self, x):
++                return self.exchange(x, True)
++
++        return Group()
++
++
++def run_ranks(logits, operation, ranks=4):
++    width = (logits.shape[-1] + ranks - 1) // ranks
++    padded = torch.nn.functional.pad(
++        logits, (0, width * ranks - logits.shape[-1]), value=10000
++    )
++    collective = Collective(ranks)
++
++    def run(rank):
++        start = rank * width
++        sampler = math.VocabParallelSampler(
++            collective.group(rank), start, logits.shape[-1]
++        )
++        local = sampler.mask_padding(padded[:, start : start + width])
++        return operation(sampler, local, start)
++
++    with ThreadPoolExecutor(ranks) as pool:
++        results = list(pool.map(run, range(ranks)))
++    return results
++
++
++def noise(shape, seed=42):
++    u = torch.rand(shape, generator=torch.Generator().manual_seed(seed)).double()
++    return -(-u.clamp_min(1e-15).log()).log()
++
++
++def draw_for(noise_tensor, start):
++    def draw(x):
++        n = torch.nn.functional.pad(
++            noise_tensor[:, start : start + x.shape[-1]],
++            (0, max(0, start + x.shape[-1] - noise_tensor.shape[-1])),
++        )
++        value, ids = (x.double() + n).max(-1)
++        return value, ids + start
++
++    return draw
++
++
++def dense_filter(logits, k, p):
++    values, ids = logits.sort(dim=-1, descending=True, stable=True)
++    threshold = values.gather(-1, (k.long() - 1)[:, None])
++    values = values.masked_fill(values < threshold, -torch.inf)
++    mass = values.double().softmax(-1)
++    keep = (p[:, None] >= 1) | (mass.cumsum(-1) - mass < p[:, None])
++    values = values.masked_fill(~keep, -torch.inf)
++    return torch.full_like(logits, -torch.inf).scatter(-1, ids, values)
++
++
++class SamplingMathTest(unittest.TestCase):
++    def test_greedy_ties_and_padding_use_lowest_global_id(self):
++        x = torch.zeros(5, 129)
++        x[1, [1, 66, 128]] = 10
++        x[2, 128] = 11
++        x[3] = -torch.inf
++        results = run_ranks(
++            x,
++            lambda s, local, start: s.sample(
++                local, lambda a: (a.max(-1).values, a.argmax(-1) + start)
++            ),
++        )
++        for result in results:
++            torch.testing.assert_close(result, x.argmax(-1), rtol=0, atol=0)
++
++    def test_seeded_gumbel_is_invariant_to_partition(self):
++        x = torch.randn(71, 137, generator=torch.Generator().manual_seed(7))
++        n = noise(x.shape)
++        expected = (x.double() + n).argmax(-1)
++        for result in run_ranks(x, lambda s, a, start: s.sample(a, draw_for(n, start))):
++            torch.testing.assert_close(result, expected, rtol=0, atol=0)
++
++    def test_real_vocab_six_verify_rows_pack_float32_token_ids_exactly(self):
++        x = torch.randn(6, 129280, generator=torch.Generator().manual_seed(5))
++        n = noise(x.shape).float()
++
++        def sample(s, a, start):
++            def draw(local):
++                value, ids = (local + n[:, start : start + local.shape[-1]]).max(-1)
++                return value, ids + start
++
++            return s.sample(a, draw)
++
++        for result in run_ranks(x, sample):
++            torch.testing.assert_close(result, (x + n).argmax(-1), rtol=0, atol=0)
++
++    def test_temperature_distribution_matches_softmax(self):
++        x = torch.tensor([0.1, -1.2, 0.8, 1.6]).repeat(24000, 1) / 0.7
++        n = noise(x.shape)
++        result = run_ranks(x, lambda s, a, start: s.sample(a, draw_for(n, start)))[0]
++        expected = x[0].double().softmax(-1)
++        freq = result.bincount(minlength=4).double() / x.shape[0]
++        sigma = (expected * (1 - expected) / x.shape[0]).sqrt()
++        self.assertTrue(bool(((freq - expected).abs() < 6 * sigma).all()))
++
++    def test_bounded_topk_keeps_cutoff_ties(self):
++        x = torch.arange(129).float().repeat(3, 1)
++        x[:, 126:128] = 128
++        k, p = torch.tensor([1, 4, 8]), torch.ones(3)
++        expected = dense_filter(x, k, p)
++        results = run_ranks(x, lambda s, a, start: s.filter(a, k, p, 16))
++        actual = torch.cat(results, -1)[:, :129]
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++
++    def test_topp_coverage_and_combined_topk(self):
++        x = torch.arange(129).float().repeat(3, 1)
++        k, p = torch.tensor([129, 4, 129]), torch.tensor([0.9, 0.8, 0.5])
++        expected = dense_filter(x, k, p)
++        results = run_ranks(x, lambda s, a, start: s.filter(a, k, p, 8))
++        self.assertTrue(all(a is not None for a in results))
++        torch.testing.assert_close(torch.cat(results, -1)[:, :129], expected)
++
++    def test_insufficient_mass_ties_and_boundary_fall_back(self):
++        for x, k, p in (
++            (torch.zeros(2, 129), torch.full((2,), 129), torch.full((2,), 0.99)),
++            (torch.zeros(2, 129), torch.ones(2), torch.ones(2)),
++            (
++                torch.arange(129).float().repeat(2, 1),
++                torch.full((2,), 80),
++                torch.ones(2),
++            ),
++            (torch.zeros(2, 128), torch.full((2,), 128), torch.full((2,), 0.5)),
++        ):
++            results = run_ranks(x, lambda s, a, start, k=k, p=p: s.filter(a, k, p, 4))
++            self.assertTrue(all(a is None for a in results))
++
++    def test_log_partition_and_owning_token_at_extreme_logits(self):
++        x = torch.randn(7, 129) * 500
++        tokens = torch.tensor([0, 31, 32, 65, 98, 127, 128])
++        results = run_ranks(
++            x, lambda s, a, start: (s.lse(a), s.token_logprob(a, tokens, s.lse(a)))
++        )
++        for lse, lp in results:
++            torch.testing.assert_close(lse, x.double().logsumexp(-1, keepdim=True))
++            torch.testing.assert_close(
++                lp, x.double().log_softmax(-1).gather(-1, tokens[:, None]).squeeze(-1)
++            )
++
++    def test_rejection_dense_and_four_ranks_variable_lengths(self):
++        g = torch.Generator().manual_seed(91)
++        x, q = torch.randn(10, 129, generator=g), torch.randn(10, 129, generator=g)
++        proposed = torch.tensor([0, 45, 128, -1, 31, 98, 65, 12, 127, -1])
++        cu = torch.tensor([0, 4, 5, 8, 10])
++        bonus = torch.zeros(10, dtype=torch.bool)
++        bonus[cu[1:] - 1] = True
++        greedy = torch.tensor([False] * 5 + [True] * 5)
++        u, n = torch.rand(10, generator=g), noise(x.shape, 9)
++        # Greedy rows use zero noise; the stochastic reference uses the same
++        # global-token-indexed noise on every rank.
++        n[greedy] = 0
++        for draft in (None, q):
++
++            def verify(s, a, start, draft=draft):
++                local_q = None
++                if draft is not None:
++                    local_q = torch.nn.functional.pad(
++                        draft[:, start : start + a.shape[-1]],
++                        (0, max(0, start + a.shape[-1] - 129)),
++                        value=-torch.inf,
++                    )
++                return s.verify(
++                    a, local_q, proposed, bonus, greedy, u, draw_for(n, start), cu, 5
++                )
++
++            expected = run_ranks(x, verify, ranks=1)[0]
++            for output, count in run_ranks(x, verify):
++                torch.testing.assert_close(output, expected[0], rtol=0, atol=0)
++                torch.testing.assert_close(count, expected[1], rtol=0, atol=0)
++                self.assertTrue(bool((count <= cu.diff()).all()))
++
++    def test_probabilistic_rejection_preserves_target_distribution(self):
++        nreq = 24000
++        p = torch.tensor([0.05, 0.25, 0.4, 0.3])
++        q = torch.tensor([0.4, 0.3, 0.1, 0.2])
++        g = torch.Generator().manual_seed(123)
++        proposed = torch.multinomial(q, nreq, replacement=True, generator=g)
++        tokens = torch.stack((proposed, torch.zeros_like(proposed)), -1).flatten()
++        x = p.log().repeat(2 * nreq, 1)
++        draft = q.log().repeat(2 * nreq, 1)
++        bonus = torch.arange(2 * nreq) % 2 == 1
++        cu = torch.arange(nreq + 1) * 2
++        u, n = torch.rand(2 * nreq, generator=g), noise(x.shape, 21)
++
++        def verify(s, a, start):
++            return s.verify(
++                a,
++                draft[:, start : start + 1],
++                tokens,
++                bonus,
++                torch.zeros_like(bonus),
++                u,
++                draw_for(n, start),
++                cu,
++                1,
++            )
++
++        output = run_ranks(x, verify)[0][0][:, 0]
++        freq = output.bincount(minlength=4).float() / nreq
++        sigma = (p * (1 - p) / nreq).sqrt()
++        self.assertTrue(bool(((freq - p).abs() < 6 * sigma).all()))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index c0032c457e..f9d7f07ea2 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -253,6 +253,8 @@ if TYPE_CHECKING:
+         | None
+     ) = None
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
++    VLLM_TP_DISTRIBUTED_SAMPLING: bool = False
++    VLLM_TP_SAMPLING_CANDIDATES: int = 256
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
+@@ -1875,6 +1877,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Enable checking whether the generated logits contain NaNs,
+     # indicating corrupted output. Useful for debugging low level bugs
+     # or bad hardware but it may add compute overhead.
++    "VLLM_TP_DISTRIBUTED_SAMPLING": lambda: bool(
++        int(os.getenv("VLLM_TP_DISTRIBUTED_SAMPLING", "0"))
++    ),
++    "VLLM_TP_SAMPLING_CANDIDATES": lambda: int(
++        os.getenv("VLLM_TP_SAMPLING_CANDIDATES", "256")
++    ),
+     "VLLM_COMPUTE_NANS_IN_LOGITS": lambda: bool(
+         int(os.getenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0"))
+         or int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+index 6d1bbcd047..156263d76e 100644
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -19,8 +19,8 @@ import torch.nn as nn
+ import vllm.envs as envs
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
+-from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.distributed import get_pp_group
++from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
+     mhc_post_tilelang,
+@@ -342,6 +342,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         """Base logits U_k = lm_head(norm(head_hidden))."""
+         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+ 
++    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return self.logits_processor(
++            self.lm_head, self.model.norm(hidden_states), skip_gather=True
++        )
++
+     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Full-vocab draft: base logits, no d2t scatter.
+         return self.compute_logits(hidden_states)
+@@ -409,7 +414,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+ 
+         for name, loaded_weight in weights:
+             if self.has_own_embed_tokens and name in (
+-                "embed.weight", "embed_tokens.weight", "model.embed_tokens.weight"
++                "embed.weight",
++                "embed_tokens.weight",
++                "model.embed_tokens.weight",
+             ):
+                 param = self.model.embed_tokens.weight
+                 param.weight_loader(param, loaded_weight)
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 7b3373659a..f8b175696a 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -99,13 +99,6 @@ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
+-from ..pp_shadow import (
+-    CAND_KEY as _DSV41_CAND_KEY,
+-    SRC_KEY as _DSV41_SRC_KEY,
+-    PPShadowPlan as _DSV41PPShadowPlan,
+-    ShadowSource as _DSV41ShadowSource,
+-    remap_shadow_weight_name as _dsv41_remap_shadow_weight_name,
+-)
+ from ..common.engram import (
+     Engram,
+     EngramBatch,
+@@ -115,6 +108,21 @@ from ..common.engram import (
+     gather_engram_hashes,
+ )
+ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
++from ..pp_shadow import (
++    CAND_KEY as _DSV41_CAND_KEY,
++)
++from ..pp_shadow import (
++    SRC_KEY as _DSV41_SRC_KEY,
++)
++from ..pp_shadow import (
++    PPShadowPlan as _DSV41PPShadowPlan,
++)
++from ..pp_shadow import (
++    ShadowSource as _DSV41ShadowSource,
++)
++from ..pp_shadow import (
++    remap_shadow_weight_name as _dsv41_remap_shadow_weight_name,
++)
+ from .ops.mhc import (
+     MHC_OVERLAP_MAX_TOKENS,
+     init_mhc_all_reduce,
+@@ -1207,14 +1215,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             # Without MTP, gather only the collapsed and normalized hidden states.
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+         aux_hidden_states = (
+-            self.collect_remote_aux_hidden_states(intermediate_tensors) + aux_hidden_states
++            self.collect_remote_aux_hidden_states(intermediate_tensors)
++            + aux_hidden_states
+         )
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+     def _mega_gate_metadata(
+-        self, input_ids: torch.Tensor | None
++        self,
++        input_ids: torch.Tensor | None,
+     ) -> MegaGateRoutingMetadata | None:
+         if not self.use_native_mega_moe:
+             return None
+@@ -1745,6 +1755,12 @@ class DeepseekV41LLMForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_vocab_parallel_sampling_info(self) -> tuple[int, int]:
++        return (
++            self.lm_head.shard_indices.org_vocab_start_index,
++            self.logits_processor.org_vocab_size,
++        )
++
+     def compute_logits_local(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 264a45781b..df10600a4f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -974,7 +974,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     last_sampled=self.req_states.last_sampled_tokens,
+                     next_prefill_tokens=self.req_states.next_prefill_tokens,
+                     temperature=self.sampler.sampling_states.temperature.gpu,
+-                    seeds=self.sampler.sampling_states.seeds.gpu,
++                    seeds=self.sampler.sampling_seeds,
+                     dp_sync_state=dp_sync_state,
+                     dummy_run=True,
+                     skip_attn_for_dummy_run=skip_attn,
+@@ -1618,6 +1618,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         input_batch: InputBatch,
+         grammar_output: GrammarOutput | None,
+     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
++        if (
++            envs.VLLM_TP_DISTRIBUTED_SAMPLING
++            and self.parallel_config.tensor_parallel_size > 1
++            and self.parallel_config.pipeline_parallel_size == 1
++            and self.parallel_config.prefill_context_parallel_size == 1
++            and self.parallel_config.decode_context_parallel_size == 1
++            and self.lora_config is None
++            and self.batch_sharder is None
++            and (
++                self.speculative_config is None or self.speculative_config.use_dspark()
++            )
++            and grammar_output is None
++            and hasattr(self.model, "get_vocab_parallel_sampling_info")
++            and self.model.lm_head.tp_size == self.parallel_config.tensor_parallel_size
++            and self.model.lm_head.num_added_embeddings == 0
++        ):
++            from vllm.v1.worker.gpu.sample.distributed_sampler import (
++                try_distributed_sample,
++            )
++
++            output = try_distributed_sample(
++                self.model,
++                self.sampler,
++                self.rejection_sampler,
++                self.speculator,
++                input_batch,
++                hidden_states,
++            )
++            if output is not None:
++                return output, output.num_sampled, output.num_rejected
++
+         shard_metadata = None
+         global_input_batch = input_batch
+         if self.batch_sharder is not None:
+@@ -1667,6 +1698,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Rejection sampling for spec decoding.
+             assert self.rejection_sampler is not None
+             assert self.speculator is not None
++            materialize = getattr(self.speculator, "materialize_draft_logits", None)
++            if materialize is not None:
++                materialize(input_batch.idx_mapping)
+             sampler_output = self.rejection_sampler(
+                 logits,
+                 input_batch,
+@@ -2279,7 +2313,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.req_states.last_sampled_tokens,
+                     self.req_states.next_prefill_tokens,
+                     self.sampler.sampling_states.temperature.gpu,
+-                    self.sampler.sampling_states.seeds.gpu,
++                    self.sampler.sampling_seeds,
+                     num_speculative_tokens=num_spec_tokens,
+                     dp_sync_state=dp_sync_state,
+                     mm_inputs=mm_inputs,
+diff --git a/vllm/v1/worker/gpu/sample/distributed.py b/vllm/v1/worker/gpu/sample/distributed.py
+new file mode 100644
+index 0000000000..c9eec8cd0f
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/distributed.py
+@@ -0,0 +1,188 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Vocabulary-sharded sampling math, independent of CUDA and model state.
++
++Collectives operate on rows, never on vocabulary-sized tensors. ``draw`` returns
++(local winning value, global token id), keyed by global token id, request seed
++and position. The dense reference is the same algorithm with one shard.
++"""
++
++from collections.abc import Callable
++from typing import Any
++
++import torch
++
++Draw = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
++
++
++def merge_winners(values: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
++    """Resolve equal maxima to the smallest global token id, as torch.argmax."""
++    maximum = values.amax(-1, keepdim=True)
++    return ids.masked_fill(values != maximum, torch.iinfo(torch.int64).max).amin(-1)
++
++
++def finish_verification(
++    accepted: torch.Tensor,
++    proposed: torch.Tensor,
++    recovered: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    max_spec_len: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Pack a variable-length accepted prefix and one recovery/bonus per request."""
++    cols = torch.arange(max_spec_len + 1, device=accepted.device)
++    rows = cu_num_logits[:-1, None].long() + cols
++    lengths = cu_num_logits.diff().long()
++    safe_rows = rows.clamp_max(accepted.numel() - 1)
++    valid = cols < lengths[:, None] - 1
++    prefix = (accepted[safe_rows] & valid).long().cumprod(-1)
++    count = prefix.sum(-1)
++    last = recovered[(cu_num_logits[:-1] + count).long()]
++    output = torch.where(cols < count[:, None], proposed[safe_rows], last[:, None])
++    output = output.masked_fill(cols > count[:, None], 0)
++    return output, (count + 1).to(torch.int32)
++
++
++class VocabParallelSampler:
++    def __init__(self, group: Any, start: int, vocab_size: int):
++        self.group = group
++        self.start = start
++        self.vocab_size = vocab_size
++
++    def mask_padding(self, logits: torch.Tensor) -> torch.Tensor:
++        ids = torch.arange(logits.shape[-1], device=logits.device) + self.start
++        return logits.masked_fill(ids >= self.vocab_size, -torch.inf)
++
++    def lse(self, logits: torch.Tensor) -> torch.Tensor:
++        # Use a common maximum before the scalar SUM reduction. FP64 makes the
++        # top-p coverage decision insensitive to FP32 accumulation order.
++        x = logits.double()
++        maximum = self.group.all_gather(x.amax(-1, keepdim=True), dim=-1).amax(
++            -1, keepdim=True
++        )
++        maximum = maximum.masked_fill(~torch.isfinite(maximum), 0)
++        total = self.group.all_reduce((x - maximum).exp().sum(-1, keepdim=True))
++        return maximum + total.log()
++
++    def token_logprob(
++        self, logits: torch.Tensor, tokens: torch.Tensor, lse: torch.Tensor
++    ) -> torch.Tensor:
++        local_ids = tokens - self.start
++        owned = (local_ids >= 0) & (local_ids < logits.shape[-1])
++        value = logits.gather(-1, local_ids.clamp(0, logits.shape[-1] - 1)[:, None])
++        value = self.group.all_reduce(value.double().masked_fill(~owned[:, None], 0))
++        return (value - lse).squeeze(-1)
++
++    def sample(self, logits: torch.Tensor, draw: Draw) -> torch.Tensor:
++        value, ids = draw(logits)
++        # All vocabulary ids must fit exactly in the value dtype used for packing.
++        pair = torch.stack((value, ids.to(value.dtype)), -1)
++        pairs = self.group.all_gather(pair, dim=-1).reshape(logits.shape[0], -1, 2)
++        return merge_winners(pairs[..., 0], pairs[..., 1].long())
++
++    def filter(
++        self, logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor, bound: int
++    ) -> torch.Tensor | None:
++        """Exact top-k, then nucleus, or None if candidate coverage is unproved.
++
++        Top-k retains all cutoff ties. Nucleus order is descending score, then
++        ascending global id; keep the crossing token. A strict cutoff above
++        every omitted score certifies global ordering. Full-vocab scalar mass
++        certifies nucleus coverage. A numerical guard falls back at boundaries.
++        This method runs outside graph capture: the batch-wide proof syncs once.
++        """
++        if bound < 1:
++            return None
++        width = min(bound, logits.shape[-1])
++        values, local_ids = logits.topk(min(width + 1, logits.shape[-1]), dim=-1)
++        omitted = (
++            values[:, width : width + 1]
++            if width < logits.shape[-1]
++            else torch.full_like(values[:, :1], -torch.inf)
++        )
++        omitted = self.group.all_gather(omitted, dim=-1).amax(-1)
++        ids = local_ids[:, :width] + self.start
++        values = self.group.all_gather(values[:, :width].contiguous(), dim=-1)
++        ids = self.group.all_gather(ids.contiguous(), dim=-1)
++        # topk has unspecified tie order; establish a global canonical order.
++        order = ids.argsort(dim=-1, stable=True)
++        ids, values = ids.gather(-1, order), values.gather(-1, order)
++        order = values.argsort(dim=-1, descending=True, stable=True)
++        ids, values = ids.gather(-1, order), values.gather(-1, order)
++        finite = torch.isfinite(values)
++        limited = k < self.vocab_size
++        kth = values.gather(-1, (k.long() - 1).clamp_max(values.shape[-1] - 1)[:, None])
++        topk_keep = (~limited[:, None] | (values >= kth)) & finite
++        topk_proved = ~limited | ((k <= values.shape[-1]) & (kth[:, 0] > omitted))
++        filtered = values.masked_fill(~topk_keep, -torch.inf).double()
++        full_lse = self.lse(logits)
++        normalizer = torch.where(
++            limited[:, None], filtered.logsumexp(-1, keepdim=True), full_lse
++        )
++        mass = (filtered - normalizer).exp()
++        cumulative = mass.cumsum(-1)
++        before = cumulative - mass
++        nucleus_keep = (before < p[:, None]) & topk_keep
++        keep = torch.where(p[:, None] < 1, nucleus_keep, topk_keep)
++        count = keep.sum(-1)
++        cut = (count - 1).clamp_min(0)[:, None]
++        cutoff_value, cutoff_id = values.gather(-1, cut), ids.gather(-1, cut)
++        kept_mass = mass.masked_fill(~keep, 0).sum(-1)
++        # FP64 arithmetic cannot prove a decision at a rounded boundary. Use a
++        # conservative error guard; equality, near-equality and ties fall back.
++        guard = 64 * torch.finfo(torch.float64).eps * self.vocab_size
++        p_proved = (p >= 1) | (
++            (kept_mass > p.double() + guard)
++            & ((before - p[:, None]).abs().amin(-1) > guard)
++        )
++        coverage = (count > 0) & (cutoff_value[:, 0] > omitted)
++        if not bool((topk_proved & p_proved & coverage).all().item()):
++            return None
++        global_ids = torch.arange(logits.shape[-1], device=logits.device) + self.start
++        if_p = (logits > cutoff_value) | (
++            (logits == cutoff_value) & (global_ids <= cutoff_id)
++        )
++        if_k = logits >= kth
++        mask = torch.where(p[:, None] < 1, if_p, if_k)
++        return logits.masked_fill(~mask, -torch.inf)
++
++    def verify(
++        self,
++        target: torch.Tensor,
++        draft: torch.Tensor | None,
++        proposed: torch.Tensor,
++        is_bonus: torch.Tensor,
++        greedy: torch.Tensor,
++        uniform: torch.Tensor,
++        draw: Draw,
++        cu_num_logits: torch.Tensor,
++        max_spec_len: int,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Leviathan rejection with sharded p/q and sharded residual Gumbel-max.
++
++        Only log partitions, owning-rank token logits, and winning pairs cross
++        ranks. q=None denotes a point-mass (greedily proposed) draft.
++        """
++        target_lse = self.lse(target)
++        log_p = self.token_logprob(target, proposed, target_lse)
++        if draft is None:
++            log_q = torch.zeros_like(log_p)
++            keys = torch.arange(target.shape[-1], device=target.device) + self.start
++            residual = target.masked_fill(keys == proposed[:, None], -torch.inf)
++        else:
++            draft_lse = self.lse(draft)
++            log_q = self.token_logprob(draft, proposed, draft_lse)
++            a = target.double() - target_lse
++            b = draft.double() - draft_lse
++            ratio = (b - a).exp()
++            residual = (a + torch.log1p(-ratio.clamp_max(1))).float()
++            residual = residual.masked_fill(~(a > b), -torch.inf)
++        valid = (proposed >= 0) & ~is_bonus
++        accepted = (log_p > uniform.double().log() + log_q) & valid
++        # Greedy recovery is the unmodified target argmax. Bonus/placeholder
++        # rows also draw from p directly. Never use a zero-mass residual there.
++        residual = torch.where((greedy | is_bonus | ~valid)[:, None], target, residual)
++        recovered = self.sample(residual, draw)
++        accepted = torch.where(greedy, (recovered == proposed) & valid, accepted)
++        return finish_verification(
++            accepted, proposed, recovered, cu_num_logits, max_spec_len
++        )
+diff --git a/vllm/v1/worker/gpu/sample/distributed_sampler.py b/vllm/v1/worker/gpu/sample/distributed_sampler.py
+new file mode 100644
+index 0000000000..1ed88cc0bb
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/distributed_sampler.py
+@@ -0,0 +1,191 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in V2 adapter for vocabulary-parallel sampling and DSpark verification."""
++
++import numpy as np
++import torch
++
++import vllm.envs as envs
++from vllm.distributed import get_tp_group
++from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
++from vllm.v1.worker.gpu.sample.distributed import (
++    VocabParallelSampler,
++    finish_verification,
++)
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, tl_rand32
++from vllm.v1.worker.gpu.sample.output import SamplerOutput
++from vllm.v1.worker.gpu.sample.sampler import Sampler
++from vllm.v1.worker.gpu.spec_decode.rejection_sampler import gather_draft_sampled
++
++
++@triton.jit
++def _acceptance_uniform_kernel(out, mapping, seeds, positions, n, B: tl.constexpr):
++    i = tl.program_id(0) * B + tl.arange(0, B)
++    mask = i < n
++    req = tl.load(mapping + i, mask, other=0)
++    seed = tl.load(seeds + req)
++    pos = tl.load(positions + i, mask, other=0)
++    u = tl_rand32(seed, pos, includes_zero=False)
++    tl.store(out + i, u, mask)
++
++
++def acceptance_uniform(mapping, seeds, positions):
++    out = torch.empty_like(positions, dtype=torch.float32)
++    _acceptance_uniform_kernel[(triton.cdiv(out.numel(), 256),)](
++        out, mapping, seeds, positions, out.numel(), B=256
++    )
++    return out
++
++
++def eligible(sampler, input_batch, rejection_sampler=None) -> bool:
++    """Host-only, whole-batch decision, before any vocabulary collective."""
++    if type(sampler) is not Sampler:
++        return False
++    idx = input_batch.idx_mapping_np
++    if (
++        input_batch.num_reqs == 0
++        or input_batch.has_structured_output_reqs
++        or sampler.compute_nans
++        or sampler.return_sampling_mask
++        or sampler.trace_replay_state is not None
++        or len(sampler.logits_processors) != 3
++        or sampler.get_logprobs_dims(idx) is not None
++        or np.any(sampler.distributed_fallback[idx])
++    ):
++        return False
++    return not (
++        input_batch.num_draft_tokens
++        and rejection_sampler is not None
++        and (
++            rejection_sampler.use_block_verification
++            or rejection_sampler.fly_window_size
++            or rejection_sampler.synthetic_conditional_rates is not None
++            or rejection_sampler.watermark_key is not None
++        )
++    )
++
++
++def try_distributed_sample(
++    model, sampler, rejection_sampler, speculator, batch, hidden_states
++):
++    """Return None to run the existing full-logits path for this entire batch."""
++    if not eligible(sampler, batch, rejection_sampler):
++        return None
++    states = sampler.sampling_states
++    idx = batch.idx_mapping_np
++    all_greedy = bool(np.all(states.temperature.np[idx] == 0))
++    if (
++        batch.num_draft_tokens
++        and not all_greedy
++        and speculator.draft_logits is not None
++        and not getattr(speculator, "distributed_draft", False)
++    ):
++        return None
++    group = get_tp_group()
++    start, vocab_size = model.get_vocab_parallel_sampling_info()
++    if vocab_size > 2**24:
++        return None
++    parallel = VocabParallelSampler(group, start, vocab_size)
++    logits = parallel.mask_padding(
++        model.compute_logits_local(hidden_states[batch.logits_indices])
++    ).float()
++    mapping = batch.expanded_idx_mapping
++    temp = states.temperature.gpu[mapping]
++    greedy = temp == 0
++    logits = logits / torch.where(greedy, 1, temp)[:, None]
++    if not all_greedy and (
++        np.any(states.top_k.np[idx] < vocab_size) or np.any(states.top_p.np[idx] < 1)
++    ):
++        # Greedy rows ignore truncation even in a mixed batch.
++        k = torch.where(greedy, vocab_size, states.top_k.gpu[mapping])
++        p = torch.where(greedy, 1, states.top_p.gpu[mapping])
++        filtered = parallel.filter(logits, k, p, envs.VLLM_TP_SAMPLING_CANDIDATES)
++        if filtered is None:
++            return None
++        logits = filtered
++    pos = batch.positions[batch.logits_indices]
++
++    def draw(x):
++        return gumbel_sample(
++            x,
++            mapping,
++            states.temperature.gpu,
++            sampler.sampling_seeds,
++            pos,
++            apply_temperature=False,
++            is_drafting=False,
++            use_fp64=sampler.use_fp64_gumbel,
++            vocab_start=start,
++            return_max=True,
++        )
++
++    if batch.num_draft_tokens and rejection_sampler is not None:
++        previous, pos = gather_draft_sampled(
++            batch.input_ids,
++            batch.positions,
++            batch.logits_indices,
++            mapping,
++            batch.expanded_local_pos,
++            sampler.req_states.prefill_len.gpu,
++        )
++        proposed = previous.roll(-1)
++        is_bonus = batch.expanded_local_pos.roll(-1) == 0
++        is_bonus[-1] = True
++        if all_greedy:
++            recovered = parallel.sample(logits, draw)
++            accepted = (recovered == proposed) & (proposed >= 0) & ~is_bonus
++            sampled, count = finish_verification(
++                accepted,
++                proposed,
++                recovered,
++                batch.cu_num_logits,
++                rejection_sampler.num_speculative_steps,
++            )
++        else:
++            draft = None
++            if speculator.draft_logits is not None:
++                if not getattr(speculator, "distributed_draft", False):
++                    # A different draft implementation still owns a replicated
++                    # cache. Read only this target rank's vocabulary slice.
++                    draft = speculator.draft_logits[
++                        ..., start : start + logits.shape[-1]
++                    ]
++                    draft = torch.nn.functional.pad(
++                        draft, (0, logits.shape[-1] - draft.shape[-1]), value=-torch.inf
++                    )
++                else:
++                    draft = speculator.local_draft_logits
++                steps = batch.expanded_local_pos.long().clamp_max(draft.shape[1] - 1)
++                draft = draft[mapping, steps].float()
++                draft = draft / torch.where(greedy, 1, temp)[:, None]
++                draft = parallel.mask_padding(draft)
++            uniform = acceptance_uniform(mapping, sampler.sampling_seeds, pos)
++            sampled, count = parallel.verify(
++                logits,
++                draft,
++                proposed,
++                is_bonus,
++                greedy,
++                uniform,
++                draw,
++                batch.cu_num_logits,
++                rejection_sampler.num_speculative_steps,
++            )
++    else:
++        sampled = parallel.sample(logits, draw)[:, None]
++        count = batch.seq_lens.new_ones(batch.num_reqs)
++    count, rejected = get_num_sampled_and_rejected(
++        count,
++        batch.seq_lens,
++        batch.cu_num_logits,
++        batch.idx_mapping,
++        sampler.req_states.prefill_len.gpu,
++    )
++    return SamplerOutput(
++        sampled_token_ids=sampled,
++        logprobs_tensors=None,
++        num_nans=None,
++        num_sampled=count,
++        num_rejected=rejected,
++    )
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index 9ab0579a6f..90ecf9eec7 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -233,6 +233,7 @@ def gumbel_block_argmax(
+     APPLY_TEMPERATURE: tl.constexpr,
+     USE_FP64: tl.constexpr,
+     PER_TOKEN_COL: tl.constexpr = False,
++    VOCAB_START: tl.constexpr = 0,
+ ):
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
+     is_valid_req = req_state_idx >= 0
+@@ -267,7 +268,7 @@ def gumbel_block_argmax(
+         seed = spec_step_seed(seed, col)
+     return gumbel_noised_argmax(
+         logits,
+-        block,
++        block + VOCAB_START,
+         mask,
+         seed,
+         pos,
+@@ -303,6 +304,7 @@ def _gumbel_sample_kernel(
+     APPLY_TEMPERATURE: tl.constexpr,
+     USE_FP64: tl.constexpr,
+     PER_TOKEN_COL: tl.constexpr,
++    VOCAB_START: tl.constexpr,
+ ):
+     token_idx = tl.program_id(0).to(tl.int64)
+     block_idx = tl.program_id(1)
+@@ -335,8 +337,9 @@ def _gumbel_sample_kernel(
+         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+         USE_FP64=USE_FP64,
+         PER_TOKEN_COL=PER_TOKEN_COL,
++        VOCAB_START=VOCAB_START,
+     )
+-    token_id = block_idx * BLOCK_SIZE + idx
++    token_id = VOCAB_START + block_idx * BLOCK_SIZE + idx
+     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
+     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+ 
+@@ -353,7 +356,9 @@ def gumbel_sample(
+     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
+     use_fp64: bool = False,
+     logits_cache_source: torch.Tensor | None = None,
+-) -> torch.Tensor:
++    vocab_start: int = 0,
++    return_max: bool = False,
++) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+     # Enforce contiguity on non-strided input tensors
+     expanded_idx_mapping = expanded_idx_mapping.contiguous()
+     pos = pos.contiguous()
+@@ -410,8 +415,11 @@ def gumbel_sample(
+         APPLY_TEMPERATURE=apply_temperature,
+         USE_FP64=use_fp64,
+         PER_TOKEN_COL=per_token_col,
++        VOCAB_START=vocab_start,
+     )
+     # NOTE(woosuk): Use int64 for later indexing.
+     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+     sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
++    if return_max:
++        return local_max.gather(-1, max_block_idx).view(-1), sampled
+     return sampled
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 4ad56292e4..ae1e5ff662 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -9,6 +9,7 @@ import torch
+ import vllm.envs as envs
+ from vllm.config import VllmConfig
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
++from vllm.distributed import get_tp_group
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.sample.ops.topk_topp_sampler import (
+     apply_top_k_top_p,
+@@ -54,6 +55,13 @@ class Sampler:
+         return_sampling_mask: bool = False,
+         custom_logits_processors: Sequence[LogitsProcessor] = (),
+     ):
++        self.distributed_fallback = np.zeros(max_num_reqs, dtype=bool)
++        self._seeds_dirty = False
++        self.shared_seeds = (
++            torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
++            if envs.VLLM_TP_DISTRIBUTED_SAMPLING
++            else None
++        )
+         self.logprobs_mode = logprobs_mode
+         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
+         self.use_fp64_gumbel = use_fp64_gumbel
+@@ -95,19 +103,38 @@ class Sampler:
+ 
+     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
+         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
+-        needs_processing |= self.thinking_budget_state.add_request(
++        needs_extra_processing = self.thinking_budget_state.add_request(
+             req_idx, sampling_params
+         )
+         for processor in self.logits_processors:
+-            needs_processing |= processor.add_request(req_idx, sampling_params)
+-        self.needs_logits_processing[req_idx] = needs_processing
++            needs_extra_processing |= processor.add_request(req_idx, sampling_params)
++        self.needs_logits_processing[req_idx] = (
++            needs_processing | needs_extra_processing
++        )
++        self.distributed_fallback[req_idx] = (
++            needs_extra_processing
++            or sampling_params.min_p != 0
++            or sampling_params.prompt_logprobs is not None
++            or sampling_params.prompt_logprob_token_ids is not None
++        )
++        self._seeds_dirty = True
+ 
+         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.add_request(req_idx, sampling_params)
+ 
++    @property
++    def sampling_seeds(self) -> torch.Tensor:
++        if self.shared_seeds is not None:
++            return self.shared_seeds
++        return self.sampling_states.seeds.gpu
++
+     def apply_staged_writes(self) -> None:
+         self.sampling_states.apply_staged_writes()
++        if self.shared_seeds is not None and self._seeds_dirty:
++            self.shared_seeds.copy_(self.sampling_states.seeds.gpu)
++            get_tp_group().broadcast(self.shared_seeds, src=0)
++            self._seeds_dirty = False
+         for processor in self.logits_processors:
+             processor.apply_staged_writes()
+         self.thinking_budget_state.apply_staged_writes()
+@@ -351,7 +378,7 @@ class Sampler:
+                 processed_logits,
+                 expanded_idx_mapping,
+                 self.sampling_states.temperature.gpu,
+-                self.sampling_states.seeds.gpu,
++                self.sampling_seeds,
+                 pos,
+                 apply_temperature=False,
+                 is_drafting=False,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 2b3afa22ac..c7db679fdb 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -27,15 +27,17 @@ from typing import Any
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.distributed import get_tp_group
+ from vllm.logger import init_logger
++from vllm.utils.dsv41_diagnostics import debug_call
++from vllm.v1.worker.gpu.sample.distributed import VocabParallelSampler
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+-from vllm.utils.dsv41_diagnostics import debug_call
+-
+ logger = init_logger(__name__)
+ 
+ 
+@@ -82,6 +84,8 @@ class DSparkSpeculator(DFlashSpeculator):
+         )
+ 
+         self.use_confidence_head: bool = False
++        self.distributed_draft = False
++        self.local_draft_logits: torch.Tensor | None = None
+ 
+     def load_draft_model(
+         self,
+@@ -113,8 +117,38 @@ class DSparkSpeculator(DFlashSpeculator):
+             # The acceptance estimator is not needed when a trained confidence head
+             # is available.
+             self.use_acceptance_estimator = False
++        self.distributed_draft = (
++            envs.VLLM_TP_DISTRIBUTED_SAMPLING
++            and get_tp_group().world_size > 1
++            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
++            and not self.vllm_config.parallel_config.enable_batch_sharded_sampling
++            and hasattr(model, "compute_draft_logits_local")
++            and self._draft_topk is None
++            and self.draft_watermarker is None
++            and not self.use_acceptance_estimator
++            and self.vllm_config.lora_config is None
++            and model.lm_head.tp_size == get_tp_group().world_size
++            and model.lm_head.org_vocab_size == self.vocab_size
++            and model.lm_head.num_added_embeddings == 0
++            and self.vocab_size <= 2**24
++        )
++        if self.distributed_draft and self.draft_logits is not None:
++            self.local_draft_logits = torch.empty(
++                *self.draft_logits.shape[:-1],
++                model.lm_head.num_embeddings_per_partition,
++                dtype=self.draft_logits.dtype,
++                device=self.device,
++            )
+         return model
+ 
++    def materialize_draft_logits(self, idx_mapping: torch.Tensor) -> None:
++        """Populate today's cache only for a batch taking the dense fallback."""
++        if self.local_draft_logits is not None:
++            logits = get_tp_group().all_gather(
++                self.local_draft_logits[idx_mapping], dim=-1
++            )[..., : self.vocab_size]
++            self.draft_logits.index_copy_(0, idx_mapping, logits)
++
+     def _sample_logits(
+         self,
+         logits: torch.Tensor,
+@@ -175,7 +209,10 @@ class DSparkSpeculator(DFlashSpeculator):
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        if self.distributed_draft:
++            base_logits = self.model.compute_draft_logits_local(sample_hidden)
++        else:
++            base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
+@@ -193,10 +230,47 @@ class DSparkSpeculator(DFlashSpeculator):
+             if self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
+             bias = self.model.markov_bias(markov_embed)
+-            logits_i = base_logits[:, i] + bias
+-            draft_sampled_i = self._sample_logits(
+-                logits_i, idx_map[:, i], sample_pos[:, i], i
+-            )
++            if self.distributed_draft:
++                start = self.model.lm_head.shard_indices.org_vocab_start_index
++                bias = bias[:, start : start + vocab_size]
++                bias = torch.nn.functional.pad(
++                    bias, (0, vocab_size - bias.shape[-1]), value=0
++                )
++                logits_i = base_logits[:, i] + bias
++                parallel = VocabParallelSampler(get_tp_group(), start, self.vocab_size)
++                logits_i = parallel.mask_padding(logits_i)
++                if self.local_draft_logits is None:
++
++                    def draw(x, start=start):
++                        value, ids = x.max(-1)
++                        return value.float(), ids + start
++                else:
++
++                    def draw(x, i=i, start=start):
++                        temp = self.temperature[idx_map[:, i]]
++                        scaled = x.float() / torch.where(temp == 0, 1, temp)[:, None]
++                        return gumbel_sample(
++                            scaled,
++                            idx_map[:, i],
++                            self.temperature,
++                            self.seeds,
++                            sample_pos[:, i] - 1,
++                            apply_temperature=False,
++                            is_drafting=True,
++                            logits_cache=self.local_draft_logits,
++                            logits_cache_source=x,
++                            logits_cache_col=self._step_cols[i],
++                            use_fp64=self.use_fp64_gumbel,
++                            vocab_start=start,
++                            return_max=True,
++                        )
++
++                draft_sampled_i = parallel.sample(logits_i, draw)
++            else:
++                logits_i = base_logits[:, i] + bias
++                draft_sampled_i = self._sample_logits(
++                    logits_i, idx_map[:, i], sample_pos[:, i], i
++                )
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 2200c173ab..4df23d15bf 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -281,7 +281,9 @@ class RejectionSampler:
+             expanded_idx_mapping,
+             expanded_local_pos,
+             self.sampler.sampling_states.temperature.gpu,
+-            self.sampler.sampling_states.seeds.gpu,
++            getattr(
++                self.sampler, "sampling_seeds", self.sampler.sampling_states.seeds.gpu
++            ),
+             self.num_speculative_steps,
+             self.synthetic_conditional_rates,
+             use_fp64=self.sampler.use_fp64_gumbel,
+-- 
+2.55.0
+

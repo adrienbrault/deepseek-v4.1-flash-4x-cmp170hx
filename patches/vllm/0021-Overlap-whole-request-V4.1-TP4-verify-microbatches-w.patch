@@ -1,0 +1,1201 @@
+From d38f4de3cb927f855771eb12937e11fc2b09c2a4 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 21:55:36 +0200
+Subject: [PATCH 21/22] Overlap whole-request V4.1 TP4 verify microbatches with
+ upstream DBO
+
+Keep non-causal DSpark queries intact; pack ragged rows into stable half-batch buffers for FULL graphs and use event-ordered TP reductions on the DBO communication stream. Isolate indexer, Engram and MTP state and add an optional live output gate.
+
+Origin: dsv41 overlap round r17
+Upstream: local opt-in SM80 experiment
+---
+ tests/v1/worker/test_gpu_ubatch_slicing.py    | 112 ++++++
+ vllm/config/parallel.py                       |   4 +-
+ vllm/config/vllm.py                           |  31 +-
+ .../device_communicators/cuda_communicator.py |  19 +
+ .../flashinfer_pcie_ipc_all_reduce.py         |  48 ++-
+ vllm/envs.py                                  |   6 +
+ .../layers/sparse_attn_indexer.py             |  10 +-
+ vllm/models/deepseek_v41/attention.py         |  20 +-
+ vllm/models/deepseek_v41/common/engram.py     |   7 +-
+ vllm/models/deepseek_v41/nvidia/model.py      |  10 +-
+ vllm/v1/attention/backends/mla/indexer.py     |   2 +-
+ vllm/v1/worker/gpu/cudagraph_utils.py         |  47 ++-
+ vllm/v1/worker/gpu/dp_utils.py                |  21 ++
+ vllm/v1/worker/gpu/dsv41_tbo.py               | 326 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |  21 ++
+ vllm/v1/worker/gpu/ubatch_utils.py            |  46 ++-
+ vllm/v1/worker/ubatching.py                   |  12 +-
+ 17 files changed, 713 insertions(+), 29 deletions(-)
+ create mode 100644 vllm/v1/worker/gpu/dsv41_tbo.py
+
+diff --git a/tests/v1/worker/test_gpu_ubatch_slicing.py b/tests/v1/worker/test_gpu_ubatch_slicing.py
+index 56a365218b..8e1256a84c 100644
+--- a/tests/v1/worker/test_gpu_ubatch_slicing.py
++++ b/tests/v1/worker/test_gpu_ubatch_slicing.py
+@@ -961,3 +961,115 @@ def test_microbatched_graph_needs_every_rank_to_reach_the_split():
+     assert desc.cg_mode == CUDAGraphMode.NONE
+     assert desc.num_ubatches == 2
+     assert dp_sync_state is not None and dp_sync_state.eager
++
++
++def test_dsv41_tbo_keeps_whole_requests_with_device_trimmed_lengths(monkeypatch):
++    """Host upper bounds must not decide the split of a compacted GPU batch."""
++    from vllm.v1.worker.gpu import dsv41_tbo as tbo
++    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++
++    runner = tbo.DSV41TBORunner.__new__(tbo.DSV41TBORunner)
++    runner.device = torch.device("cpu")
++    runner.query_len = 6
++    runner.inputs = [InputBuffers(4, 24, runner.device) for _ in range(2)]
++    runner.slots = [torch.empty((1, 24), dtype=torch.int64) for _ in range(2)]
++    runner.attn_groups = []
++    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[None])
++    runner.model_state = SimpleNamespace(prepare_attn=lambda *a, **k: a[0])
++    runner._make_forward_contexts = lambda slices, meta, slots, pad: meta
++
++    def cpu_pack(src, dst, qloc, start, stop, real_reqs, pad=0):
++        lo, hi = qloc[min(start, real_reqs)], qloc[min(stop, real_reqs)]
++        dst.fill_(pad)
++        dst[: hi - lo].copy_(src[lo:hi])
++
++    monkeypatch.setattr(tbo, "pack_rows", cpu_pack)
++    for reqs, lengths in (
++        (2, [1, 6]),
++        (3, [6, 1, 2]),
++        (4, [1, 2, 3, 1]),
++        (7, [1, 6, 2, 5, 3, 4, 1]),
++        (8, [6] * 8),
++    ):
++        padded_reqs, rows = tbo.tbo_shape(reqs, 6)
++        buffers = InputBuffers(padded_reqs, rows, runner.device)
++        batch = InputBatch.make_dummy(padded_reqs, rows, buffers, max_query_len=6)
++        batch.num_reqs = reqs
++        batch.req_ids = batch.req_ids[:reqs]
++        # Host still describes all six scheduled verification rows per request.
++        # Device offsets instead describe adaptive reallocation and padding.
++        qloc = torch.tensor([0, *np.cumsum(lengths)], dtype=torch.int32)
++        batch.query_start_loc[: reqs + 1].copy_(qloc)
++        batch.input_ids.copy_(torch.arange(rows))
++        batch.positions.copy_(torch.arange(rows) + 100)
++        batch.is_padding.copy_(torch.arange(rows) >= sum(lengths))
++        slots = torch.arange(rows, dtype=torch.int64).view(1, -1)
++        state = runner.prepare(
++            batch,
++            (torch.arange(padded_reqs).view(-1, 1),),
++            slots,
++            cg_mode=CUDAGraphMode.FULL,
++        )
++        half = padded_reqs // 2
++        assert int(state.batches[0].query_start_loc[-1]) == sum(lengths[:half])
++        assert int(state.batches[1].query_start_loc[-1]) == sum(lengths[half:])
++        for i, sub in enumerate(state.batches):
++            lo, hi = sum(lengths[: i * half]), sum(lengths[: (i + 1) * half])
++            assert sub.input_ids[: hi - lo].tolist() == list(range(lo, hi))
++            assert not sub.is_padding[: hi - lo].any()
++            assert sub.is_padding[hi - lo :].all()
++            assert runner.slots[i][0, : hi - lo].tolist() == list(range(lo, hi))
++            assert (runner.slots[i][0, hi - lo : rows // 2] == -1).all()
++            expected = [0, *np.cumsum(lengths[i * half : (i + 1) * half])]
++            expected += [expected[-1]] * (half + 1 - len(expected))
++            assert sub.query_start_loc.tolist() == expected
++
++
++def test_dsv41_tbo_graphs_belong_only_to_the_target_runner(monkeypatch):
++    """The DSpark drafter shares config but has no threaded microbatch runner."""
++    from collections import defaultdict
++    from types import MethodType
++
++    from vllm.v1.worker.gpu.dsv41_tbo import tbo_shape
++
++    monkeypatch.setattr(cudagraph_utils.envs, "VLLM_DSV41_TBO", True)
++    mode = CUDAGraphMode
++    for target in (False, True):
++        manager = SimpleNamespace(
++            compilation_config=SimpleNamespace(
++                cudagraph_capture_sizes=list(range(1, 49)),
++                max_cudagraph_capture_size=48,
++            ),
++            max_num_reqs=8,
++            decode_query_len=6,
++            cudagraph_mode=mode.FULL_DECODE_ONLY,
++            varlen_decode=True,
++            vllm_config=SimpleNamespace(
++                speculative_config=None,
++                cache_config=SimpleNamespace(use_kda_recoverssm=False),
++            ),
++            lora_capture_cases=[0],
++            _capture_descs=defaultdict(list),
++            _candidates={},
++            ubatch_runner=object() if target else None,
++            _maybe_ubatch_twin=lambda desc: None,
++        )
++        manager._init_tbo_candidates = MethodType(
++            cudagraph_utils.CudaGraphManager._init_tbo_candidates, manager
++        )
++        cudagraph_utils.CudaGraphManager._init_candidates(manager)
++        tbo = [
++            desc for desc in manager._capture_descs[mode.FULL] if desc.num_ubatches == 2
++        ]
++        assert sorted((d.num_reqs, d.num_tokens) for d in tbo) == (
++            [tbo_shape(reqs, 6) for reqs in (2, 4, 6, 8)] if target else []
++        )
++
++        if target:
++            manager._graphs_captured = True
++            manager._resolve_effective_loras = lambda n: n
++            for reqs, rows in ((2, 7), (3, 13), (4, 17), (7, 29), (8, 37)):
++                desc = cudagraph_utils.CudaGraphManager.dispatch(
++                    manager, reqs, rows, None, 0, max_query_len=6, num_ubatches=2
++                )
++                assert (desc.num_reqs, desc.num_tokens) == tbo_shape(reqs, 6)
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index 69677ee9d6..01ffe24a25 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -643,11 +643,11 @@ class ParallelConfig:
+ 
+     @property
+     def use_ubatching(self) -> bool:
+-        return self.enable_dbo or self.ubatch_size > 1
++        return self.enable_dbo or self.ubatch_size > 1 or envs.VLLM_DSV41_TBO
+ 
+     @property
+     def num_ubatches(self) -> int:
+-        return 2 if self.enable_dbo else self.ubatch_size
++        return 2 if self.enable_dbo or envs.VLLM_DSV41_TBO else self.ubatch_size
+ 
+     @property
+     def local_engines_only(self) -> bool:
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 7312ef9c4e..2decc4548a 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1451,6 +1451,7 @@ class VllmConfig:
+             and model_config.architecture == "DeepseekV41ForCausalLM"
+             and getattr(model_config.hf_text_config, "engram_layer_ids", None)
+             and self.parallel_config.use_ubatching
++            and not envs.VLLM_DSV41_TBO
+         ):
+             raise ValueError(
+                 "DeepSeek V4.1 Engram does not support DBO or microbatching. "
+@@ -2173,7 +2174,7 @@ class VllmConfig:
+                 f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
+             )
+ 
+-        if self.parallel_config.use_ubatching:
++        if self.parallel_config.use_ubatching and not envs.VLLM_DSV41_TBO:
+             a2a_backend = self.parallel_config.all2all_backend
+             if current_platform.is_rocm():
+                 supported_backends = [
+@@ -3044,6 +3045,32 @@ class VllmConfig:
+             if getattr(speculative_config, "use_heterogeneous_vocab", False):
+                 unsupported.append("heterogeneous-vocabulary draft models")
+ 
++        if envs.VLLM_DSV41_TBO:
++            p = self.parallel_config
++            spec = self.speculative_config
++            target = spec.target_model_config if spec else self.model_config
++            if not (
++                target is not None
++                and target.architecture == "DeepseekV41ForCausalLM"
++                and target.quantization == "exl3"
++                and p.tensor_parallel_size == 4
++                and p.pipeline_parallel_size == p.data_parallel_size == 1
++                and p.decode_context_parallel_size == 1
++                and p.prefill_context_parallel_size == 1
++                and not p.enable_expert_parallel
++                and not p.enable_dbo
++                and p.ubatch_size == 0
++                and self.lora_config is None
++                and (spec is None or spec.method == "dspark")
++                and envs.VLLM_DSV41_TBO_MIN_ROWS >= 2
++                and self.scheduler_config.max_num_seqs >= 2
++                and self.scheduler_config.max_num_seqs % 2 == 0
++                and not self.model_config.enable_prompt_embeds
++            ):
++                raise ValueError(
++                    "VLLM_DSV41_TBO requires V4.1 EXL3 TP4/PP1/DP1, "
++                    "DSpark or plain decode, no EP/CP/LoRA/embeds/DBO"
++                )
+         if self.parallel_config.use_ubatching:
+             unsupported.extend(self._get_dbo_unsupported_features())
+ 
+@@ -3206,7 +3233,7 @@ class VllmConfig:
+ 
+         if self.lora_config is not None:
+             unsupported.append("dual batch overlap with LoRA")
+-        if self.speculative_config is not None:
++        if self.speculative_config is not None and not envs.VLLM_DSV41_TBO:
+             unsupported.append("dual batch overlap with speculative decoding")
+         if parallel_config.pipeline_parallel_size > 1:
+             unsupported.append("dual batch overlap with pipeline parallelism")
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 1bc6182288..b752a4b2f1 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -360,6 +360,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         )
+ 
+     def all_reduce(self, input_):
++        if envs.VLLM_DSV41_TBO:
++            from vllm.v1.worker.ubatching import (
++                dbo_enabled,
++                dbo_switch_to_comm_sync,
++                dbo_yield_and_switch_from_comm_to_compute,
++            )
++
++            if dbo_enabled():
++                # Own the producer output across scratch reuse by the other half.
++                owned = input_.clone()
++                dbo_switch_to_comm_sync()
++                owned.record_stream(torch.cuda.current_stream())
++                out = self._all_reduce(owned).clone()
++                dbo_yield_and_switch_from_comm_to_compute()
++                out.record_stream(torch.cuda.current_stream())
++                return out
++        return self._all_reduce(input_)
++
++    def _all_reduce(self, input_):
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+diff --git a/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py b/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
+index 10e9bf885b..fa70cd6b89 100644
+--- a/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
++++ b/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
+@@ -17,6 +17,7 @@ import torch
+ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+ 
++import vllm.envs as envs
+ from vllm.distributed.parallel_state import in_the_same_node_as
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+@@ -54,6 +55,7 @@ class FlashInferPcieIpcAllReduce:
+         self.world_size = dist.get_world_size(group)
+         self.rank = dist.get_rank(group)
+         self.workspace: Any | None = None
++        self.tbo_workspace = None
+         self.hidden_dim = 0
+         self.dtype: torch.dtype | None = None
+ 
+@@ -99,6 +101,7 @@ class FlashInferPcieIpcAllReduce:
+         dtype: torch.dtype,
+         capture_sizes: Sequence[int],
+         tune_cache: Path,
++        tbo_stream: torch.cuda.Stream | None = None,
+     ) -> None:
+         """Allocate, tune, and prepare the exact graph-capture shapes."""
+         if self.disabled or self.workspace is not None:
+@@ -146,6 +149,25 @@ class FlashInferPcieIpcAllReduce:
+         workspace.prepare([(batch, self.hidden_dim) for batch in batches], dtype=dtype)
+         torch.accelerator.synchronize(self.device)
+         workspace.rebind_stream()
++        if tbo_stream is not None:
++            # One workspace per stream; the two halves serialize on tbo_stream.
++            with torch.cuda.stream(tbo_stream):
++                tbo_workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
++                    group=self.group,
++                    max_numel=max_numel,
++                    dtype=dtype,
++                    tune_batches=batches,
++                    tune_cache=str(tune_cache.with_suffix(".tbo.json")),
++                )
++                tbo_workspace.rebind_stream()
++                tbo_workspace.tune(
++                    [self.hidden_dim], dtype=dtype, tune_group=self.tune_group
++                )
++                tbo_workspace.prepare(
++                    [(n, self.hidden_dim) for n in batches], dtype=dtype
++                )
++                self.tbo_workspace = tbo_workspace
++            torch.accelerator.synchronize(self.device)
+         logger.info_once(
+             "Initialized FlashInfer PCIe IPC all-reduce for TP%d, hidden_dim=%d, "
+             "dtype=%s, max_tokens=%d.",
+@@ -155,8 +177,16 @@ class FlashInferPcieIpcAllReduce:
+             batches[-1],
+         )
+ 
++    def active_workspace(self):
++        if getattr(self, "tbo_workspace", None) is not None:
++            from vllm.v1.worker.ubatching import dbo_enabled
++
++            if dbo_enabled():
++                return self.tbo_workspace
++        return self.workspace
++
+     def should_use(self, inp: torch.Tensor) -> bool:
+-        workspace = self.workspace
++        workspace = self.active_workspace()
+         return bool(
+             not self.disabled
+             and workspace is not None
+@@ -169,8 +199,9 @@ class FlashInferPcieIpcAllReduce:
+         )
+ 
+     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+-        assert self.workspace is not None
+-        return self.workspace.all_reduce(inp)
++        workspace = self.active_workspace()
++        assert workspace is not None
++        return workspace.all_reduce(inp)
+ 
+     @contextmanager
+     def capture(self):
+@@ -193,6 +224,9 @@ class FlashInferPcieIpcAllReduce:
+             workspace.rebind_stream()
+ 
+     def destroy(self) -> None:
++        if self.tbo_workspace is not None:
++            self.tbo_workspace.destroy()
++            self.tbo_workspace = None
+         workspace = self.workspace
+         if workspace is not None:
+             workspace.destroy()
+@@ -216,7 +250,7 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
+     pcie_comm = communicator.fi_pcie_ipc_ar_comm
+     if pcie_comm is None or pcie_comm.disabled:
+         return
+-    if worker.vllm_config.parallel_config.use_ubatching:
++    if worker.vllm_config.parallel_config.use_ubatching and not envs.VLLM_DSV41_TBO:
+         logger.warning_once(
+             "FlashInfer PCIe IPC all-reduce does not yet support DBO or "
+             "multi-ubatch execution; falling back to another backend."
+@@ -228,6 +262,11 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
+     if not capture_sizes:
+         return
+ 
++    tbo_stream = None
++    if envs.VLLM_DSV41_TBO:
++        tbo_stream = worker.model_runner.ubatch_runner.comm_stream
++        # Half sizes differ from parent graph buckets, including ragged totals.
++        capture_sizes = sorted(set(capture_sizes) | set(range(1, 49)))
+     base_cache = resolve_flashinfer_autotune_file(worker.model_runner)
+     ranks = "-".join(str(rank) for rank in tp_group.ranks)
+     tune_cache = base_cache.with_name(f"pcie_ipc_allreduce_tp_{ranks}.json")
+@@ -236,4 +275,5 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
+         dtype=worker.model_config.dtype,
+         capture_sizes=capture_sizes,
+         tune_cache=tune_cache,
++        tbo_stream=tbo_stream,
+     )
+diff --git a/vllm/envs.py b/vllm/envs.py
+index c48e6a398d..d044daea8d 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -12,6 +12,9 @@ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any, Literal
+ 
+ if TYPE_CHECKING:
++    VLLM_DSV41_TBO_CHECK: bool = False
++    VLLM_DSV41_TBO: bool = False
++    VLLM_DSV41_TBO_MIN_ROWS: int = 12
+     VLLM_HOST_IP: str = ""
+     VLLM_PORT: int | None = None
+     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
+@@ -617,6 +620,9 @@ def _resolve_rust_cli_path() -> str | None:
+ 
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    "VLLM_DSV41_TBO_CHECK": lambda: bool(int(os.getenv("VLLM_DSV41_TBO_CHECK", "0"))),
++    "VLLM_DSV41_TBO": lambda: bool(int(os.getenv("VLLM_DSV41_TBO", "0"))),
++    "VLLM_DSV41_TBO_MIN_ROWS": lambda: int(os.getenv("VLLM_DSV41_TBO_MIN_ROWS", "12")),
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 6daff90334..6430a5a4e2 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -1141,6 +1141,14 @@ class SparseAttnIndexer(CustomOp):
+     `custom_ops` in `CompilationConfig` to enable the platform specific path.
+     """
+ 
++    @property
++    def topk_indices_buffer(self):
++        from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
++
++        buffer = self._topk_indices_buffer
++        offset = dbo_current_ubatch_token_offset()
++        return buffer[offset:] if buffer is not None and offset else buffer
++
+     def __init__(
+         self,
+         k_cache,
+@@ -1167,7 +1175,7 @@ class SparseAttnIndexer(CustomOp):
+         self.head_dim = head_dim
+         self.max_model_len = max_model_len
+         self.max_total_seq_len = max_total_seq_len
+-        self.topk_indices_buffer = topk_indices_buffer
++        self._topk_indices_buffer = topk_indices_buffer
+         self.skip_k_cache_insert = skip_k_cache_insert
+         self.use_fp4_cache = use_fp4_cache
+         self.compress_ratio = compress_ratio
+diff --git a/vllm/models/deepseek_v41/attention.py b/vllm/models/deepseek_v41/attention.py
+index 39004caa09..d008cf0218 100644
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -280,6 +280,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         returns one that writes and scores its own cache layout."""
+         return DeepseekV4Indexer
+ 
++    @property
++    def topk_indices_buffer(self):
++        from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
++
++        buffer = self._topk_indices_buffer
++        offset = dbo_current_ubatch_token_offset()
++        return buffer[offset:] if buffer is not None and offset else buffer
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -423,7 +431,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+             compress_ratio=self.compress_ratio,
+         )
+         self.indexer_rotary_emb = self.rotary_emb
+-        self.topk_indices_buffer = topk_indices_buffer
++        self._topk_indices_buffer = topk_indices_buffer
+         self.candidate_block_buffer = candidate_block_buffer
+ 
+         # Register with compilation context for metadata lookup. Done before
+@@ -1333,6 +1341,14 @@ class DeepseekV4Indexer(nn.Module):
+     )
+     attn_cls: ClassVar[type[SparseAttnIndexer]] = SparseAttnIndexer
+ 
++    @property
++    def topk_indices_buffer(self):
++        from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
++
++        buffer = self._topk_indices_buffer
++        offset = dbo_current_ubatch_token_offset()
++        return buffer[offset:] if buffer is not None and offset else buffer
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -1388,7 +1404,7 @@ class DeepseekV4Indexer(nn.Module):
+ 
+         self.scale_fmt = "ue8m0"
+         self.quant_block_size = 128  # TODO: get from config
+-        self.topk_indices_buffer = topk_indices_buffer
++        self._topk_indices_buffer = topk_indices_buffer
+ 
+         self.max_model_len = (
+             vllm_config.model_config.max_model_len // self.compress_ratio
+diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
+index 2f6c7ee563..7314845401 100644
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -77,6 +77,7 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.platform_utils import is_uva_available
+ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++from vllm.v1.worker.ubatching import dbo_current_ubatch_token_offset
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1641,7 +1642,8 @@ class Engram(nn.Module):
+     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+         """Look up, or prefetch from host memory, rows before the decoder layers
+         consume them; DP-sharded tables take the group's gathered hash IDs."""
+-        rows = self.staged_rows[: hash_ids.shape[0]]
++        offset = dbo_current_ubatch_token_offset()
++        rows = self.staged_rows[offset : offset + hash_ids.shape[0]]
+         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+         if self._prefetch_stream is None:
+             self.embed_tokens.lookup(hash_ids, rows)
+@@ -1684,7 +1686,8 @@ class Engram(nn.Module):
+             slot = engram_gathered_num_tokens()
+             staged = self.staged_rows[: slot * self.embed_tokens.dp_size]
+             return _gather_engram_rows(staged, num_tokens)
+-        return self.staged_rows[:num_tokens]
++        offset = dbo_current_ubatch_token_offset()
++        return self.staged_rows[offset : offset + num_tokens]
+ 
+     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+         """Gather heads, returning only local tokens when SP is enabled."""
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index e0350af023..a2d5a5bc9f 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -98,7 +98,10 @@ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
++from vllm.v1.worker.ubatching import (
++    dbo_current_ubatch_id,
++    dbo_current_ubatch_token_offset,
++)
+ 
+ from ..common.engram import (
+     Engram,
+@@ -1242,7 +1245,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
+             num_tokens = hidden_states.shape[0]
+-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
++            offset = dbo_current_ubatch_token_offset()
++            self._mtp_hidden_buffer[offset : offset + num_tokens].copy_(
++                hidden_states.flatten(1)
++            )
+ 
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference applies via
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 6c086479e8..fb69ac48f3 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -965,7 +965,7 @@ def _sm80_adaptive_device_query_lens(vllm_config: VllmConfig) -> bool:
+     spec_config = vllm_config.speculative_config
+     if not (
+         spec_config is not None
+-        and spec_config.enable_adaptive_verification
++        and (spec_config.enable_adaptive_verification or envs.VLLM_DSV41_TBO)
+         and current_platform.is_cuda()
+         and current_platform.is_device_capability_family(80)
+     ):
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 13ff66fac8..5c5ff1bc79 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -13,6 +13,7 @@ import torch
+ import torch.nn as nn
+ from tqdm import tqdm
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import (
+     BreakableCUDAGraphWrapper,
+     is_breakable_cudagraph_enabled,
+@@ -226,6 +227,22 @@ class CudaGraphManager:
+         # Counts above the largest captured case clamp to it.
+         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
+ 
++    def _init_tbo_candidates(self, decode_mode, descs_by_mode):
++        from vllm.v1.worker.gpu.dsv41_tbo import tbo_shape
++
++        if decode_mode != CUDAGraphMode.FULL:
++            raise ValueError("VLLM_DSV41_TBO requires FULL decode CUDA graphs")
++        for reqs in range(2, self.max_num_reqs + 1, 2):
++            slots, rows = tbo_shape(reqs, self.decode_query_len)
++            desc = BatchExecutionDescriptor(
++                cg_mode=decode_mode,
++                num_tokens=rows,
++                num_reqs=slots,
++                max_query_len=self.decode_query_len,
++                num_ubatches=2,
++            )
++            descs_by_mode[decode_mode].append(desc)
++
+     def _maybe_ubatch_twin(
+         self, desc: BatchExecutionDescriptor
+     ) -> BatchExecutionDescriptor | None:
+@@ -234,7 +251,11 @@ class CudaGraphManager:
+         Uniform query lengths preserve the captured request split. Use the DP
+         dispatch thresholds so all ranks generate the same candidates.
+         """
+-        if self.ubatch_runner is None or desc.cg_mode != CUDAGraphMode.FULL:
++        if (
++            envs.VLLM_DSV41_TBO
++            or self.ubatch_runner is None
++            or desc.cg_mode != CUDAGraphMode.FULL
++        ):
+             return None
+         if desc.num_reqs is None:
+             return None
+@@ -373,6 +394,8 @@ class CudaGraphManager:
+                 if ubatch_desc is not None:
+                     descs_by_mode[mixed_mode].append(ubatch_desc)
+ 
++        if envs.VLLM_DSV41_TBO and self.ubatch_runner is not None:
++            self._init_tbo_candidates(decode_mode, descs_by_mode)
+         for mode, descs in descs_by_mode.items():
+             descs.sort(key=lambda d: d.num_tokens, reverse=True)
+             self._capture_descs[mode] = descs
+@@ -532,6 +555,21 @@ class CudaGraphManager:
+         """Find matching cudagraph descriptor from priority-ordered candidates."""
+         effective_loras = self._resolve_effective_loras(num_active_loras)
+         key = (num_tokens, effective_loras)
++        if envs.VLLM_DSV41_TBO and num_ubatches == 2 and self._graphs_captured:
++            # Normal dispatch ranges are keyed by row count. Ragged TBO needs
++            # capacity for whole request slots, even when a smaller ordinary
++            # graph exactly covers its compacted row count.
++            for desc in reversed(self._capture_descs.get(CUDAGraphMode.FULL, [])):
++                if desc.num_ubatches == 2 and _is_compatible(
++                    desc,
++                    num_reqs,
++                    num_tokens,
++                    uniform_token_count,
++                    effective_loras,
++                    max_query_len,
++                    num_ubatches,
++                ):
++                    return desc
+         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
+             for desc in self._candidates[key]:
+                 if _is_compatible(
+@@ -702,7 +740,12 @@ class ModelCudaGraphManager(CudaGraphManager):
+             if desc.num_ubatches > 1:
+                 # Prepare and park threads before capture; finish runs inside it.
+                 assert self.ubatch_runner is not None
+-                input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
++                input_batch = InputBatch.make_dummy(
++                    num_reqs,
++                    num_tokens,
++                    input_buffers,
++                    max_query_len=desc.max_query_len,
++                )
+                 input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+                 set_dcp_capture_context(
+                     input_batch,
+diff --git a/vllm/v1/worker/gpu/dp_utils.py b/vllm/v1/worker/gpu/dp_utils.py
+index 5ad88ca7f1..9a90319d06 100644
+--- a/vllm/v1/worker/gpu/dp_utils.py
++++ b/vllm/v1/worker/gpu/dp_utils.py
+@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.config import ParallelConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed.parallel_state import get_dp_group
+@@ -276,6 +277,26 @@ def dispatch_cg_and_sync_dp(
+         )
+ 
+     if dp_size == 1:
++        if (
++            envs.VLLM_DSV41_TBO
++            and allow_ubatching
++            and not need_eager
++            and num_reqs >= 2
++            and max_query_len is not None
++            and num_tokens >= envs.VLLM_DSV41_TBO_MIN_ROWS
++        ):
++            assert cudagraph_manager is not None
++            candidate = cudagraph_manager.dispatch(
++                num_reqs,
++                num_tokens,
++                None,
++                num_active_loras,
++                max_query_len=max_query_len,
++                num_ubatches=2,
++            )
++            # Capture must have succeeded; never launch a token-midpoint eager split.
++            if candidate.cg_mode == CUDAGraphMode.FULL:
++                batch_desc = candidate
+         return batch_desc, None
+ 
+     if dp_sync_state is not None:
+diff --git a/vllm/v1/worker/gpu/dsv41_tbo.py b/vllm/v1/worker/gpu/dsv41_tbo.py
+new file mode 100644
+index 0000000000..04015be700
+--- /dev/null
++++ b/vllm/v1/worker/gpu/dsv41_tbo.py
+@@ -0,0 +1,326 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Whole-request TP4 overlap; never split a non-causal DSpark query."""
++
++from dataclasses import replace
++from typing import Any, NamedTuple
++
++import numpy as np
++import torch
++
++from vllm.config import CUDAGraphMode
++from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
++from vllm.v1.worker.ubatch_utils import UBatchSlice
++
++
++def tbo_shape(num_reqs: int, query_len: int) -> tuple[int, int]:
++    """Equal request slots and worst-case row capacity, including odd batches."""
++    padded_reqs = 2 * ((num_reqs + 1) // 2)
++    return padded_reqs, padded_reqs * query_len
++
++
++@triton.jit
++def _pack_rows(
++    Src,
++    Dst,
++    Qloc,
++    START: tl.constexpr,
++    STOP: tl.constexpr,
++    REAL_REQS: tl.constexpr,
++    ROWS: tl.constexpr,
++    WIDTH: tl.constexpr,
++    SRC_STRIDE: tl.constexpr,
++    DST_STRIDE: tl.constexpr,
++    PAD: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    start = tl.load(Qloc + min(START, REAL_REQS))
++    end = tl.load(Qloc + min(STOP, REAL_REQS))
++    value = tl.load(
++        Src + (start + row) * SRC_STRIDE + cols,
++        (row < end - start) & (cols < WIDTH),
++        other=PAD,
++    )
++    tl.store(Dst + row * DST_STRIDE + cols, value, cols < WIDTH)
++
++
++def pack_rows(src, dst, qloc, start, stop, real_reqs, pad=0):
++    width = src[0].numel() if src.ndim > 1 else 1
++    _pack_rows[(dst.shape[0], triton.cdiv(width, 256))](
++        src,
++        dst,
++        qloc,
++        start,
++        stop,
++        real_reqs,
++        dst.shape[0],
++        width,
++        src.stride(0),
++        dst.stride(0),
++        pad,
++        256,
++    )
++
++
++@triton.jit
++def _unpack_rows(
++    Src,
++    Dst,
++    Qloc,
++    SPLIT: tl.constexpr,
++    REAL_REQS: tl.constexpr,
++    CAPACITY: tl.constexpr,
++    WIDTH: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    split = tl.load(Qloc + SPLIT)
++    end = tl.load(Qloc + REAL_REQS)
++    source_row = tl.where(row < split, row, CAPACITY + row - split)
++    value = tl.load(
++        Src + source_row * WIDTH + cols, (row < end) & (cols < WIDTH), other=0
++    )
++    tl.store(Dst + row * WIDTH + cols, value, cols < WIDTH)
++
++
++def unpack_rows(src, qloc, split, real_reqs):
++    out = torch.empty_like(src)
++    width = src[0].numel()
++    _unpack_rows[(src.shape[0], triton.cdiv(width, 256))](
++        src, out, qloc, split, real_reqs, src.shape[0] // 2, width, 256
++    )
++    return out
++
++
++class TBOState(NamedTuple):
++    slices: list[UBatchSlice]
++    forward_contexts: list[Any]
++    batches: list[InputBatch]
++    parent: InputBatch
++
++
++class DSV41TBORunner(UBatchRunner):
++    """Reuse DBO's cooperative threads, event handoffs and FULL graph capture.
++
++    Each half owns whole requests and has a persistent packed input buffer.
++    Device query offsets, including r9's reallocation, drive packing/unpacking.
++    """
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        config = self.vllm_config
++        self.query_len = config.num_speculative_tokens + 1
++        slots, rows = tbo_shape(config.scheduler_config.max_num_seqs, self.query_len)
++        self.inputs = [
++            InputBuffers(slots // 2, rows // 2, self.device) for _ in range(2)
++        ]
++        groups = len(self.kv_cache_config.kv_cache_groups)
++        self.slots = [
++            torch.empty((groups, rows // 2), dtype=torch.int64, device=self.device)
++            for _ in range(2)
++        ]
++
++    def prepare(
++        self,
++        input_batch,
++        block_tables,
++        slot_mappings,
++        cg_mode=CUDAGraphMode.NONE,
++        for_capture=False,
++    ):
++        parent = input_batch
++        reqs = parent.num_reqs_after_padding
++        assert reqs % 2 == 0 and reqs >= 2 and not parent.has_prefill
++        parent.query_start_loc[parent.num_reqs + 1 :].copy_(
++            parent.query_start_loc[parent.num_reqs].expand(reqs - parent.num_reqs)
++        )
++        half = reqs // 2
++        capacity = parent.num_tokens_after_padding // 2
++        assert capacity == half * self.query_len
++        batches, slices, metadata, mappings, padding = [], [], [], [], []
++        for i in range(2):
++            lo, hi = i * half, (i + 1) * half
++            real_lo, real_hi = min(lo, parent.num_reqs), min(hi, parent.num_reqs)
++            buf = self.inputs[i]
++            qloc = buf.query_start_loc[: half + 1]
++            # Clamp padded request slots to the real end, on the device too.
++            indices = torch.arange(lo, hi + 1, device=self.device).clamp_(
++                max=parent.num_reqs
++            )
++            torch.index_select(parent.query_start_loc, 0, indices, out=qloc)
++            qloc.sub_(parent.query_start_loc[real_lo])
++            qloc_np = parent.query_start_loc_np[
++                np.minimum(np.arange(lo, hi + 1), parent.num_reqs)
++            ]
++            qloc_np = qloc_np - qloc_np[0]
++            seq_lens = buf.seq_lens[:half]
++            seq_lens.copy_(parent.seq_lens[lo:hi])
++            slots = self.slots[i][:, :capacity]
++            ids, pos, pad = (
++                buf.input_ids[:capacity],
++                buf.positions[:capacity],
++                buf.is_padding[:capacity],
++            )
++            for src, dst, fill in (
++                (parent.input_ids, ids, 0),
++                (parent.positions, pos, 0),
++                (parent.is_padding, pad, True),
++            ):
++                pack_rows(
++                    src, dst, parent.query_start_loc, lo, hi, parent.num_reqs, fill
++                )
++            for group in range(slots.shape[0]):
++                pack_rows(
++                    slot_mappings[group],
++                    slots[group],
++                    parent.query_start_loc,
++                    lo,
++                    hi,
++                    parent.num_reqs,
++                    -1,
++                )
++            batch = replace(
++                parent,
++                req_ids=parent.req_ids[real_lo:real_hi],
++                num_reqs=real_hi - real_lo,
++                num_reqs_after_padding=half,
++                idx_mapping=parent.idx_mapping[lo:hi],
++                idx_mapping_np=parent.idx_mapping_np[lo:hi],
++                num_scheduled_tokens=parent.num_scheduled_tokens[real_lo:real_hi],
++                num_tokens=int(qloc_np[-1]),
++                num_tokens_after_padding=capacity,
++                query_start_loc=qloc,
++                query_start_loc_np=qloc_np,
++                seq_lens=seq_lens,
++                seq_lens_cpu_upper_bound=parent.seq_lens_cpu_upper_bound[lo:hi],
++                num_computed_tokens_np=parent.num_computed_tokens_np[real_lo:real_hi],
++                prefill_len_np=parent.prefill_len_np[real_lo:real_hi],
++                num_computed_prefill_tokens_np=(
++                    parent.num_computed_prefill_tokens_np[real_lo:real_hi]
++                ),
++                is_prefilling_np=parent.is_prefilling_np[real_lo:real_hi],
++                input_ids=ids,
++                positions=pos,
++                is_padding=pad,
++                max_query_len=self.query_len,
++                fast_prefill=None,
++            )
++            batches.append(batch)
++            slices.append(
++                UBatchSlice(slice(lo, hi), slice(i * capacity, (i + 1) * capacity))
++            )
++            metadata.append(
++                self.model_state.prepare_attn(
++                    batch,
++                    cg_mode,
++                    tuple(t[lo:hi] for t in block_tables),
++                    slots,
++                    self.attn_groups,
++                    self.kv_cache_config,
++                    ubatch_idx=i,
++                    for_capture=for_capture,
++                )
++            )
++            from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
++
++            mappings.append(build_slot_mappings_by_layer(slots, self.kv_cache_config))
++            padding.append(pad)
++        return TBOState(
++            slices,
++            self._make_forward_contexts(slices, metadata, mappings, padding),
++            batches,
++            parent,
++        )
++
++    def slice_inputs(self, model_inputs, state, index):
++        batch = state.batches[index]
++        inputs = dict(
++            model_inputs, input_ids=batch.input_ids, positions=batch.positions
++        )
++        lookback = inputs.get("lookback_token_ids")
++        if lookback is not None:
++            inputs["lookback_token_ids"] = lookback[state.slices[index].request_slice]
++        return inputs
++
++    def merge_outputs(self, outputs, state, model):
++        from vllm.v1.worker.gpu.ubatch_utils import merge_ubatch_outputs
++
++        merged = merge_ubatch_outputs(outputs)
++        split = state.slices[0].request_slice.stop
++        qloc, reqs = state.parent.query_start_loc, state.parent.num_reqs
++
++        def unpack(value):
++            return unpack_rows(value, qloc, split, reqs)
++
++        mtp = model.get_mtp_target_hidden_states()
++        if mtp is not None:
++            rows = state.parent.num_tokens_after_padding
++            mtp[:rows].copy_(unpack(mtp[:rows]))
++        if isinstance(merged, tuple):
++            return tuple(unpack(value) for value in merged)
++        return unpack(merged)
++
++
++def check_live_tbo(model, inputs, candidate, batch, metadata, mappings, config):
++    """Expensive qualification only: compare real EXL3 outputs and MTP states.
++
++    Rewriting this step's same KV slots with identical inputs is idempotent.
++    Copy candidate MTP back afterwards so the drafter consumes the tested path.
++    Greedy token parity is a separate mandatory end-to-end gate.
++    """
++    import json
++    import os
++    from pathlib import Path
++
++    from vllm.distributed import get_tp_group
++    from vllm.forward_context import set_forward_context
++
++    assert isinstance(candidate, torch.Tensor)
++    tested = candidate.clone()
++    rows = batch.num_tokens_after_padding
++    mtp_buffer = model.get_mtp_target_hidden_states()
++    mtp = mtp_buffer[:rows].clone() if mtp_buffer is not None else None
++    with set_forward_context(
++        metadata,
++        config,
++        num_tokens=rows,
++        cudagraph_runtime_mode=CUDAGraphMode.NONE,
++        slot_mapping=mappings,
++        is_padding=batch.is_padding,
++    ):
++        reference = model(**inputs)
++    valid = ~batch.is_padding
++
++    def error(a, b):
++        a, b = a[valid].float(), b[valid].float()
++        return {
++            "bit_equal": bool(torch.equal(a, b)),
++            "max_abs": float((a - b).abs().max()),
++            "rms": float((a - b).square().mean().sqrt()),
++            "pass": bool(torch.allclose(a, b, atol=0.01, rtol=0.01)),
++        }
++
++    receipt = {
++        "rows": rows,
++        "requests": batch.num_reqs,
++        "query_lens": torch.diff(batch.query_start_loc[: batch.num_reqs + 1])
++        .cpu()
++        .tolist(),
++        "output": error(tested, reference),
++    }
++    if mtp is not None:
++        receipt["mtp"] = error(mtp, mtp_buffer[:rows])
++        mtp_buffer[:rows].copy_(mtp)
++    rank = get_tp_group().rank_in_group
++    directory = Path(os.environ.get("DSV41_TBO_CHECK_DIR", "/results/tbo-check"))
++    directory.mkdir(parents=True, exist_ok=True)
++    with (directory / f"rank{rank}.jsonl").open("a") as stream:
++        stream.write(json.dumps(receipt) + "\n")
++    assert all(
++        value["pass"] for value in receipt.values() if isinstance(value, dict)
++    ), receipt
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index df10600a4f..01b5245f3c 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2103,6 +2103,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     # Eager (NONE): call the raw model directly.
+                     model_output = self.model(**model_inputs)
+ 
++        if envs.VLLM_DSV41_TBO_CHECK and batch_desc.num_ubatches == 2:
++            from vllm.v1.worker.gpu.dsv41_tbo import check_live_tbo
++
++            reference_metadata = self.model_state.prepare_attn(
++                input_batch,
++                CUDAGraphMode.FULL,
++                block_tables,
++                slot_mappings,
++                self.attn_groups,
++                self.kv_cache_config,
++            )
++            check_live_tbo(
++                self.model,
++                model_inputs,
++                model_output,
++                input_batch,
++                reference_metadata,
++                build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config),
++                self.vllm_config,
++            )
++
+         self.kv_connector.finish_forward()
+ 
+         if self.is_last_pp_rank:
+diff --git a/vllm/v1/worker/gpu/ubatch_utils.py b/vllm/v1/worker/gpu/ubatch_utils.py
+index 3fa9783bf5..3f0ba62186 100644
+--- a/vllm/v1/worker/gpu/ubatch_utils.py
++++ b/vllm/v1/worker/gpu/ubatch_utils.py
+@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
+ import numpy as np
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.config import CUDAGraphMode, VllmConfig
+ from vllm.distributed import get_dcp_group
+ from vllm.forward_context import (
+@@ -462,6 +463,7 @@ class UBatchRunner:
+             compute_stream=compute_stream,
+             forward_contexts=ubatch_state.forward_contexts,
+             ready_barrier=self.ready_barrier,
++            token_offsets=[s.token_slice.start for s in ubatch_slices],
+         )
+ 
+         outputs: dict[int, Any] = {}
+@@ -480,14 +482,13 @@ class UBatchRunner:
+                 with ubatch_context:
+                     outputs[ubatch_context.id] = model(**inputs)
+             except BaseException as e:  # noqa: BLE001
+-                # Recorded so the join below can report which microbatch broke.
+-                # Note the siblings are not told to unwind: microbatches hand
+-                # control to each other, so one that dies mid-forward leaves
+-                # the others parked on a handoff that never comes and the step
+-                # hangs. The V1 runner behaves the same way; fixing it means
+-                # changing the shared handoff protocol in ubatching.py, which
+-                # is deliberately out of scope here.
++                # TBO cancels parked siblings so a Python error can be reported.
+                 errors[ubatch_context.id] = e
++                if envs.VLLM_DSV41_TBO:
++                    for ctx in ubatch_contexts:
++                        ctx.cancelled = True
++                        ctx.cpu_wait_event.set()
++                    self.ready_barrier.abort()
+ 
+         # Threads own the forward context; keep it cleared and SMs reserved
+         # until finish joins them.
+@@ -501,14 +502,22 @@ class UBatchRunner:
+                 target=run_ubatch,
+                 args=(
+                     ubatch_context,
+-                    slice_model_inputs(model_inputs, ubatch_slice.token_slice),
++                    self.slice_inputs(model_inputs, ubatch_state, ubatch_context.id),
+                 ),
+             )
+             threads.append(thread)
+             thread.start()
+ 
+         # Park all threads before the caller starts capture.
+-        self.ready_barrier.wait()
++        try:
++            self.ready_barrier.wait()
++        except threading.BrokenBarrierError:
++            for thread in threads:
++                thread.join()
++            stack.close()
++            raise RuntimeError("Microbatch initialization failed") from next(
++                iter(errors.values()), None
++            )
+ 
+         def finish() -> Any:
+             try:
+@@ -524,11 +533,19 @@ class UBatchRunner:
+                 raise RuntimeError(
+                     f"Microbatch {failed} of {self.num_ubatches} failed"
+                 ) from errors[failed]
+-            return merge_ubatch_outputs([outputs[i] for i in range(self.num_ubatches)])
++            return self.merge_outputs(
++                [outputs[i] for i in range(self.num_ubatches)], ubatch_state, model
++            )
+ 
+         self._pending_finish = finish
+         return finish
+ 
++    def slice_inputs(self, model_inputs, state, index):
++        return slice_model_inputs(model_inputs, state.slices[index].token_slice)
++
++    def merge_outputs(self, outputs, state, model):
++        return merge_ubatch_outputs(outputs)
++
+     def abort_pending_run(self) -> None:
+         """Release and join parked threads after a failed capture."""
+         if self._pending_finish is None:
+@@ -555,6 +572,15 @@ def maybe_build_ubatch_runner(
+     available with more than one DP rank (as in the V1 runner).
+     """
+     parallel_config = vllm_config.parallel_config
++    if envs.VLLM_DSV41_TBO:
++        from vllm.platforms import current_platform
++        from vllm.v1.worker.gpu.dsv41_tbo import DSV41TBORunner
++
++        if not current_platform.is_device_capability(80):
++            raise ValueError("VLLM_DSV41_TBO is qualified for SM80 only")
++        return DSV41TBORunner(
++            vllm_config, device, model_state, attn_groups, kv_cache_config, max_num_reqs
++        )
+     if not parallel_config.use_ubatching or parallel_config.data_parallel_size <= 1:
+         return None
+ 
+diff --git a/vllm/v1/worker/ubatching.py b/vllm/v1/worker/ubatching.py
+index a39f85d388..8ceffb79a6 100644
+--- a/vllm/v1/worker/ubatching.py
++++ b/vllm/v1/worker/ubatching.py
+@@ -47,16 +47,24 @@ class UBatchContext:
+         self.schedule = schedule
+         self.token_offset = token_offset
+         self.recv_hook = None
++        self.cancelled = False
+ 
+     def __enter__(self):
+         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
+         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
+         _CURRENT_CONTEXTS[self.id] = self
+         # _NUM_UBATCHES is set in make_ubatch_contexts
+-        self.ready_barrier.wait()
++        try:
++            self.ready_barrier.wait()
++        except threading.BrokenBarrierError:
++            self.__exit__(None, None, None)
++            raise
+ 
+         self.cpu_wait_event.wait()
+         self.cpu_wait_event.clear()
++        if self.cancelled:
++            self.__exit__(None, None, None)
++            raise RuntimeError("Microbatch peer failed")
+         self._restore_context()
+         # Assume we want to start on the compute stream
+         self.update_stream(self.compute_stream)
+@@ -102,6 +110,8 @@ class UBatchContext:
+         self.cpu_signal_event.set()
+         self.cpu_wait_event.wait()
+         self.cpu_wait_event.clear()
++        if self.cancelled:
++            raise RuntimeError("Microbatch peer failed")
+         self._restore_context()
+ 
+     def switch_to_comm(self):
+-- 
+2.55.0
+

@@ -1,0 +1,134 @@
+--- a/vllm/models/deepseek_v41/ssd/row_store.cpp
++++ b/vllm/models/deepseek_v41/ssd/row_store.cpp
+@@ -11,6 +11,8 @@
+ //   weight: [rows, 256] F8_E4M3   at byte offset woff (contiguous 256 B rows)
+ //   scale : [rows,   8] F8_E8M0   at byte offset soff (contiguous   8 B rows)
+ #include <atomic>
++#include <array>
++#include <memory>
+ #include <cerrno>
+ #include <condition_variable>
+ #include <cstdint>
+@@ -72,7 +74,50 @@
+   }
+ };
+ 
++
++// Bounded direct-mapped row cache, local to this immutable Store. Stripe locks
++// protect tag + payload as a unit; misses read outside locks. Concurrent misses
++// for the same row can duplicate I/O, but can never expose an unfinished row.
++struct RowCache {
++  struct Entry {
++    int64_t id = -1;
++    uint8_t w[256], sc[8];
++  };
++  static constexpr size_t stripes = 64;
++  std::array<std::mutex, stripes> locks;
++  std::vector<Entry> entries;
++  std::atomic<uint64_t> hits{0}, misses{0};
++  explicit RowCache(uint64_t bytes) {
++    size_t n = 1;
++    while ((n * 2) <= bytes / sizeof(Entry)) n *= 2;
++    entries.resize(n);
++  }
++  size_t slot(int64_t id) const {
++    uint64_t x = uint64_t(id);
++    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
++    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
++    x ^= x >> 31;
++    return x & (entries.size() - 1);
++  }
++  bool get(int64_t id, uint8_t *w, uint8_t *sc) {
++    size_t i = slot(id);
++    std::lock_guard<std::mutex> guard(locks[i % stripes]);
++    const Entry &e = entries[i];
++    if (e.id != id) { misses.fetch_add(1, std::memory_order_relaxed); return false; }
++    std::memcpy(w, e.w, 256); std::memcpy(sc, e.sc, 8);
++    hits.fetch_add(1, std::memory_order_relaxed);
++    return true;
++  }
++  void put(int64_t id, const uint8_t *w, const uint8_t *sc) {
++    size_t i = slot(id);
++    std::lock_guard<std::mutex> guard(locks[i % stripes]);
++    Entry &e = entries[i];
++    std::memcpy(e.w, w, 256); std::memcpy(e.sc, sc, 8); e.id = id;
++  }
++};
++
+ struct Store {
++  std::unique_ptr<RowCache> cache;
+   int fd = -1;
+   uint64_t rows = 0, woff = 0, soff = 0, row_lo = 0, row_hi = 0;
+   Pool *pool = nullptr;
+@@ -135,7 +180,7 @@
+ 
+ struct Miss { uint8_t *dst; size_t len; uint64_t off; };
+ 
+-void fetch_range(Store *s, const int64_t *ids, uint8_t *weights,
++void fetch_range_uncached(Store *s, const int64_t *ids, uint8_t *weights,
+                  uint8_t *scales, uint64_t lo, uint64_t hi) {
+   if (!s->batch_reads) {
+     for (uint64_t i = lo; i < hi; ++i)
+@@ -163,6 +208,33 @@
+     posix_fadvise(s->fd, off_t(misses[k].off), off_t(misses[k].len), POSIX_FADV_WILLNEED);
+   for (size_t k = 0; k < count; ++k)
+     pread_all(s->fd, misses[k].dst, misses[k].len, misses[k].off);
++}
++
++
++void fetch_range(Store *s, const int64_t *ids, uint8_t *w, uint8_t *sc,
++                 uint64_t lo, uint64_t hi) {
++  if (!s->cache) { fetch_range_uncached(s, ids, w, sc, lo, hi); return; }
++  // Preserve the baseline's up-to-64-row batched miss handling. Cache hits
++  // split miss runs; each run is filled completely before its tags publish.
++  uint64_t begin = lo;
++  auto finish = [&](uint64_t end) {
++    if (begin == end) return;
++    fetch_range_uncached(s, ids, w, sc, begin, end);
++    for (uint64_t k = begin; k < end; ++k) {
++      int64_t id = ids[k];
++      if (id >= 0 && uint64_t(id) >= s->row_lo && uint64_t(id) < s->row_hi)
++        s->cache->put(id, w + k * 256, sc + k * 8);
++    }
++  };
++  for (uint64_t k = lo; k < hi; ++k) {
++    int64_t id = ids[k];
++    // Invalid/foreign IDs retain exact baseline zero-fill behavior.
++    if (id >= 0 && uint64_t(id) >= s->row_lo && uint64_t(id) < s->row_hi &&
++        s->cache->get(id, w + k * 256, sc + k * 8)) {
++      finish(k); begin = k + 1;
++    }
++  }
++  finish(hi);
+ }
+ 
+ }  // namespace
+@@ -180,6 +252,15 @@
+   s->batch_reads = batch && std::strcmp(batch, "1") == 0;
+   if (s->batch_reads) posix_fadvise(s->fd, 0, 0, POSIX_FADV_RANDOM);
+   if (nthreads < 1) nthreads = 1;
++  const char *setting = std::getenv("DSV41_EG_ROW_CACHE_MB");
++  if (setting && std::strcmp(setting, "0") != 0) {
++    char *end = nullptr;
++    unsigned long mb = std::strtoul(setting, &end, 10);
++    if (!*setting || *end || mb < 1 || mb > 512) fail("row cache MB must be 0..512");
++    s->cache.reset(new RowCache(uint64_t(mb) << 20));
++    std::fprintf(stderr, "EG_ROW_CACHE entries=%zu bytes=%zu requested_mb=%lu\n",
++                 s->cache->entries.size(), s->cache->entries.size() * sizeof(RowCache::Entry), mb);
++  }
+   s->pool = new Pool(nthreads);
+   return s;
+ }
+@@ -226,3 +307,12 @@
+   close(s->fd);
+   delete s;
+ }
++
++
++// New optional ABI; the existing stats struct and Work layout stay unchanged.
++extern "C" void row_store_cache_stats(Store *s, uint64_t *out) {
++  out[0] = s->cache ? s->cache->hits.load() : 0;
++  out[1] = s->cache ? s->cache->misses.load() : 0;
++  out[2] = s->cache ? s->cache->entries.size() * sizeof(RowCache::Entry) : 0;
++}
++extern "C" int row_store_gap_revision() { return 1; }

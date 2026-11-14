@@ -1,0 +1,623 @@
+From 99415231f0377bfd2d91ae768a8bb947071f631a Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 21:00:46 +0200
+Subject: [PATCH 13/20] Add opt-in offline-tuned sparse decode on SM80
+
+Reuse BF16 tensor-core split-K and softmax reduction over both paged KV segments. Select fixed launch parameters by row/head/index capacities, validate the device-specific table before capture, and retain the original default. Honor inverse RoPE requests throughout the opt-in path and write BF16 output directly.
+
+Origin: Local SM80 sparse attention optimization; shared ROCm Triton kernels
+Upstream: Not submitted; GPU qualification pending
+---
+ .../kernels/attention/test_sm80_sparse_cpu.py | 268 ++++++++++++++++++
+ .../v1/attention/ops/rocm_aiter_mla_sparse.py | 108 ++++++-
+ vllm/v1/attention/ops/sm80_sparse_config.py   | 107 +++++++
+ 3 files changed, 469 insertions(+), 14 deletions(-)
+ create mode 100644 tests/kernels/attention/test_sm80_sparse_cpu.py
+ create mode 100644 vllm/v1/attention/ops/sm80_sparse_config.py
+
+diff --git a/tests/kernels/attention/test_sm80_sparse_cpu.py b/tests/kernels/attention/test_sm80_sparse_cpu.py
+new file mode 100644
+index 0000000000..ab192599f3
+--- /dev/null
++++ b/tests/kernels/attention/test_sm80_sparse_cpu.py
+@@ -0,0 +1,268 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Dependency-free policy and exhaustive software-codec checks."""
++
++import ast
++import importlib.util
++import math
++import os
++import struct
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++ROOT = Path(__file__).resolve().parents[3]
++OPS = ROOT / "vllm/v1/attention/ops"
++spec = importlib.util.spec_from_file_location(
++    "sm80_sparse_config_cpu", OPS / "sm80_sparse_config.py"
++)
++config = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = config
++spec.loader.exec_module(config)
++
++
++def scalar_cast(value, dtype, bitcast=False):
++    if bitcast:
++        fmt_in, fmt_out = ("I", "f") if dtype == "float32" else ("f", "I")
++        return struct.unpack("<" + fmt_out, struct.pack("<" + fmt_in, value))[0]
++    return float(value) if dtype == "float32" else int(value)
++
++
++class ScalarCasts(ast.NodeTransformer):
++    def visit_Call(self, node):
++        node = self.generic_visit(node)
++        if isinstance(node.func, ast.Attribute) and node.func.attr == "to":
++            return ast.copy_location(
++                ast.Call(
++                    func=ast.Name(id="scalar_cast", ctx=ast.Load()),
++                    args=[node.func.value, *node.args],
++                    keywords=node.keywords,
++                ),
++                node,
++            )
++        return node
++
++
++def load_scalar_decoder():
++    # Execute the actual JIT function body with scalar casts, rather than a
++    # second implementation of the bit trick. The oracle below uses E4M3 math.
++    module = ast.parse((OPS / "fp8_sm80.py").read_text())
++    fn = next(
++        n
++        for n in module.body
++        if isinstance(n, ast.FunctionDef) and n.name == "_e4m3fn_to_f32_bits"
++    )
++    fn.decorator_list = []
++    module = ast.fix_missing_locations(
++        ScalarCasts().visit(ast.Module(body=[fn], type_ignores=[]))
++    )
++    scope = dict(
++        scalar_cast=scalar_cast,
++        tl=SimpleNamespace(
++            uint32="uint32", float32="float32", where=lambda c, a, b: a if c else b
++        ),
++    )
++    exec(compile(module, "fp8_sm80", "exec"), scope)
++    return scope[fn.name]
++
++
++def load_launcher():
++    """Exercise the actual launcher with tensors that cannot read device data."""
++    source = ast.parse((OPS / "rocm_aiter_mla_sparse.py").read_text())
++    fn = next(
++        n
++        for n in source.body
++        if isinstance(n, ast.FunctionDef)
++        and (n.name == "_rocm_sparse_attn_decode_ragged_triton")
++    )
++    launches = []
++
++    class Tensor:
++        is_cpu = False
++        dtype = "bf16"
++        device = SimpleNamespace(index=0)
++
++        def __init__(self, shape):
++            self.shape = (shape,) if isinstance(shape, int) else shape
++            self.ndim = len(self.shape)
++
++        def numel(self):
++            return math.prod(self.shape)
++
++        def stride(self, dim):
++            return math.prod(self.shape[dim + 1 :])
++
++        def contiguous(self):
++            return self
++
++    class Kernel:
++        def __init__(self, name):
++            self.name = name
++
++        def __getitem__(self, grid):
++            return lambda *args, **kwargs: launches.append((self.name, grid, kwargs))
++
++    scope = dict(
++        torch=SimpleNamespace(
++            empty=lambda shape, **kwargs: Tensor(shape),
++            empty_like=lambda x, **kwargs: Tensor(x.shape),
++            zeros=lambda size, **kwargs: Tensor((size,)),
++            float32="f32",
++            int32="i32",
++            bfloat16="bf16",
++        ),
++        triton=SimpleNamespace(
++            cdiv=lambda x, y: (x + y - 1) // y,
++            next_power_of_2=lambda x: 1 << (x - 1).bit_length(),
++        ),
++        current_platform=SimpleNamespace(
++            is_cuda=lambda: True,
++            is_device_capability=lambda _: True,
++            is_fp8_fnuz=lambda: False,
++        ),
++        sparse_decode_enabled=lambda: False,
++        _ON_GFX942=False,
++        _ON_GFX950=False,
++        _as_int32_contiguous_1d=lambda x: x,
++        _validate_dsv4_sparse_dims=lambda *args: None,
++        rocm_inverse_rope_rows_=lambda *args: launches.append(("rope", None, {})),
++    )
++    for name in (
++        "_sparse_attn_decode_ragged_kernel",
++        "_sparse_attn_decode_partial_kernel",
++        "_sparse_attn_decode_reduce_kernel",
++    ):
++        scope[name] = Kernel(name)
++    future = ast.ImportFrom(
++        module="__future__", names=[ast.alias(name="annotations")], level=0
++    )
++    module = ast.fix_missing_locations(ast.Module(body=[future, fn], type_ignores=[]))
++    exec(compile(module, "sparse-launcher", "exec"), scope)
++    inputs = dict(
++        q=Tensor((6, 16, 512)),
++        main_cache=Tensor((8, 64, 584)),
++        main_indices=Tensor((6 * 128,)),
++        main_indptr=Tensor((7,)),
++        extra_cache=Tensor((16, 64, 584)),
++        extra_indices=Tensor((6 * 512,)),
++        extra_indptr=Tensor((7,)),
++        attn_sink=None,
++        scale=512**-0.5,
++        nope_head_dim=448,
++        rope_head_dim=64,
++    )
++    return scope[fn.name], inputs, launches, Tensor
++
++
++class TestSm80SparseCPU(unittest.TestCase):
++    def test_all_fp8_bytes_including_signed_zero_and_nan(self):
++        decode = load_scalar_decoder()
++        for byte in range(256):
++            sign = -1.0 if byte & 128 else 1.0
++            exponent, mantissa = (byte >> 3) & 15, byte & 7
++            actual = decode(byte)
++            if exponent == 15 and mantissa == 7:
++                self.assertTrue(math.isnan(actual))
++                continue
++            expected = sign * (
++                math.ldexp(mantissa / 8, -6)
++                if exponent == 0
++                else math.ldexp(1 + mantissa / 8, exponent - 7)
++            )
++            self.assertEqual(struct.pack("<f", actual), struct.pack("<f", expected))
++
++    def test_opt_in_is_frozen_until_restart(self):
++        config.sparse_decode_enabled.cache_clear()
++        with patch.dict(os.environ, {}, clear=True):
++            self.assertFalse(config.sparse_decode_enabled())
++            os.environ["VLLM_SM80_SPARSE_DECODE"] = "1"
++            self.assertFalse(config.sparse_decode_enabled())
++            config.sparse_decode_enabled.cache_clear()
++            self.assertTrue(config.sparse_decode_enabled())
++        config.sparse_decode_enabled.cache_clear()
++
++    def test_exact_shape_overrides_and_untuned_shape_fallback(self):
++        tuned = config.SparseDecodeConfig(block_k=16, splits=4, decode="lut")
++        table = {"configs": {config.shape_key(6, 16, 128, 512): tuned.to_dict()}}
++        self.assertEqual(config.select_config(6, 16, 128, 512, 70, table), tuned)
++        self.assertEqual(
++            config.select_config(5, 16, 128, 512, 70, table).decode, "bits"
++        )
++        self.assertEqual(config.select_config(48, 64, 128, 512, 70, {}).splits, 1)
++
++    def test_all_adaptive_rows_and_device_sizes_have_bounded_splits(self):
++        for rows in range(1, 49):
++            for heads in (16, 64):
++                for sms in (70, 74, 108):
++                    for topk in (0, 1, 512):
++                        chosen = config.select_config(rows, heads, 128, topk, sms, {})
++                        self.assertIn(chosen.splits, range(1, 17))
++                        self.assertLessEqual(chosen.splits, (128 + topk + 31) // 32)
++
++    def test_table_validation_rejects_unsafe_launches(self):
++        for kwargs in (
++            {"splits": 0},
++            {"splits": 1.0},
++            {"block_k": 7},
++            {"decode": "native"},
++        ):
++            with self.assertRaises(ValueError):
++                config.SparseDecodeConfig(**kwargs)
++        with tempfile.TemporaryDirectory() as tmp:
++            path = Path(tmp) / "table.json"
++            path.write_text('{"version": 0, "configs": {}}')
++            config.load_table.cache_clear()
++            with (
++                patch.dict(os.environ, VLLM_SM80_SPARSE_CONFIG=str(path)),
++                self.assertRaises(ValueError),
++            ):
++                config.load_table()
++            config.load_table.cache_clear()
++
++    def test_hardware_specific_table_cannot_cross_enabled_sm_counts(self):
++        device = dict(name="GA100", sm_count=70, capability=[8, 0])
++        config.validate_device({}, device)
++        config.validate_device({"device": device}, device)
++        with self.assertRaises(ValueError):
++            config.validate_device({"device": dict(device, sm_count=108)}, device)
++
++    def test_default_keeps_original_single_launch_and_compiler_defaults(self):
++        launch, inputs, calls, _ = load_launcher()
++        launch(**inputs)
++        self.assertEqual(len(calls), 1)
++        name, grid, kwargs = calls[0]
++        self.assertEqual(name, "_sparse_attn_decode_ragged_kernel")
++        self.assertEqual(grid, (6, 1))
++        self.assertEqual((kwargs["BLOCK_K"], kwargs["num_warps"]), (16, 8))
++        self.assertEqual(kwargs["DECODE_MODE"], 0)
++        self.assertNotIn("num_stages", kwargs)
++
++    def test_opt_in_splits_and_reduce_keep_device_lengths_dynamic(self):
++        launch, inputs, calls, tensor = load_launcher()
++        launch(
++            **inputs,
++            sm80_config=config.SparseDecodeConfig(splits=8),
++            inv_rope_positions=tensor((6,)),
++            inv_rope_cos_sin_cache=tensor((10, 64)),
++        )
++        self.assertEqual([c[1] for c in calls], [(6, 8, 1), (6, 16)])
++        self.assertEqual(calls[0][2]["DECODE_MODE"], 1)
++        self.assertEqual(calls[0][2]["NUM_SPLITS"], 8)
++        self.assertTrue(calls[1][2]["FUSE_INV_ROPE"])
++
++    def test_tuned_legacy_shape_still_honors_requested_rotation(self):
++        launch, inputs, calls, tensor = load_launcher()
++        launch(
++            **inputs,
++            sm80_config=config.SparseDecodeConfig(legacy=True),
++            inv_rope_positions=tensor((6,)),
++            inv_rope_cos_sin_cache=tensor((10, 64)),
++        )
++        self.assertEqual(calls[-1][0], "rope")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index be69bb5dbf..8ac0afc966 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -16,10 +16,20 @@ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+-from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
+ from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
+ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.fp8_sm80 import (
++    _decode_sparse_fp8,
++    get_e4m3fn_bf16_lut,
++)
++from vllm.v1.attention.ops.sm80_sparse_config import (
++    SparseDecodeConfig,
++    load_table,
++    select_config,
++    sparse_decode_enabled,
++    validate_device,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if current_platform.is_rocm():
+@@ -2453,6 +2463,8 @@ def _sparse_attn_decode_ragged_kernel(
+     IS_FNUZ_EXTRA: tl.constexpr,
+     BLOCK_H: tl.constexpr,
+     BLOCK_K: tl.constexpr,
++    FP8_LUT=None,
++    DECODE_MODE: tl.constexpr = 0,
+ ):
+     query_idx = tl.program_id(0)
+     pid_h = tl.program_id(1)
+@@ -2507,7 +2519,7 @@ def _sparse_attn_decode_ragged_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
++        x_f32 = _decode_sparse_fp8(x_uint8, IS_FNUZ_MAIN, FP8_LUT, DECODE_MODE)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+@@ -2572,7 +2584,7 @@ def _sparse_attn_decode_ragged_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
++            x_f32 = _decode_sparse_fp8(x_uint8, IS_FNUZ_EXTRA, FP8_LUT, DECODE_MODE)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+@@ -2690,6 +2702,8 @@ def _sparse_attn_decode_partial_kernel(
+     BLOCK_K: tl.constexpr,
+     NUM_SPLITS: tl.constexpr,
+     NUM_STAGES: tl.constexpr,
++    FP8_LUT=None,
++    DECODE_MODE: tl.constexpr = 0,
+ ):
+     query_idx = tl.program_id(0)
+     split_id = tl.program_id(1)
+@@ -2751,7 +2765,7 @@ def _sparse_attn_decode_partial_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
++        x_f32 = _decode_sparse_fp8(x_uint8, IS_FNUZ_MAIN, FP8_LUT, DECODE_MODE)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+@@ -2819,7 +2833,7 @@ def _sparse_attn_decode_partial_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
++            x_f32 = _decode_sparse_fp8(x_uint8, IS_FNUZ_EXTRA, FP8_LUT, DECODE_MODE)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+@@ -3955,6 +3969,23 @@ def _rocm_sparse_attn_decode_ragged_bf16_triton(
+     return out
+ 
+ 
++@functools.cache
++def _sm80_sparse_table(device_index: int) -> tuple[int, dict]:
++    # Warmup populates this before capture. A table belongs to a specific SKU,
++    # including its enabled SMs; never silently use another device's tuning.
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Warm up SM80 sparse decode before graph capture")
++    props = torch.cuda.get_device_properties(device_index)
++    table = load_table()
++    expected = dict(
++        name=props.name,
++        sm_count=props.multi_processor_count,
++        capability=[props.major, props.minor],
++    )
++    validate_device(table, expected)
++    return props.multi_processor_count, table
++
++
+ def _rocm_sparse_attn_decode_ragged_triton(
+     q: torch.Tensor,
+     main_cache: torch.Tensor,
+@@ -3973,6 +4004,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
+     inv_rope_positions: torch.Tensor | None = None,
+     inv_rope_cos_sin_cache: torch.Tensor | None = None,
+     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
++    sm80_config: SparseDecodeConfig | None = None,
+ ) -> torch.Tensor:
+     """Split-K sparse decode; returns the attention output.
+ 
+@@ -4043,7 +4075,33 @@ def _rocm_sparse_attn_decode_ragged_triton(
+         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
+         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
+ 
+-    block_h = 16
++    use_sm80 = (
++        sparse_decode_enabled()
++        and current_platform.is_cuda()
++        and current_platform.is_device_capability(80)
++    )
++    if sm80_config is not None:
++        assert current_platform.is_cuda() and current_platform.is_device_capability(80)
++        use_sm80 = True
++    if use_sm80 and sm80_config is None:
++        sms, table = _sm80_sparse_table(q.device.index)
++        sm80_config = select_config(
++            num_queries,
++            num_heads,
++            main_indices.numel() // max(1, num_queries),
++            extra_indices.numel() // max(1, num_queries) if has_extra else 0,
++            sms,
++            table,
++        )
++    sm80_requested = use_sm80
++    if use_sm80 and sm80_config.legacy:
++        use_sm80 = False
++    block_h = sm80_config.block_h if use_sm80 else 16
++    block_k = sm80_config.block_k if use_sm80 else 32
++    warps = sm80_config.warps if use_sm80 else 4
++    stages = sm80_config.stages if use_sm80 else 1
++    decode_mode = ("alu", "bits", "lut").index(sm80_config.decode) if use_sm80 else 0
++    fp8_lut = get_e4m3fn_bf16_lut(q.device) if decode_mode == 2 else None
+     out_scale = None
+     if out_mxfp8 is not None:
+         assert out is None, "out and out_mxfp8 are mutually exclusive"
+@@ -4080,8 +4138,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
+     comb_dim = nope_head_dim + rope_head_dim
+     is_fnuz = current_platform.is_fp8_fnuz()
+ 
+-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+-        block_k = 16 if head_dim >= 256 else 32
++    single_pass = use_sm80 and sm80_config.splits == 1 and inv_rope_positions is None
++    if single_pass or not (_ON_GFX942 or _ON_GFX950 or use_sm80):
++        block_k = block_k if use_sm80 else (16 if head_dim >= 256 else 32)
+         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
+             q,
+             main_cache,
+@@ -4113,12 +4172,21 @@ def _rocm_sparse_attn_decode_ragged_triton(
+             IS_FNUZ_EXTRA=False,
+             BLOCK_H=block_h,
+             BLOCK_K=block_k,
+-            num_warps=8,
++            FP8_LUT=fp8_lut,
++            DECODE_MODE=decode_mode,
++            num_warps=warps if use_sm80 else 8,
++            **({"num_stages": stages} if use_sm80 else {}),
+         )
++        if sm80_requested and inv_rope_positions is not None:
++            assert inv_rope_cos_sin_cache is not None
++            rocm_inverse_rope_rows_(
++                out, inv_rope_positions, inv_rope_cos_sin_cache, rope_head_dim
++            )
+         return out
+ 
+-    block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
+-    if _ON_GFX950:
++    if use_sm80:
++        num_splits = sm80_config.splits
++    elif _ON_GFX950:
+         inv_q = 1.0 / max(1, num_queries)
+         avg_main_len = main_indices.numel() * inv_q
+         avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
+@@ -4238,8 +4306,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
+             BLOCK_H=block_h,
+             BLOCK_K=block_k,
+             NUM_SPLITS=num_splits,
+-            NUM_STAGES=1,
+-            num_warps=4,
++            NUM_STAGES=stages,
++            FP8_LUT=fp8_lut,
++            DECODE_MODE=decode_mode,
++            num_warps=warps,
++            **({"num_stages": stages} if use_sm80 else {}),
+         )
+ 
+     fuse_inv_rope = inv_rope_positions is not None
+@@ -4570,7 +4641,16 @@ def rocm_sparse_attn_decode(
+         direct_out = None
+     else:
+         assert output is not None
+-        direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
++        sm80_direct = (
++            sparse_decode_enabled()
++            and current_platform.is_cuda()
++            and current_platform.is_device_capability(80)
++        )
++        direct_out = (
++            output
++            if (_ON_GFX950 or sm80_direct) and output.dtype == torch.bfloat16
++            else None
++        )
+     attn_out = _rocm_sparse_attn_decode_triton(
+         q=q,
+         main_cache=swa_k_cache,
+diff --git a/vllm/v1/attention/ops/sm80_sparse_config.py b/vllm/v1/attention/ops/sm80_sparse_config.py
+new file mode 100644
+index 0000000000..7a36fe5be0
+--- /dev/null
++++ b/vllm/v1/attention/ops/sm80_sparse_config.py
+@@ -0,0 +1,107 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Offline sparse-decode policy. No device reads or tuning during graph capture."""
++
++import functools
++import json
++import os
++from dataclasses import asdict, dataclass
++from pathlib import Path
++
++
++@dataclass(frozen=True)
++class SparseDecodeConfig:
++    block_h: int = 16
++    block_k: int = 32
++    warps: int = 4
++    stages: int = 1
++    splits: int = 1
++    decode: str = "bits"
++    legacy: bool = False
++
++    def __post_init__(self):
++        if (
++            any(
++                type(value) is not int
++                for value in (
++                    self.block_h,
++                    self.block_k,
++                    self.warps,
++                    self.stages,
++                    self.splits,
++                )
++            )
++            or self.block_h not in (16, 32)
++            or self.block_k not in (16, 32, 64)
++            or self.warps not in (4, 8)
++            or self.stages not in (1, 2)
++            or not 1 <= self.splits <= 16
++            or self.decode not in ("alu", "bits", "lut")
++            or type(self.legacy) is not bool
++        ):
++            raise ValueError("Invalid SM80 sparse decode configuration")
++
++    def to_dict(self):
++        return asdict(self)
++
++
++def shape_key(rows: int, heads: int, main_capacity: int, topk: int) -> str:
++    # Capacities come from allocation shapes, never indptr contents. Ragged
++    # lengths can change on replay without changing the compiled policy.
++    return f"{rows}:{heads}:{main_capacity}:{topk}"
++
++
++@functools.cache
++def sparse_decode_enabled() -> bool:
++    return os.getenv("VLLM_SM80_SPARSE_DECODE", "0") == "1"
++
++
++@functools.cache
++def load_table() -> dict:
++    path = os.getenv("VLLM_SM80_SPARSE_CONFIG")
++    if not path:
++        return {}
++    table = json.loads(Path(path).read_text())
++    if table.get("version") != 1 or not isinstance(table.get("configs"), dict):
++        raise ValueError("Invalid SM80 sparse decode table")
++    for config in table["configs"].values():
++        SparseDecodeConfig(**config)
++    return table
++
++
++def validate_device(table: dict, device: dict) -> None:
++    recorded = table.get("device")
++    if table and (
++        recorded is None
++        or any(recorded.get(k) != device[k] for k in ("name", "sm_count", "capability"))
++    ):
++        raise ValueError("SM80 sparse decode table belongs to a different GPU SKU")
++
++
++def select_config(
++    rows: int,
++    heads: int,
++    main_capacity: int,
++    topk: int,
++    sm_count: int,
++    table: dict,
++) -> SparseDecodeConfig:
++    key = shape_key(rows, heads, main_capacity, topk)
++    if key in table.get("configs", {}):
++        return SparseDecodeConfig(**table["configs"][key])
++    # Seed only: the operator replaces it with graph timings on their SKU.
++    base = max(1, rows * ((heads + 15) // 16))
++    if base >= sm_count:
++        return SparseDecodeConfig()
++    tiles = max(1, (main_capacity + topk + 31) // 32)
++
++    def cost(splits):
++        waves = (base * splits + max(1, sm_count) - 1) // max(1, sm_count)
++        iterations = sum(
++            ((length + splits - 1) // splits + 31) // 32
++            for length in (main_capacity, topk)
++        )
++        return waves * (iterations + 0.15) + 0.01 * splits
++
++    splits = min(range(1, min(16, tiles) + 1), key=cost)
++    return SparseDecodeConfig(splits=splits)
+-- 
+2.55.0
+

@@ -1,0 +1,14 @@
+--- a/csrc/p2b_batched.cu	2026-10-20 12:37:54
++++ b/csrc/p2b_batched.cu	2026-10-20 12:37:55
+@@ -7,7 +7,10 @@
+ #include "util.cuh"
+ 
+ #define EXL3_GEMM_ARGS const half*, const uint16_t*, void*, const int, const int, const int, int*, const half*, half*, const half*
+-template <int, bool, int, int, int, bool>
++// vcruz305/exllamav3 07b8a2e0 ("Fractional trellis support") added a 7th parameter, bool HALF = false; a 6-parameter
++// forward declaration is a second template and makes the call below ambiguous. Same template now, default from the
++// definition, so HALF=false (integer bitrates) exactly as before.
++template <int, bool, int, int, int, bool, bool>
+ __device__ void exl3_gemv_kernel(EXL3_GEMM_ARGS);
+ 
+ // Make the vendor GEMV body device-callable before the fast worklist uses its

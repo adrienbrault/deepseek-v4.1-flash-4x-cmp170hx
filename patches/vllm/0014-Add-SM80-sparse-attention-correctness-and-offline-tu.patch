@@ -1,0 +1,594 @@
+From d8dc2a27f1f5ccd2afae82b1464e1133dffd873a Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 21:00:46 +0200
+Subject: [PATCH 14/20] Add SM80 sparse attention correctness and offline
+ tuning tool
+
+Compare the original and opt-in kernels against independent torch attention at ragged decode shapes. Gate graph replay after length changes, collect hardware and compiler metadata, and persist per-shape launch choices from graph timings.
+
+Origin: Local SM80 sparse attention qualification
+Upstream: Not submitted; GPU qualification pending
+---
+ .../kernels/benchmark_sm80_sparse_decode.py   | 570 ++++++++++++++++++
+ 1 file changed, 570 insertions(+)
+ create mode 100644 benchmarks/kernels/benchmark_sm80_sparse_decode.py
+
+diff --git a/benchmarks/kernels/benchmark_sm80_sparse_decode.py b/benchmarks/kernels/benchmark_sm80_sparse_decode.py
+new file mode 100644
+index 0000000000..2e28b17c30
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_sm80_sparse_decode.py
+@@ -0,0 +1,570 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SM80 packed sparse MLA correctness, graph timing, and offline tuning.
++
++Writes JSONL incrementally; --mode tune also writes a hardware-specific table.
++Run inside the installed fork. No model weights or service are required.
++"""
++
++import argparse
++import ctypes
++import itertools
++import json
++import os
++import statistics
++from collections import defaultdict
++from pathlib import Path
++
++import torch
++from triton.runtime.errors import OutOfResources, PTXASError
++
++import vllm.v1.attention.ops.rocm_aiter_mla_sparse as sparse_ops
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _e4m3fn_to_f32_bits
++from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
++    _rocm_sparse_attn_decode_ragged_triton as decode,
++)
++from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
++    rocm_inverse_rope_rows_,
++)
++from vllm.v1.attention.ops.sm80_sparse_config import (
++    SparseDecodeConfig,
++    select_config,
++    shape_key,
++)
++
++LEGACY = SparseDecodeConfig(legacy=True)
++COMPILER_STATS = {}
++
++
++def record_compiler_stats():
++    for name in (
++        "_sparse_attn_decode_ragged_kernel",
++        "_sparse_attn_decode_partial_kernel",
++        "_sparse_attn_decode_reduce_kernel",
++    ):
++        kernel = getattr(sparse_ops, name)
++        original = kernel.run
++
++        def run(*args, _run=original, _name=name, **kwargs):
++            compiled = _run(*args, **kwargs)
++            if compiled is not None:
++                metadata = getattr(compiled, "metadata", None)
++                ptx = getattr(compiled, "asm", {}).get("ptx", "")
++                COMPILER_STATS[_name] = dict(
++                    registers=getattr(compiled, "n_regs", None),
++                    spills=getattr(compiled, "n_spills", None),
++                    shared_bytes=getattr(metadata, "shared", None),
++                    bf16_mma="mma.sync" in ptx and ".bf16" in ptx,
++                )
++            return compiled
++
++        kernel.run = run
++
++
++@triton.jit
++def codec_gate_kernel(src, dst, BLOCK: tl.constexpr):
++    i = tl.arange(0, BLOCK)
++    value = _e4m3fn_to_f32_bits(tl.load(src + i))
++    tl.store(dst + i, value)
++
++
++def device_info():
++    props = torch.cuda.get_device_properties(0)
++    l2 = getattr(props, "L2_cache_size", getattr(props, "l2_cache_size", None))
++    if l2 is None:
++        # cudaDevAttrL2CacheSize = 38; query the runtime when torch omits it.
++        for library in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
++            try:
++                runtime = ctypes.CDLL(library)
++                size = ctypes.c_int()
++                if runtime.cudaDeviceGetAttribute(ctypes.byref(size), 38, 0) == 0:
++                    l2 = size.value
++                    break
++            except OSError:
++                continue
++    return dict(
++        name=props.name,
++        sm_count=props.multi_processor_count,
++        capability=[props.major, props.minor],
++        l2_bytes=l2,
++        total_memory=props.total_memory,
++        torch=torch.__version__,
++        triton=triton.__version__,
++        cuda=torch.version.cuda,
++    )
++
++
++def codec_gate():
++    src = torch.arange(256, device="cuda", dtype=torch.uint8)
++    dst = torch.empty(256, device="cuda", dtype=torch.float32)
++    codec_gate_kernel[(1,)](src, dst, BLOCK=256)
++    expected = src.view(torch.float8_e4m3fn).float()
++    torch.testing.assert_close(dst, expected, atol=0, rtol=0, equal_nan=True)
++    finite = torch.isfinite(expected)
++    assert torch.equal(torch.signbit(dst[finite]), torch.signbit(expected[finite]))
++
++
++def packed_cache(capacity, block, padding=0):
++    blocks = triton.cdiv(capacity, block)
++    cache = torch.zeros(
++        (blocks, block, 584 + padding), device="cuda", dtype=torch.uint8
++    )
++    pages = cache.view(blocks, -1)
++    tokens = pages[:, : block * 576].view(blocks, block, 576)
++    source = torch.randn((blocks, block, 448), device="cuda") * 0.25
++    tokens[..., :448] = source.to(torch.float8_e4m3fn).view(torch.uint8)
++    rope = torch.randn((blocks, block, 64), device="cuda").to(torch.bfloat16) * 0.25
++    tokens[..., 448:] = rope.view(torch.uint8)
++    scales = pages[:, block * 576 : block * 584].view(blocks, block, 8)
++    scales.copy_(
++        torch.randint(124, 130, scales.shape, device="cuda", dtype=torch.uint8)
++    )
++    # Canonical readers scrub payload NaNs before the dot products.
++    tokens[0, 0, 0] = 127
++    tokens[0, 0, 1] = 255
++    tokens[0, 0, 448:450] = torch.tensor([192, 127], device="cuda", dtype=torch.uint8)
++    return cache
++
++
++def pack_rows(rows, width):
++    lengths = [len(row) for row in rows]
++    indptr = torch.tensor(
++        [0, *itertools.accumulate(lengths)], device="cuda", dtype=torch.int32
++    )
++    indices = torch.full((len(rows) * width,), -123, device="cuda", dtype=torch.int32)
++    flat = [item for row in rows for item in row]
++    if flat:
++        indices[: len(flat)] = torch.tensor(flat, device="cuda", dtype=torch.int32)
++    return indices, indptr
++
++
++def make_case(
++    rows,
++    seqs,
++    context,
++    heads,
++    topk,
++    adversarial=False,
++    sink=True,
++    padding=0,
++    main_width=128,
++    ratio=2,
++):
++    block = 64
++    qlens = [rows // seqs + (i < rows % seqs) for i in range(seqs)]
++    assert min(qlens) >= 1 and max(qlens) <= 6
++    main_stride = triton.cdiv(main_width + 6, block) * block
++    main_live = min(main_width, 128 + max(qlens) - 1)
++    main = packed_cache(seqs * main_stride, block, padding)
++    extra = (
++        packed_cache(seqs * triton.cdiv(context, ratio), block, padding)
++        if topk
++        else None
++    )
++    main_rows, extra_rows = [], []
++    for req, qlen in enumerate(qlens):
++        for pos in range(qlen):
++            start = req * main_stride + pos
++            main_rows.append(list(range(start, start + main_live)))
++            if topk:
++                live = max(0, (context - qlen + pos + 1) // ratio)
++                slots = torch.randint(max(1, live), (min(topk, live),)).tolist()
++                extra_rows.append(
++                    [req * triton.cdiv(context, ratio) + x for x in slots]
++                )
++    if adversarial:
++        for i, row in enumerate(main_rows):
++            # Empty, partial tiles, duplicate, negative and out-of-range slots.
++            main_rows[i] = [] if i % 4 == 0 else row[: (1, 17, 63, 127)[i % 4]]
++            if main_rows[i]:
++                main_rows[i][-1] = -1 if i % 2 else main.numel()
++        for i, row in enumerate(extra_rows):
++            extra_rows[i] = row[: (0, 1, 31, 65)[i % 4]]
++    mi, mp = pack_rows(main_rows, main_width)
++    ei, ep = pack_rows(extra_rows, topk) if topk else (None, None)
++    # Non-unit head/row strides exercise pointer arithmetic and direct output.
++    q = torch.randn(rows, heads * 2, 512, device="cuda", dtype=torch.bfloat16)[:, ::2]
++    q *= 0.25
++    output = torch.empty_like(q, memory_format=torch.contiguous_format)
++    positions = torch.arange(rows, device="cuda", dtype=torch.int64) + 1
++    angles = torch.randn((rows + 1, 32), device="cuda")
++    cs = torch.cat((angles.cos(), angles.sin()), dim=-1)
++    return (
++        dict(
++            q=q,
++            main_cache=main,
++            main_indices=mi,
++            main_indptr=mp,
++            scale=512**-0.5,
++            attn_sink=torch.linspace(-2, 2, heads, device="cuda") if sink else None,
++            nope_head_dim=448,
++            rope_head_dim=64,
++            extra_cache=extra,
++            extra_indices=ei,
++            extra_indptr=ep,
++            out=output,
++        ),
++        (main_rows, extra_rows),
++        positions,
++        cs,
++    )
++
++
++def unpack_selected(cache, slots):
++    block = cache.shape[1]
++    slots = torch.tensor(slots, device="cuda", dtype=torch.int64)
++    slots = slots[(slots >= 0) & (slots < cache.shape[0] * block)]
++    pages = cache.view(cache.shape[0], -1)
++    page, offset = slots // block, slots % block
++    data = pages[
++        page[:, None], offset[:, None] * 576 + torch.arange(576, device="cuda")
++    ]
++    scales = pages[
++        page[:, None],
++        block * 576 + offset[:, None] * 8 + torch.arange(8, device="cuda"),
++    ]
++    scales = torch.exp2(scales[:, :7].float() - 127).repeat_interleave(64, -1)
++    nope = data[:, :448].contiguous().view(torch.float8_e4m3fn).float() * scales
++    # Multiply in BF16, matching the cache's dequantized operand contract.
++    nope = nope.to(torch.bfloat16).float()
++    rope = data[:, 448:].contiguous().view(torch.bfloat16).float()
++    return torch.cat((nope, rope), -1).nan_to_num(nan=0.0)
++
++
++def reference(case, selected):
++    results = []
++    for row in range(case["q"].shape[0]):
++        kv = unpack_selected(case["main_cache"], selected[0][row])
++        if case["extra_cache"] is not None:
++            kv = torch.cat((kv, unpack_selected(case["extra_cache"], selected[1][row])))
++        logits = case["q"][row].float() @ kv.T * case["scale"]
++        sink = case["attn_sink"]
++        if sink is not None:
++            logits = torch.cat((logits, sink[:, None]), -1)
++            kv = torch.cat((kv, torch.zeros_like(case["q"][0, :1]).float()))
++        results.append(
++            logits.softmax(-1) @ kv
++            if kv.shape[0]
++            else torch.zeros_like(case["q"][row]).float()
++        )
++    return torch.stack(results)
++
++
++def rotate_reference(values, positions, cs):
++    result = values.float().clone()
++    tail = values[..., 448:].float().reshape(*values.shape[:2], 32, 2)
++    c, s = cs[positions, :32, None], cs[positions, 32:, None]
++    c, s = c.transpose(1, 2), s.transpose(1, 2)
++    result[..., 448::2] = tail[..., 0] * c + tail[..., 1] * s
++    result[..., 449::2] = tail[..., 1] * c - tail[..., 0] * s
++    return result
++
++
++def runner(case, config, positions, cs, fuse_rope=False):
++    def run():
++        fuse = fuse_rope and (config is None or not config.legacy)
++        result = decode(
++            **case,
++            sm80_config=config,
++            inv_rope_positions=positions if fuse else None,
++            inv_rope_cos_sin_cache=cs if fuse else None,
++        )
++        if fuse_rope and config is not None and config.legacy:
++            # The original fallback omits this rotation despite reporting it
++            # complete. Use the mathematically correct baseline for timing.
++            rocm_inverse_rope_rows_(result, positions, cs, 64)
++        return result
++
++    return run
++
++
++def check_close(actual, expected):
++    torch.testing.assert_close(actual.float(), expected.float(), atol=0.008, rtol=0.02)
++
++
++def graph_time(run, repetitions):
++    for _ in range(3):
++        run()
++    graph = torch.cuda.CUDAGraph()
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        run()
++    stream.synchronize()
++    with torch.cuda.graph(graph, stream=stream):
++        for _ in range(16):
++            run()
++    torch.cuda.current_stream().wait_stream(stream)
++    samples = []
++    for _ in range(5):
++        start, end = (
++            torch.cuda.Event(enable_timing=True),
++            torch.cuda.Event(enable_timing=True),
++        )
++        start.record()
++        for _ in range(repetitions):
++            graph.replay()
++        end.record()
++        end.synchronize()
++        samples.append(start.elapsed_time(end) * 1000 / (repetitions * 16))
++    return statistics.median(samples), samples
++
++
++def replay_gate(case, config, positions, cs):
++    run = runner(case, config, positions, cs)
++    run()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        result = run()
++    # Keep all argument addresses, change lengths and make entire rows empty.
++    ptrs = (case["main_indptr"], case["extra_indptr"])
++    saved = [p.clone() if p is not None else None for p in ptrs]
++    try:
++        for p in ptrs:
++            if p is not None:
++                p.zero_()
++        case["out"].fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        torch.testing.assert_close(result, torch.zeros_like(result), atol=0, rtol=0)
++        for p, s in zip(ptrs, saved):
++            if p is not None:
++                p.copy_(s)
++        expected = run().clone()
++        case["out"].fill_(float("nan"))
++        graph.replay()
++        torch.cuda.synchronize()
++        check_close(result, expected)
++    finally:
++        for p, s in zip(ptrs, saved):
++            if p is not None:
++                p.copy_(s)
++
++
++def candidates(args, seed):
++    if args.mode != "tune":
++        return list(
++            dict.fromkeys(
++                [
++                    seed,
++                    *[
++                        SparseDecodeConfig(splits=s, decode=d)
++                        for s in (1, 2, 4, 6, 8, 12, 16)
++                        for d in ("bits", "alu", "lut")
++                    ],
++                ]
++            )
++        )
++    return [
++        SparseDecodeConfig(h, k, w, stage, splits, dec)
++        for h, k, w, stage, splits, dec in itertools.product(
++            (16, 32) if args.full_sweep else (16,),
++            (16, 32, 64),
++            (4, 8) if args.full_sweep else (4,),
++            (1, 2) if args.full_sweep else (1,),
++            range(1, 17) if args.full_sweep else (1, 2, 4, 6, 8, 12, 16),
++            ("bits", "alu", "lut"),
++        )
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--mode", choices=("gate", "bench", "tune"), default="gate")
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--table", type=Path, help="Table to validate or benchmark")
++    parser.add_argument("--write-table", type=Path)
++    parser.add_argument(
++        "--rows", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6, 12, 24, 48]
++    )
++    parser.add_argument("--seqs", nargs="+", type=int, default=[1, 2, 4, 8])
++    parser.add_argument(
++        "--contexts", nargs="+", type=int, default=[1024, 32768, 262144]
++    )
++    parser.add_argument("--heads", nargs="+", type=int, default=[16, 64])
++    parser.add_argument("--topk", nargs="+", type=int, default=[0, 512])
++    parser.add_argument("--main-widths", nargs="+", type=int, default=[128, 192])
++    parser.add_argument("--ratios", nargs="+", type=int, default=[1, 2])
++    parser.add_argument(
++        "--full-grid", action="store_true", help="All rows 1..48, seqs 1..8"
++    )
++    parser.add_argument(
++        "--full-sweep", action="store_true", help="Also sweep head tiles, warps, stages"
++    )
++    parser.add_argument("--fuse-rope", action="store_true")
++    parser.add_argument("--repetitions", type=int, default=20)
++    parser.add_argument("--seed", type=int, default=11)
++    args = parser.parse_args()
++    if args.mode == "tune" and args.write_table is None:
++        parser.error("--write-table is required for tune")
++    if not all(1 <= x <= 256 for x in args.main_widths):
++        parser.error("--main-widths must lie in 1..256")
++    if not all(x in (1, 2) for x in args.ratios):
++        parser.error("--ratios must be 1 or 2")
++    torch.manual_seed(args.seed)
++    record_compiler_stats()
++    info = device_info()
++    assert info["capability"] == [8, 0], "This gate targets SM80"
++    table = json.loads(args.table.read_text()) if args.table else {}
++    if table:
++        assert all(
++            table["device"][k] == info[k] for k in ("name", "sm_count", "capability")
++        )
++        os.environ["VLLM_SM80_SPARSE_DECODE"] = "1"
++        os.environ["VLLM_SM80_SPARSE_CONFIG"] = str(args.table.resolve())
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    scores, rejected = defaultdict(lambda: defaultdict(list)), set()
++    with args.output.open("w", buffering=1) as output:
++
++        def emit(record):
++            output.write(json.dumps(record) + "\n")
++
++        emit(
++            dict(
++                event="device", **info, args={k: str(v) for k, v in vars(args).items()}
++            )
++        )
++        try:
++            codec_gate()
++            emit(dict(event="codec", status="pass", encodings=256))
++            rows_list = range(1, 49) if args.full_grid else args.rows
++            seqs_list = range(1, 9) if args.full_grid else args.seqs
++            shapes = itertools.product(
++                rows_list,
++                seqs_list,
++                args.contexts,
++                args.heads,
++                args.topk,
++                args.main_widths,
++                args.ratios,
++            )
++            case_count = 0
++            for rows, seqs, context, heads, topk, width, ratio in shapes:
++                if not seqs <= rows <= 6 * seqs:
++                    continue
++                if topk == 0 and ratio != args.ratios[0]:
++                    continue
++                case_count += 1
++                key = shape_key(rows, heads, width, topk)
++                seed = select_config(rows, heads, width, topk, info["sm_count"], table)
++                configs = [seed] if args.table else candidates(args, seed)
++                case, selected, pos, cs = make_case(
++                    rows,
++                    seqs,
++                    context,
++                    heads,
++                    topk,
++                    main_width=width,
++                    ratio=ratio,
++                )
++                ref = reference(case, selected)
++                baseline = runner(case, LEGACY, pos, cs, args.fuse_rope)
++                expected = rotate_reference(ref, pos, cs) if args.fuse_rope else ref
++                check_close(baseline(), expected)
++                baseline_out = baseline().clone()
++                if args.table:
++                    check_close(runner(case, None, pos, cs, args.fuse_rope)(), expected)
++                    if args.mode == "gate":
++                        replay_gate(case, None, pos, cs)
++                baseline_us, _ = (
++                    graph_time(baseline, args.repetitions)
++                    if args.mode != "gate"
++                    else (None, [])
++                )
++                for cfg in configs:
++                    record = dict(
++                        event=args.mode,
++                        key=key,
++                        rows=rows,
++                        seqs=seqs,
++                        context=context,
++                        ratio=ratio,
++                        config=cfg.to_dict(),
++                    )
++                    try:
++                        COMPILER_STATS.clear()
++                        run = runner(case, cfg, pos, cs, args.fuse_rope)
++                        check_close(run(), expected)
++                        check_close(run(), baseline_out)
++                        if args.mode == "gate":
++                            replay_gate(case, cfg, pos, cs)
++                            check_close(
++                                runner(case, cfg, pos, cs, True)(),
++                                rotate_reference(ref, pos, cs),
++                            )
++                            odd, picks, op, oc = make_case(
++                                rows,
++                                seqs,
++                                context,
++                                heads,
++                                topk,
++                                adversarial=True,
++                                sink=False,
++                                padding=8,
++                                main_width=width,
++                                ratio=ratio,
++                            )
++                            odd_ref = reference(odd, picks)
++                            check_close(runner(odd, LEGACY, op, oc)(), odd_ref)
++                            check_close(runner(odd, cfg, op, oc)(), odd_ref)
++                            replay_gate(odd, cfg, op, oc)
++                            record.update(status="pass")
++                        else:
++                            us, samples = graph_time(run, args.repetitions)
++                            record.update(
++                                status="pass",
++                                us=us,
++                                samples_us=samples,
++                                baseline_us=baseline_us,
++                                speedup=baseline_us / us,
++                            )
++                            scores[key][cfg].append(us / baseline_us)
++                    except Exception as exc:
++                        rejected.add((key, cfg))
++                        record.update(status="fail", error=str(exc))
++                        emit(record)
++                        if args.mode == "gate" or not isinstance(
++                            exc, (OutOfResources, PTXASError)
++                        ):
++                            raise
++                        continue
++                    record["compiler"] = dict(COMPILER_STATS)
++                    emit(record)
++                del case, selected, baseline_out, ref
++            if case_count == 0:
++                raise ValueError("No valid row/sequence combinations selected")
++            if args.mode == "tune":
++                tuned = {}
++                for key, configs in scores.items():
++                    eligible = {
++                        c: statistics.geometric_mean(v)
++                        for c, v in configs.items()
++                        if (key, c) not in rejected and max(v) <= 1.05
++                    }
++                    best = min(eligible, key=eligible.get) if eligible else LEGACY
++                    # Retain the original kernel when the measured gain is <5%.
++                    tuned[key] = (
++                        best if eligible.get(best, 1) < 0.95 else LEGACY
++                    ).to_dict()
++                args.write_table.parent.mkdir(parents=True, exist_ok=True)
++                args.write_table.write_text(
++                    json.dumps(
++                        dict(
++                            version=1,
++                            device=info,
++                            configs=tuned,
++                            fuse_rope=args.fuse_rope,
++                        ),
++                        indent=2,
++                    )
++                    + "\n"
++                )
++            emit(dict(event="complete", status="pass"))
++        except Exception as exc:
++            emit(dict(event="complete", status="fail", error=str(exc)))
++            raise
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.55.0
+

@@ -1,0 +1,33 @@
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -1632,6 +1632,8 @@
+             head_dim,
+             dtype=torch.bfloat16,
+         )
++        from dsv41_engram_gap.prefetch import initialize
++        initialize(self, get_current_vllm_config())
+         if not self.embed_tokens.cpu_offload:
+             self._prefetch_stream = None
+             return
+@@ -1645,7 +1647,10 @@
+         offset = dbo_current_ubatch_token_offset()
+         rows = self.staged_rows[offset : offset + hash_ids.shape[0]]
+         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+-        if self._prefetch_stream is None:
++        if self._gap_stream is not None:
++            from dsv41_engram_gap.prefetch import prepare
++            prepare(self, hash_ids, rows)
++        elif self._prefetch_stream is None:
+             self.embed_tokens.lookup(hash_ids, rows)
+         else:
+             self._start_prefetch(hash_ids, rows)
+@@ -1680,6 +1685,9 @@
+         torch.cuda.current_stream().wait_event(event)
+ 
+     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
++        if self._gap_done is not None:
++            from dsv41_engram_gap.prefetch import join
++            join(self)
+         if self._prefetch_done is not None:
+             self._finish_prefetch(self._prefetch_done)
+         if self.embed_tokens.dp_size > 1:

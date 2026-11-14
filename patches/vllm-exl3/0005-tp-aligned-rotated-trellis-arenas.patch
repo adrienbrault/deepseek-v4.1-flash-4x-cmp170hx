@@ -1,0 +1,378 @@
+# Purpose: Plan trellis arenas with the loader's aligned, rotated MoE TP slices and fail closed on load mismatches.
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -865,6 +865,10 @@
+             stats["allocations_after"] += 1
+             stats["final_bytes"] += int(arena.nbytes)
+         setattr(layer, proj_to_attr[proj], arenas)
++    layer._exl3_trellis_expected = {
++        (proj, int(eid)) for proj, entries in shapes_by_proj.items() for eid in entries
++    }
++    layer._exl3_trellis_filled = set()
+     layer._exl3_trellis_arena_plan = plan
+     layer._exl3_trellis_eid_index = eid_index
+     layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
+@@ -1079,6 +1083,12 @@
+     st["slot"] = i ^ 1
+ 
+ 
++def _trellis_load_context(layer: Any, proj: str, expert_id: int) -> str:
++    name = getattr(layer, "layer_name", None) or getattr(layer, "prefix", "?")
++    shard = {"gate": "w1", "up": "w3", "down": "w2"}.get(proj, proj)
++    return f"layer={name} tensor=experts.{expert_id}.{shard}.trellis"
++
++
+ def _direct_fill_trellis_slot(
+     layer: Any,
+     proj: str,
+@@ -1086,11 +1096,14 @@
+     src: "torch.Tensor",
+ ) -> None:
+     """Copy one trellis into its pre-planned arena slot; drop ``src`` ASAP."""
++    context = _trellis_load_context(layer, proj, expert_id)
+     eid_index = getattr(layer, "_exl3_trellis_eid_index", None)
+     plan = getattr(layer, "_exl3_trellis_arena_plan", None)
+     if not eid_index or not plan:
+-        raise RuntimeError("EXL3 direct fill requires prepare_trellis_arena_plan")
+-    if expert_id not in eid_index[proj]:
++        raise RuntimeError(
++            f"EXL3 direct fill plan missing (prepare_trellis_arena_plan required) {context}"
++        )
++    if expert_id not in eid_index.get(proj, {}):
+         # ATS-aliased expert: the Parameter already points at the mmap'd side
+         # file. Verify the checkpoint tensor matches the aliased shape, then
+         # drop the source instead of copying it into CUDA memory.
+@@ -1100,23 +1113,29 @@
+         if want is not None:
+             if tuple(int(x) for x in src.shape) != tuple(want):
+                 raise RuntimeError(
+-                    f"EXL3 ATS alias shape mismatch {proj} expert={expert_id}: "
++                    f"EXL3 ATS alias shape mismatch {context}: "
+                     f"checkpoint {tuple(src.shape)} alias {want}"
+                 )
++            layer._exl3_trellis_filled.add((proj, int(expert_id)))
+             _ats._STATS["skipped_fill_bytes"] += int(src.numel()) * int(src.element_size())
+             _ats._STATS["skipped_fill_calls"] += 1
+             _madv_dontneed_cpu_tensor(src)
+             return
+         raise RuntimeError(
+-            f"EXL3 arena plan missing {proj} expert={expert_id} shape={tuple(src.shape)}"
++            f"EXL3 arena plan missing {context} shape={tuple(src.shape)}"
+         )
+     shape, idx = eid_index[proj][expert_id]
+     if tuple(int(x) for x in src.shape) != shape:
+         raise RuntimeError(
+-            f"EXL3 arena slot shape mismatch {proj} expert={expert_id}: "
++            f"EXL3 arena slot shape mismatch {context}: "
+             f"got {tuple(src.shape)} planned {shape}"
+         )
+-    arena = plan[proj][shape]["arena"]
++    meta = plan.get(proj, {}).get(shape)
++    if meta is None or (
++        "eid_to_idx" in meta and meta["eid_to_idx"].get(expert_id) != idx
++    ):
++        raise RuntimeError(f"EXL3 arena slot index mismatch {context}")
++    arena = meta["arena"]
+     transient = int(src.numel()) * int(src.element_size())
+     layer._exl3_trellis_temp_peak_bytes = max(
+         int(getattr(layer, "_exl3_trellis_temp_peak_bytes", 0)), transient
+@@ -1137,6 +1156,7 @@
+         # completion before ``src`` is released.
+         arena[idx].copy_(src, non_blocking=False)
+     _madv_dontneed_cpu_tensor(src)
++    layer._exl3_trellis_filled.add((proj, int(expert_id)))
+     _DIRECT_FILL_STATS["DIRECT_FILL_CALLS"] += 1
+     _DIRECT_FILL_STATS["DIRECT_FILL_BYTES"] += transient
+     _DIRECT_FILL_STATS["DIRECT_FILL_DEVICE"] = str(arena.device)
+@@ -1155,6 +1175,12 @@
+         raise RuntimeError("torch required for trellis arenas")
+     # Already planned+filled: just report stats.
+     if getattr(layer, "_exl3_trellis_arena_plan", None) is not None:
++        missing = layer._exl3_trellis_expected - layer._exl3_trellis_filled
++        if missing:
++            proj, eid = min(missing)
++            raise RuntimeError(
++                "EXL3 arena tensor was not loaded " + _trellis_load_context(layer, proj, eid)
++            )
+         stats = dict(getattr(layer, "_exl3_trellis_arena_stats", {}) or {})
+         stats["packed"] = True
+         stats["mode"] = "direct_plan"
+@@ -1290,6 +1316,36 @@
+     return int(m.group(1)) % tp_size if m else 0
+ 
+ 
++def _tp_slice(
++    size: int,
++    tp_rank: int,
++    tp_size: int,
++    unit: int = 1,
++    aligned: bool = False,
++) -> tuple[int, int]:
++    """Return (offset, length) in tensor indices for headers AND payloads."""
++    if tp_size <= 1:
++        return 0, size
++    align = _moe_tp_align() if aligned else 0
++    if align > 0:
++        if (size * unit) % align:
++            raise RuntimeError(
++                f"EXL3 aligned MoE TP: dimension spans {size * unit} columns, which "
++                f"is not a multiple of the VLLM_EXL3_MOE_TP_ALIGN={align} Hadamard "
++                "block; unset VLLM_EXL3_MOE_TP_ALIGN or use an expert-parallel build"
++            )
++        off, length = aligned_tp_split(size * unit, tp_rank, tp_size, align)
++        if off % unit or length % unit:
++            raise RuntimeError("EXL3 aligned TP split cuts a trellis tile")
++        return off // unit, length // unit
++    if size % tp_size:
++        raise ValueError(
++            f"EXL3 TP shard: size {size} is not divisible by tp={tp_size}"
++        )
++    chunk = size // tp_size
++    return chunk * tp_rank, chunk
++
++
+ def _narrow_tp(
+     tensor: torch.Tensor,
+     dim: int,
+@@ -1298,34 +1354,11 @@
+     unit: int = 1,
+     aligned: bool = False,
+ ) -> torch.Tensor:
+-    """Narrow ``dim`` to this rank's shard.
+-
+-    ``aligned`` (routed experts only) applies the VLLM_EXL3_MOE_TP_ALIGN block
+-    split; ``unit`` is columns per index along ``dim`` (16 for trellis tiles).
+-    """
++    """Narrow a payload using the same slice calculation as the header plan."""
+     if tp_size <= 1:
+         return tensor
+-    size = int(tensor.shape[dim])
+-    align = _moe_tp_align() if aligned else 0
+-    if align > 0:
+-        if (size * unit) % align:
+-            # Falling through to the equal split here would cut a Hadamard block
+-            # and decode every shard against the wrong transform, silently. This
+-            # path is only reachable with the opt-in env var set, so refuse the
+-            # geometry instead of loading weights that cannot be right.
+-            raise RuntimeError(
+-                f"EXL3 aligned MoE TP: dim {dim} spans {size * unit} columns, which "
+-                f"is not a multiple of the VLLM_EXL3_MOE_TP_ALIGN={align} Hadamard "
+-                "block; unset VLLM_EXL3_MOE_TP_ALIGN or use an expert-parallel build"
+-            )
+-        off, length = aligned_tp_split(size * unit, tp_rank, tp_size, align)
+-        return tensor.narrow(dim, off // unit, length // unit).contiguous()
+-    if size % tp_size:
+-        raise ValueError(
+-            f"EXL3 TP shard: dim {dim} size {size} is not divisible by tp={tp_size}"
+-        )
+-    chunk = size // tp_size
+-    return tensor.narrow(dim, chunk * tp_rank, chunk).contiguous()
++    off, length = _tp_slice(int(tensor.shape[dim]), tp_rank, tp_size, unit, aligned)
++    return tensor.narrow(dim, off, length).contiguous()
+ 
+ 
+ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
+@@ -1348,6 +1381,16 @@
+     )
+ 
+     return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
++
++
++def _moe_load_tp_geometry(layer: Any, param: Any = None) -> tuple[int, int]:
++    """Effective chunk owner shared by the routed loader and arena prescan."""
++    if getattr(layer, "use_ep", False):
++        return 0, 1  # whole experts; EP placement is handled by the expert map
++    rank, size = _resolve_tp_geometry(layer, param)
++    if size > 1:
++        rank = (rank + int(getattr(layer, "_exl3_tp_rotation", 0))) % size
++    return rank, size
+ 
+ 
+ def shard_exl3_col(
+@@ -3758,7 +3801,7 @@
+             expert_id = local_id
+ 
+         owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
+-        tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
++        tp_rank, tp_size = _moe_load_tp_geometry(owner_mod, param)
+         # Non-gated MoE (NemotronH): upstream maps the checkpoint's up_proj onto
+         # shard w1 and never sends w3 (ckpt_up_proj_name=""). The up payload
+         # must land in UP storage; build_exl3_fused_state later aliases up
+@@ -3775,13 +3818,6 @@
+                 f"expert_id={expert_id} suffix={_suffix_from_mapped_name(weight_name)!r}",
+                 flush=True,
+             )
+-        if tp_size > 1 and getattr(owner_mod, "_exl3_tp_rotation", 0):
+-            # Same per-layer chunk rotation as create_weights (memory balance).
+-            tp_rank = (tp_rank + owner_mod._exl3_tp_rotation) % tp_size
+-        if getattr(owner_mod, "use_ep", False):
+-            # Expert parallel: experts are whole; feature slicing must not run
+-            # (shard_exl3_col/row would quarter already-whole expert tensors).
+-            tp_rank, tp_size = 0, 1
+         suffix = _suffix_from_mapped_name(weight_name)
+         store = getattr(owner, "_exl3_mixed_store", None)
+         if store is not None:
+@@ -3809,22 +3845,27 @@
+             return True if return_success else None
+ 
+         if suffix == "trellis":
+-            # Exact checkpoint shape per expert. With arenas enabled, stage on
+-            # host and pack into contiguous per-shape arenas later (views keep
+-            # heterogeneous K / expert IDs). Legacy path allocates one Parameter
+-            # per expert immediately.
++            # Exact checkpoint shape per expert. A prescanned plan fills FINAL
++            # slots directly; optional legacy stage-pack keeps heterogeneous K.
++            # Arenas off allocates one Parameter per expert immediately.
+             if owner_mod is None:
+-                raise RuntimeError("EXL3 trellis load missing owner module")
++                raise RuntimeError(f"EXL3 trellis load missing owner module tensor={weight_name}")
++            context = _trellis_load_context(
++                owner_mod, _proj_from_shard_id(shard_id), int(expert_id)
++            )
+             if _exl3_mem_waterfall_enabled():
+                 _exl3_mem_snapshot("BEFORE_SOURCE", owner_mod)
+-            if shard_id in ("w1", "w3"):
+-                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size, aligned=True)
+-                plist = owner_mod.gate_trellis if shard_id == "w1" else owner_mod.up_trellis
+-            elif shard_id == "w2":
+-                sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size, aligned=True)
+-                plist = owner_mod.down_trellis
+-            else:
+-                raise ValueError(f"unknown EXL3 shard_id={shard_id}")
++            try:
++                if shard_id in ("w1", "w3"):
++                    sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size, aligned=True)
++                    plist = owner_mod.gate_trellis if shard_id == "w1" else owner_mod.up_trellis
++                elif shard_id == "w2":
++                    sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size, aligned=True)
++                    plist = owner_mod.down_trellis
++                else:
++                    raise ValueError(f"unknown EXL3 shard_id={shard_id}")
++            except (ValueError, RuntimeError) as exc:
++                raise RuntimeError(f"EXL3 trellis shard mismatch {context}: {exc}") from exc
+             if _exl3_mem_waterfall_enabled():
+                 _exl3_mem_snapshot("AFTER_SOURCE_OPEN", owner_mod)
+             # Validate tile geometry against the layer's hidden/intermediate
+@@ -3837,18 +3878,22 @@
+                 expect_prefix = (out_tiles, in_tiles)
+             if tuple(sharded.shape[:2]) != expect_prefix:
+                 raise RuntimeError(
+-                    f"EXL3 trellis tile mismatch {weight_name} shard={shard_id} "
++                    f"EXL3 trellis tile mismatch {context} "
+                     f"expert={expert_id}: got {tuple(sharded.shape)} "
+                     f"expected prefix {expect_prefix}+K_words"
+                 )
+             if int(sharded.shape[-1]) % 16 != 0:
+                 raise RuntimeError(
+-                    f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
++                    f"EXL3 trellis K_words not multiple of 16 {context}: {tuple(sharded.shape)}"
+                 )
+ 
+             use_arena = _exl3_trellis_arena_enabled()
+-            if getattr(owner_mod, "_exl3_require_direct_fill", False) and not use_arena:
+-                raise RuntimeError("attested EXL3 direct-fill cannot disable final arenas")
++            require_direct = (
++                getattr(owner_mod, "_exl3_require_direct_fill", False)
++                or os.environ.get("VLLM_EXL3_REQUIRE_ARENA_PRESCAN", "0") == "1"
++            )
++            if require_direct and not use_arena:
++                raise RuntimeError(f"EXL3 required direct-fill cannot disable final arenas {context}")
+             if use_arena:
+                 proj = _proj_from_shard_id(shard_id)
+                 owner_mod._exl3_trellis_alloc_count_before = int(
+@@ -3883,8 +3928,11 @@
+                         _exl3_mem_snapshot("AFTER_GC", owner_mod)
+                     return True if return_success else None
+ 
+-                if getattr(owner_mod, "_exl3_require_direct_fill", False):
+-                    raise RuntimeError("attested EXL3 direct-fill plan missing; CPU staging is forbidden")
++                if require_direct:
++                    raise RuntimeError(
++                        "EXL3 direct-fill plan missing; CPU staging is forbidden "
++                        + _trellis_load_context(owner_mod, proj, int(expert_id))
++                    )
+                 # Fallback: stage on host; pack in process_weights_after_loading.
+                 _fb = int(sharded.numel()) * int(sharded.element_size())
+                 _DIRECT_FILL_STATS["DIRECT_FILL_FALLBACK_CALLS"] += 1
+@@ -3983,7 +4031,8 @@
+             sharded = sharded.contiguous()
+         if tuple(dest.shape) != tuple(sharded.shape):
+             raise RuntimeError(
+-                f"EXL3 load shape mismatch {weight_name} shard={shard_id} "
++                f"EXL3 load shape mismatch layer={getattr(owner_mod, 'layer_name', None) or getattr(owner_mod, 'prefix', '?')} "
++                f"tensor={weight_name} shard={shard_id} "
+                 f"expert={expert_id}: dest {tuple(dest.shape)} != "
+                 f"loaded {tuple(sharded.shape)}"
+             )
+@@ -4042,7 +4091,10 @@
+         if os.environ.get("VLLM_EXL3_REQUIRE_ARENA_PRESCAN", "0") == "1":
+             stats = getattr(layer, "_exl3_trellis_arena_stats", {})
+             if not stats.get("planned") or staged_n:
+-                raise RuntimeError("EXL3 required direct-fill arenas were not used")
++                raise RuntimeError(
++                    "EXL3 required direct-fill arenas were not used "
++                    + _trellis_load_context(layer, "gate", 0)
++                )
+             logger.info(
+                 "EXL3_ARENA layer=%s storages=%d bytes=%d planned=%s staging=%d",
+                 getattr(layer, "layer_name", None) or getattr(layer, "prefix", "?"),
+--- a/src/vllm_exl3/mixed_k_guard.py
++++ b/src/vllm_exl3/mixed_k_guard.py
+@@ -36,8 +36,11 @@
+ def shard_prescanned_trellis_shapes(
+     shapes: dict[str, dict[int, tuple[int, ...]]],
+     tp_size: int,
++    tp_rank: int = 0,
+ ) -> dict[str, dict[int, tuple[int, ...]]]:
+     """Mirror EXL3 gate/up column sharding and down row sharding in metadata."""
++    from .exl3 import _tp_slice
++
+     tp = int(tp_size)
+     if tp <= 1:
+         return {
+@@ -53,12 +56,15 @@
+                     f"EXL3 prescan expected 3-D trellis for {proj} expert={eid}, got {shape}"
+                 )
+             shard_dim = 1 if proj in ("gate", "up") else 0
+-            if dims[shard_dim] % tp:
++            try:
++                _, dims[shard_dim] = _tp_slice(
++                    dims[shard_dim], int(tp_rank), tp, 16, aligned=True
++                )
++            except (ValueError, RuntimeError) as exc:
+                 raise RuntimeError(
+                     f"EXL3 prescan cannot TP-shard {proj} expert={eid} shape={shape} "
+-                    f"by tp_size={tp}"
+-                )
+-            dims[shard_dim] //= tp
++                    f"by rank={tp_rank} tp_size={tp}: {exc}"
++                ) from exc
+             out[proj][int(eid)] = tuple(dims)
+     return out
+ 
+@@ -85,17 +91,21 @@
+         shapes = current(layer, num_experts)
+         if shapes is None:
+             return None
+-        resolver = getattr(exl3_module, "_resolve_tp_geometry", None)
+-        tp_size = 1
++        resolver = getattr(exl3_module, "_moe_load_tp_geometry", None)
++        tp_rank, tp_size = 0, 1
+         if callable(resolver):
+             try:
+-                _rank, tp_size = resolver(layer)
++                tp_rank, tp_size = resolver(layer)
+             except ModuleNotFoundError:
+                 # CPU-only unit tests intentionally run without vLLM. If the
+                 # synthetic layer carries no TP metadata, TP1 is the only safe
+                 # interpretation and matches the legacy prescan contract.
+                 tp_size = 1
+-        return shard_prescanned_trellis_shapes(shapes, int(tp_size))
++        try:
++            return shard_prescanned_trellis_shapes(shapes, int(tp_size), int(tp_rank))
++        except (ValueError, RuntimeError) as exc:
++            name = getattr(layer, "layer_name", None) or getattr(layer, "prefix", "?")
++            raise RuntimeError(f"EXL3 arena prescan layer={name}: {exc}") from exc
+ 
+     guarded._vllm_exl3_mixed_k_prescan_guard = True
+     guarded._vllm_exl3_original = current

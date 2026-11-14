@@ -35,3 +35,11 @@ A queue that exists only in the operator's conversation does not execute between
 `prefill-profile.py` captures unscored c8 decode and fresh8k prefill at c1/c4 after throughput scores finish. Every phase requires a profiler stop acknowledgement and observer cleanup; unresolved requests require replacing the model before another scored run. The240-second helper budget reserves80seconds for cleanup and bounds CPU report processing. CPU reports run after GPU captures because symbol processing previously consumed later phases' request deadlines. Twenty Linux tests pass; a hardware rerun of the repaired lifecycle is pending.
 
 `summarize-prefill-profile.py` reports per-phase GPU rank coverage, summed communication kernel durations, separately observed callback intervals and host counters. Collective kernel duration includes possible waiting and is not exclusive PCIe transfer or callback time. Missing callback spans remain unavailable. A partial or unsafe capture keeps its original status even when all four rank traces are recoverable.
+
+## Current-r7b publication, 2026-11-14
+
+The loaded v2 suite sums directly measured per-request decode rates within concurrent batches, averages scored batches per boot and then averages the two ON boots. Individual per-stream statistics are absent from the supplied summary. Do not divide the sum by concurrency to invent a missing per-stream statistic. Prefill is a median-per-boot, then mean-of-boots statistic, and its rounded input rate is not reconstructed from nominal input length and rounded TTFT.
+
+The current graph mode is FULL_DECODE_ONLY, with every capture size from one through 48. R7a disables LoRA graph specialization and the r7b native module is loaded before graph capture. The draft argmax implementation is still mounted but its older plugin registration is replaced by the r7a plugin. Fair prefill and prompt lookup are absent from this serving definition.
+
+The installed image identifier is a local image ID, not a registry pull digest. R17 base patches do not describe every later f760 layer. Excluded generated-output directories contain required native and ring payloads, so static source checks cannot establish a complete rebuild or serving equivalence.

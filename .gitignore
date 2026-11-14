@@ -4,3 +4,5 @@
 scripts/host.env
 *.pyc
 __pycache__/
+
+artifacts/

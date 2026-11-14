@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_draft_argmax = dsv41_draft_argmax:register

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="320" viewBox="0 0 800 320" role="img" aria-labelledby="title desc">
+<title id="title">Decode aggregate: sum of measured stream rates</title>
+<desc id="desc">Current-r7b, 2026-11-14 UTC, two qualification boots. Values are measured cell summaries, with no interpolation.</desc>
+<rect width="800" height="320" fill="#101820"/>
+<g fill="#edf2f7" font-family="sans-serif">
+<text x="28" y="35" font-size="21">Decode aggregate: sum of measured stream rates</text>
+<text x="28" y="59" font-size="13">2026-11-14 UTC · current-r7b · loaded suite v2 · 175 W/GPU</text>
+<text x="28" y="104" font-size="15">c1</text>
+<rect x="145" y="84" width="156.88" height="29" rx="3" fill="#64c4c6"/>
+<text x="311.88" y="105" font-size="15">153.8 tok/s</text>
+<text x="28" y="159" font-size="15">c4</text>
+<rect x="145" y="139" width="336.91" height="29" rx="3" fill="#64c4c6"/>
+<text x="491.91" y="160" font-size="15">330.3 tok/s</text>
+<text x="28" y="214" font-size="15">c8</text>
+<rect x="145" y="194" width="420.24" height="29" rx="3" fill="#64c4c6"/>
+<text x="575.24" y="215" font-size="15">412.0 tok/s</text>
+<text x="28" y="291" font-size="12">Source: bench/results/2026-11-14-current-r7b-qualification</text>
+</g></svg>

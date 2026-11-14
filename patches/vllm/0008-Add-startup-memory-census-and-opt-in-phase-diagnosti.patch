@@ -1,0 +1,216 @@
+From 7bbad2950be37216b18f1f70f16733f5d6f3fbe6 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 19:19:30 +0200
+Subject: [PATCH 08/10] Add startup memory census and opt-in phase diagnostics
+
+Report live, reserved, split and external GPU memory per PP/TP rank
+after loading and profiling. Keep the recipe debug switches usable with
+the V2 runner and native DSpark, with bounded host timing and optional
+worker kernel profiling. Synchronize only for explicit timing diagnostics.
+
+Origin: r6; dsv41reap-pp; new
+Upstream: none
+---
+ vllm/utils/dsv41_diagnostics.py               | 85 +++++++++++++++++++
+ vllm/v1/engine/core.py                        |  4 +
+ .../gpu/spec_decode/dspark/speculator.py      |  5 ++
+ vllm/v1/worker/gpu_worker.py                  |  7 ++
+ 4 files changed, 101 insertions(+)
+ create mode 100644 vllm/utils/dsv41_diagnostics.py
+
+diff --git a/vllm/utils/dsv41_diagnostics.py b/vllm/utils/dsv41_diagnostics.py
+new file mode 100644
+index 0000000000..abedaa2b02
+--- /dev/null
++++ b/vllm/utils/dsv41_diagnostics.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in startup accounting and bounded serving diagnostics."""
++
++import functools
++import os
++import time
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def memory_census(phase, device):
++    if os.environ.get("DSV41_MEMORY_CENSUS", "0") != "1":
++        return
++    import torch
++    from vllm.distributed import get_pp_group, get_tp_group
++
++    torch.cuda.synchronize(device)
++    stats = torch.cuda.memory_stats(device)
++    free, total = torch.cuda.mem_get_info(device)
++    allocated = torch.cuda.memory_allocated(device)
++    reserved = torch.cuda.memory_reserved(device)
++    logger.info(
++        "DSV41_MEMORY phase=%s pp=%d tp=%d allocated=%.3f reserved=%.3f "
++        "reserved_minus_allocated=%.3f inactive_split=%.3f "
++        "external=%.3f free=%.3f GiB allocator=%s",
++        phase, get_pp_group().rank_in_group, get_tp_group().rank_in_group,
++        allocated / 2**30, reserved / 2**30, (reserved - allocated) / 2**30,
++        stats.get("inactive_split_bytes.all.current", 0) / 2**30,
++        (total - free - reserved) / 2**30, free / 2**30,
++        torch.cuda.get_allocator_backend(),
++    )
++
++
++def debug_call(label, *switches):
++    """Log host phase duration; timing explicitly synchronizes at outer boundaries."""
++    def decorate(fn):
++        @functools.wraps(fn)
++        def wrapped(self, *args, **kwargs):
++            if not any(os.environ.get(key) == "1" for key in switches):
++                return fn(self, *args, **kwargs)
++            import torch
++
++            attr = "_dsv41_debug_" + label + "_" + fn.__name__
++            step = getattr(self, attr, 0) + 1
++            setattr(self, attr, step)
++            tokens = getattr(args[0], "total_num_scheduled_tokens", None) if args else None
++            gpu = torch.cuda.is_initialized()
++            capturing = gpu and torch.cuda.is_current_stream_capturing()
++            sync = gpu and not capturing and os.environ.get("DSV41_DEBUG_TIMING") == "1"
++            profile = (
++                label == "worker" and not capturing
++                and os.environ.get("DSV41_DEBUG_PROFILE") == "1"
++                and tokens == int(os.environ.get("DSV41_DEBUG_PROFILE_T", "1"))
++            )
++            if profile:
++                count = getattr(self, "_dsv41_profile_count", 0) + 1
++                self._dsv41_profile_count = count
++                profile = count in (40, 41)
++            if sync:
++                torch.cuda.synchronize()
++            start = time.perf_counter()
++            if profile:
++                from torch.profiler import ProfilerActivity, profile as torch_profile
++
++                with torch_profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
++                    result = fn(self, *args, **kwargs)
++                logger.info("DSV41 PROFILE %s", p.key_averages().table(
++                    sort_by="self_cuda_time_total", row_limit=40,
++                ))
++            else:
++                result = fn(self, *args, **kwargs)
++            if sync:
++                torch.cuda.synchronize()
++            if step <= 96 or step % 64 == 0:
++                logger.info(
++                    "DSV41_DEBUG phase=%s step=%d tokens=%s host_ms=%.3f synchronized=%s",
++                    f"{label}.{fn.__name__}", step, tokens,
++                    (time.perf_counter() - start) * 1e3, sync,
++                )
++            return result
++        return wrapped
++    return decorate
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 11f4c1c3e1..eb37f2fae5 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -105,6 +105,8 @@ from vllm.v1.structured_output import StructuredOutputManager
+ from vllm.v1.utils import compute_iteration_details
+ from vllm.version import __version__ as VLLM_VERSION
+ 
++from vllm.utils.dsv41_diagnostics import debug_call
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -637,6 +639,7 @@ class EngineCore:
+         Overridden by the DP engine core; never throttles otherwise."""
+         return False
+ 
++    @debug_call("core", "DSV41_DEBUG_CORE")
+     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+         """Schedule, execute, and make output.
+ 
+@@ -678,6 +681,7 @@ class EngineCore:
+             if draft_token_ids is not None:
+                 self.scheduler.update_draft_token_ids(draft_token_ids)
+ 
++    @debug_call("core", "DSV41_DEBUG_CORE")
+     def step_with_batch_queue(
+         self,
+     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index c29f9adce4..2b3afa22ac 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -34,6 +34,8 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
++from vllm.utils.dsv41_diagnostics import debug_call
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -153,6 +155,7 @@ class DSparkSpeculator(DFlashSpeculator):
+             use_fp64=self.use_fp64_gumbel,
+         )
+ 
++    @debug_call("dspark", "DSV41_DEBUG_DSPARK")
+     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         if self._draft_topk is not None:
+             self._sample_sequential_topk(num_reqs, head_hidden)
+@@ -206,6 +209,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                 num_reqs, n_spec
+             )
+ 
++    @debug_call("dspark", "DSV41_DEBUG_DSPARK")
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+ 
+@@ -255,6 +259,7 @@ class DSparkSpeculator(DFlashSpeculator):
+                 num_reqs, n_spec
+             )
+ 
++    @debug_call("dspark", "DSV41_DEBUG_DSPARK")
+     def _generate_draft(
+         self,
+         num_reqs: int,
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f3ffef5810..62c5c1d00c 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -115,6 +115,8 @@ from .gpu.cudagraph_utils import has_compiled_submodule
+ from .gpu.warmup import warmup_kernels
+ from .utils import request_memory
+ 
++from vllm.utils.dsv41_diagnostics import debug_call, memory_census
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -597,6 +599,8 @@ class Worker(WorkerBase):
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+ 
++        memory_census("after_load", self.device)
++
+         if has_ec_transfer():
+             get_ec_transfer().start_worker_services()
+ 
+@@ -716,6 +720,7 @@ class Worker(WorkerBase):
+ 
+         init_free_memory = self.init_snapshot.free_memory
+         free_gpu_memory = profile_result.after_profile.free_memory
++        memory_census("after_profile_and_graph_estimate", self.device)
+         rocm_fallback = maybe_rocm_profiling_fallback(profile_result)
+         if rocm_fallback is None:
+             # NOTE(woosuk): Here we assume that the other processes using the same
+@@ -1310,6 +1315,8 @@ class Worker(WorkerBase):
+ 
+     @torch.inference_mode()
+     @with_gpu_sync_check
++    @debug_call("worker", "DSV41_DEBUG_SPEC", "DSV41_DEBUG_TIMING",
++                "DSV41_DEBUG_TRACE", "DSV41_DEBUG_PROFILE")
+     def execute_model(
+         self, scheduler_output: "SchedulerOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

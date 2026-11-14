@@ -1,0 +1,421 @@
+From 9e08c43ff5f13efe2cac13c9f18b7d1eda05d2e8 Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Wed, 21 Oct 2026 01:13:49 +0200
+Subject: [PATCH] Preserve FP32 projection values at the SM80 fused mHC seam
+
+The upstream fused post/pre projects the FP32 post-mix registers while storing BF16 residual streams. Rounding those registers before projection adds coefficient error that cannot be fixed by changing the gate tolerance. Follow the upstream dispatch decision so the separate post/pre range still projects BF16.
+
+Validate against a float64 oracle, retain both sides of failed comparisons in the GPU gate, and cover the fused-to-separate boundary with CPU interpretation of the Triton bodies. GPU qualification remains pending.
+
+Origin: dsv41-gatefix-r19
+Upstream: Not submitted; SM80 hardware qualification pending
+---
+ benchmarks/kernels/benchmark_mhc_sm80.py |  72 ++++++++++---
+ tests/kernels/mhc/test_mhc_sm80_cpu.py   | 126 +++++++++++++++++++++++
+ vllm/model_executor/kernels/mhc/sm80.py  |  16 ++-
+ vllm/model_executor/kernels/mhc/torch.py |  16 ++-
+ 4 files changed, 210 insertions(+), 20 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_mhc_sm80.py b/benchmarks/kernels/benchmark_mhc_sm80.py
+index 582ac4290e..b255bf107b 100644
+--- a/benchmarks/kernels/benchmark_mhc_sm80.py
++++ b/benchmarks/kernels/benchmark_mhc_sm80.py
+@@ -5,7 +5,7 @@
+ Run from an installed vLLM checkout. --output is always written, including on
+ failure. Tuning emits a separate JSON table for VLLM_MHC_SM80_CONFIG; null means
+ retain the upstream implementation. No candidate is selected without checking
+-against both upstream and FP32 torch. No GPU results are bundled with this tool.
++against both upstream and a float64 reference. No GPU results are bundled here.
+ """
+ 
+ import argparse
+@@ -38,8 +38,10 @@ from vllm.model_executor.kernels.mhc.tilelang import (
+     mhc_post_tilelang,
+     mhc_pre_delayed_tilelang,
+ )
++from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++    mhc_fused_post_pre_split_config,
++)
+ from vllm.model_executor.kernels.mhc.torch import (
+-    mhc_post_torch,
+     mhc_pre_delayed_torch,
+ )
+ 
+@@ -57,9 +59,8 @@ def row_list(raw):
+     return sorted(result)
+ 
+ 
+-def make_case(rows, op, width, seed=0, variant="normal"):
++def make_case(rows, op, width, seed=0, variant="normal", device="cuda"):
+     torch.manual_seed(seed)
+-    device = "cuda"
+     r = torch.randn(rows, 4, 5120, device=device, dtype=torch.bfloat16)
+     x = torch.randn(rows, 5120, device=device, dtype=torch.bfloat16)
+     fn = torch.randn(24, width, device=device) / math.sqrt(width)
+@@ -82,6 +83,11 @@ def make_case(rows, op, width, seed=0, variant="normal"):
+     if op == "pre" and width == 5120:
+         kwargs["x"] = x
+     args = (r, fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 20)
++    # Evaluate the seam on the actual quantized inputs, without FP32 reduction
++    # error. Only the stored residual and collapsed input cross BF16 boundaries.
++    raw_post = prev_post.double() * x.double().unsqueeze(1) + torch.einsum(
++        "bij,bih->bjh", prev_comb.double(), r.double()
++    )
+     if op == "fused":
+         kwargs["capture_aux"] = variant == "aux"
+         old = (x, r, prev_post, prev_comb)
+@@ -96,7 +102,7 @@ def make_case(rows, op, width, seed=0, variant="normal"):
+             comb_res_mix=prev_comb,
+             config=cfg,
+         )
+-        updated = mhc_post_torch(*old)
++        updated = raw_post.bfloat16()
+     elif op == "pre":
+         baseline = lambda: mhc_pre_delayed_tilelang(*args, **kwargs)
+         candidate = lambda cfg: mhc_pre_sm80(*args, **kwargs, config=cfg)[1:5]
+@@ -104,14 +110,31 @@ def make_case(rows, op, width, seed=0, variant="normal"):
+     else:
+         baseline = lambda: mhc_post_tilelang(x, r, prev_post, prev_comb)
+         candidate = lambda cfg: mhc_post_sm80(x, r, prev_post, prev_comb, cfg)
+-        return baseline, candidate, mhc_post_torch(x, r, prev_post, prev_comb), r
++        return baseline, candidate, raw_post.bfloat16(), r
+ 
+     ref_kwargs = {k: v for k, v in kwargs.items() if k in ("x", "pre_mix")}
+-    reference = list(mhc_pre_delayed_torch(updated, *args[1:], **ref_kwargs))
++    if op == "fused":
++        fused = mhc_fused_post_pre_split_config(rows, 5120, 4) is not None
++        projection = raw_post if fused else updated.double()
++        ref_kwargs["x"] = projection.flatten(1)
++    reference = list(
++        mhc_pre_delayed_torch(
++            updated, *args[1:], **ref_kwargs, reference_dtype=torch.float64
++        )
++    )
+     if kwargs["norm_weight"] is not None:
+-        reference[2] = F.rms_norm(reference[2], (5120,), norm, 1e-6)
++        reference[2] = F.rms_norm(
++            reference[2].double(), (5120,), norm.double(), 1e-6
++        ).bfloat16()
++    # Round only final FP32 ABI outputs, after the FP64 oracle computation.
++    for i in (0, 1, 3):
++        reference[i] = reference[i].float()
+     if op == "fused":
+-        aux = updated.mean(1) if kwargs["capture_aux"] else updated.new_empty(0, 5120)
++        aux = (
++            updated.double().mean(1).bfloat16()
++            if kwargs["capture_aux"]
++            else updated.new_empty(0, 5120)
++        )
+         reference = [updated, *reference, aux]
+     return baseline, candidate, reference, r
+ 
+@@ -134,6 +157,15 @@ def check_close(actual, reference, op):
+     return errors
+ 
+ 
++def max_abs_errors(actual, reference, op):
++    if op == "post":
++        actual, reference = [actual], [reference]
++    return [
++        (got.double() - want.double()).abs().max().item() if got.numel() else 0.0
++        for got, want in zip(actual, reference, strict=True)
++    ]
++
++
+ def graph_us(functions, rows, repeats):
+     # Rotate independent weights/inputs so a one-layer L2-hot loop does not
+     # masquerade as the 80-seam target model. Use --weight-ring 1 for hot timing.
+@@ -217,7 +249,9 @@ def run(args, report):
+             entry = dict(key=key, trials=[])
+             report["cases"].append(entry)
+             baseline, candidate, reference, residual = make_case(rows, op, width)
+-            check_close(baseline(), reference, op)
++            original = baseline()
++            entry["upstream_fp64_max_abs"] = max_abs_errors(original, reference, op)
++            check_close(original, reference, op)
+             timing = []
+             if args.mode != "check":
+                 ring = args.weight_ring if rows <= 48 else min(args.weight_ring, 4)
+@@ -266,16 +300,26 @@ def run(args, report):
+                 entry["trials"].append(trial)
+                 try:
+                     validation_errors = []
+-                    for old, new, ref, _ in validation:
++                    trial["max_abs_errors"] = validation_errors
++                    for (seed, variant), (old, new, ref, _) in zip(
++                        itertools.product(range(args.seeds), variants),
++                        validation,
++                        strict=True,
++                    ):
+                         original = old()
+                         actual = new(choice)
+                         validation_errors.append(
+                             dict(
+-                                torch=check_close(actual, ref, op),
+-                                upstream=check_close(actual, original, op),
++                                seed=seed,
++                                variant=variant,
++                                fp64=max_abs_errors(actual, ref, op),
++                                upstream_fp64=max_abs_errors(original, ref, op),
++                                upstream=max_abs_errors(actual, original, op),
+                             )
+                         )
+-                    trial["max_abs_errors"] = validation_errors
++                        check_close(actual, ref, op)
++                        check_close(original, ref, op)
++                        check_close(actual, original, op)
+                     graph_gate(baseline, candidate, choice, reference, op, residual)
+                     # Confirm public routing (the same entry points the model uses).
+                     raw = json.dumps(dict(version=1, configs={key: choice.to_dict()}))
+diff --git a/tests/kernels/mhc/test_mhc_sm80_cpu.py b/tests/kernels/mhc/test_mhc_sm80_cpu.py
+index e9082deed6..9dda49c1a2 100644
+--- a/tests/kernels/mhc/test_mhc_sm80_cpu.py
++++ b/tests/kernels/mhc/test_mhc_sm80_cpu.py
+@@ -7,6 +7,7 @@ checks indexing, split tails and BF16 boundaries; compilation and GPU reduction
+ order still require benchmark_mhc_sm80.py --mode check on SM80.
+ """
+ 
++import ast
+ import importlib.util
+ import itertools
+ import json
+@@ -17,6 +18,7 @@ from pathlib import Path
+ from unittest.mock import patch
+ 
+ import torch
++import torch.distributed.tensor  # Load lazy registrations before patching sys.modules.
+ import torch.nn.functional as F
+ 
+ ROOT = Path(__file__).resolve().parents[3]
+@@ -34,6 +36,30 @@ def load_file(name, path):
+ config_module = load_file("mhc_sm80_cpu_config", KERNELS / "sm80_config.py")
+ reference = load_file("mhc_sm80_cpu_reference", KERNELS / "torch.py")
+ 
++# Use upstream's dispatch decision without importing TileLang on a CPU host.
++dispatch_tree = ast.parse((KERNELS / "tilelang_kernels.py").read_text())
++dispatch_nodes = [
++    node
++    for node in dispatch_tree.body
++    if (
++        isinstance(node, ast.FunctionDef)
++        and node.name == "mhc_fused_post_pre_split_config"
++    )
++    or (
++        isinstance(node, ast.Assign)
++        and any(
++            isinstance(target, ast.Name)
++            and target.id in ("_FUSED_POST_PRE_N_THR", "_FUSED_POST_PRE_MAX_TOKENS")
++            for target in node.targets
++        )
++    )
++]
++dispatch = types.ModuleType("vllm.model_executor.kernels.mhc.tilelang_kernels")
++exec(
++    compile(ast.Module(body=dispatch_nodes, type_ignores=[]), "dispatch", "exec"),
++    dispatch.__dict__,
++)
++
+ 
+ class Pointer:
+     def __init__(self, tensor, offset=0):
+@@ -204,6 +230,106 @@ class SM80ArithmeticTests(unittest.TestCase):
+         context = torch.device("cpu")
+         context.__enter__()
+         self.addCleanup(context.__exit__, None, None, None)
++        modules = patch.dict(sys.modules, {dispatch.__name__: dispatch})
++        modules.start()
++        self.addCleanup(modules.stop)
++
++    def test_fused_projection_preserves_upstream_fp32_seam_and_bf16_storage(self):
++        """Premature BF16 rounding corrupts next mixes, but not the residual ABI."""
++        for rows in (1, 32, 33, 48):
++            with self.subTest(rows=rows):
++                torch.manual_seed(19)
++                r = torch.randn(rows, 4, 5120).bfloat16()
++                x = torch.randn(rows, 5120).bfloat16()
++                post = torch.rand(rows, 4, 1) * 2
++                comb = torch.softmax(torch.randn(rows, 4, 4), -1)
++                fn = torch.randn(24, 20480) / 20480**0.5
++                scale, base = torch.ones(3), torch.randn(24) * 0.1
++                raw = post.double() * x.double().unsqueeze(1) + torch.einsum(
++                    "bij,bih->bjh", comb.double(), r.double()
++                )
++                stored = raw.bfloat16()
++                fused = dispatch.mhc_fused_post_pre_split_config(rows, 5120, 4)
++                projection = raw if fused is not None else stored.double()
++                expected = reference.mhc_pre_delayed_torch(
++                    stored,
++                    fn,
++                    scale,
++                    base,
++                    1e-6,
++                    1e-6,
++                    1e-6,
++                    2.0,
++                    20,
++                    x=projection.flatten(1),
++                    reference_dtype=torch.float64,
++                )
++                actual = kernels.mhc_pre_sm80(
++                    r,
++                    fn,
++                    scale,
++                    base,
++                    1e-6,
++                    1e-6,
++                    1e-6,
++                    2.0,
++                    20,
++                    sublayer_out=x,
++                    post_layer_mix=post,
++                    comb_res_mix=comb,
++                    capture_aux=True,
++                    config=config_module.SM80Config(block_k=2048),
++                )
++                torch.testing.assert_close(actual[0], stored, atol=2e-2, rtol=1e-2)
++                # The same tight FP32 tolerance as the GPU gate.
++                for i in (0, 1, 3):
++                    torch.testing.assert_close(
++                        actual[i + 1].double(),
++                        expected[i].double(),
++                        atol=5e-4,
++                        rtol=1e-3,
++                    )
++                torch.testing.assert_close(actual[3], actual[0][:, 0], atol=0, rtol=0)
++                torch.testing.assert_close(
++                    actual[5], actual[0].mean(1), atol=2e-2, rtol=1e-2
++                )
++
++    def test_gpu_gate_oracle_uses_fused_math_and_accepts_cpu_interpreter(self):
++        tilelang = types.SimpleNamespace(
++            mhc_fused_post_pre_delayed_tilelang=None,
++            mhc_post_tilelang=None,
++            mhc_pre_delayed_tilelang=None,
++        )
++        with patch.dict(
++            sys.modules,
++            {
++                "vllm": fake_vllm,
++                "vllm.model_executor.kernels.mhc.sm80": kernels,
++                "vllm.model_executor.kernels.mhc.sm80_config": config_module,
++                "vllm.model_executor.kernels.mhc.tilelang": tilelang,
++                "vllm.model_executor.kernels.mhc.torch": reference,
++            },
++        ):
++            bench = load_file(
++                "mhc_sm80_cpu_bench", ROOT / "benchmarks/kernels/benchmark_mhc_sm80.py"
++            )
++            for rows, op, width in (
++                (1, "pre", 5120),
++                (1, "pre", 20480),
++                (1, "fused", 20480),
++                (33, "fused", 20480),
++                (1, "post", 5120),
++            ):
++                with self.subTest(rows=rows, op=op, width=width):
++                    _, candidate, oracle, _ = bench.make_case(
++                        rows, op, width, variant="stress", device="cpu"
++                    )
++                    actual = candidate(config_module.SM80Config())
++                    bench.check_close(actual, oracle, op)
++                    self.assertEqual(
++                        len(bench.max_abs_errors(actual, oracle, op)),
++                        6 if op == "fused" else 4 if op == "pre" else 1,
++                    )
+ 
+     def test_actual_kernel_bodies_match_torch_at_real_shapes(self):
+         for rows, width, fused, carried, norm, aux, block in (
+diff --git a/vllm/model_executor/kernels/mhc/sm80.py b/vllm/model_executor/kernels/mhc/sm80.py
+index 64eadfd17c..ed8a2b02c7 100644
+--- a/vllm/model_executor/kernels/mhc/sm80.py
++++ b/vllm/model_executor/kernels/mhc/sm80.py
+@@ -33,8 +33,7 @@ def _post_values(X, R, P, C, row, k, valid, H: tl.constexpr):
+         coeff = tl.load(C + row * 16 + i * 4 + stream, valid, 0)
+         residual = tl.load(R + row * 4 * H + i * H + h, valid, 0).to(tl.float32)
+         value = tl.fma(coeff, residual, value)
+-    # Projection and collapse must both see the serialized BF16 residual.
+-    return value.to(tl.bfloat16).to(tl.float32)
++    return value
+ 
+ 
+ @triton.jit
+@@ -54,6 +53,7 @@ def _project(
+     BK: tl.constexpr,
+     BN: tl.constexpr,
+     POST: tl.constexpr,
++    ROUND_POST: tl.constexpr,
+ ):
+     row = tl.program_id(0)
+     tile = tl.program_id(1)
+@@ -64,6 +64,8 @@ def _project(
+         value = _post_values(X, R, P, C, row, k, k < K, H)
+         if tile == 0:
+             tl.store(R_OUT + row * K + k, value, k < K)
++        if ROUND_POST:
++            value = value.to(tl.bfloat16).to(tl.float32)
+     else:
+         value = tl.load(X + row * K + k, k < K, 0).to(tl.float32)
+     weight = tl.load(
+@@ -208,6 +210,15 @@ def mhc_pre_sm80(
+     """Return the six delayed-seam outputs; standalone pre drops first/last."""
+     rows, _, hidden = residual.shape
+     fused = sublayer_out is not None
++    round_post = False
++    if fused:
++        from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++            mhc_fused_post_pre_split_config,
++        )
++
++        # Upstream's fused seam projects FP32 registers. Its separate post/pre
++        # route projects the stored BF16 residual instead.
++        round_post = mhc_fused_post_pre_split_config(rows, hidden, 4) is None
+     projection = residual.flatten(1) if x is None else x
+     width = projection.shape[1]
+     assert residual.is_contiguous() and residual.dtype == torch.bfloat16
+@@ -264,6 +275,7 @@ def mhc_pre_sm80(
+         config.block_k,
+         config.tile_n,
+         fused,
++        round_post,
+         num_warps=config.num_warps,
+     )
+     _finish[(rows,)](
+diff --git a/vllm/model_executor/kernels/mhc/torch.py b/vllm/model_executor/kernels/mhc/torch.py
+index eb4de35e7c..4f36c6f9a6 100644
+--- a/vllm/model_executor/kernels/mhc/torch.py
++++ b/vllm/model_executor/kernels/mhc/torch.py
+@@ -15,11 +15,15 @@ def mhc_pre_delayed_torch(
+     sinkhorn_repeat: int,
+     pre_mix: torch.Tensor | None = None,
+     x: torch.Tensor | None = None,
++    *,
++    reference_dtype: torch.dtype = torch.float32,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Reference for mHC pre using coefficients from the previous sublayer."""
++    """Reference for delayed pre; optionally evaluate projection/mixes in FP64."""
+     hc_mult = residual.shape[1]
+-    x = (residual.flatten(1) if x is None else x).float()
+-    mixes = (x @ fn.t()) * torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
++    x = (residual.flatten(1) if x is None else x).to(reference_dtype)
++    mixes = (x @ fn.to(reference_dtype).t()) * torch.rsqrt(
++        x.square().mean(-1, keepdim=True) + rms_eps
++    )
+     pre = (
+         torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + hc_pre_eps
+     )
+@@ -40,7 +44,11 @@ def mhc_pre_delayed_torch(
+     layer_input = (
+         residual[:, 0]
+         if pre_mix is None
+-        else (pre_mix.unsqueeze(-1) * residual.float()).sum(dim=1).to(residual.dtype)
++        else (
++            (pre_mix.unsqueeze(-1) * residual.to(reference_dtype))
++            .sum(dim=1)
++            .to(residual.dtype)
++        )
+     )
+     return post.unsqueeze(-1), comb, layer_input, pre
+ 
+-- 
+2.55.0
+

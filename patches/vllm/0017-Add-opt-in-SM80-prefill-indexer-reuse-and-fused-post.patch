@@ -1,0 +1,228 @@
+From e281f9534120a2bbbbc28723b0d995e36647484a Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 20:52:15 +0200
+Subject: [PATCH 17/20] Add opt-in SM80 prefill indexer reuse and fused
+ postprocessing
+
+Reuse BF16 Q and K conversion across row chunks; expose fixed N tiles and keep torch.topk selection while fusing relative-index sorting and padding. All new paths default off.
+
+Origin: Local SM80 prefill optimization
+
+Upstream: Not submitted; operator GPU validation pending
+
+
+Signed-off-by: Adrien Brault <adrien.brault@gmail.com>
+---
+ .../layers/sparse_attn_indexer.py             | 44 +++++++++++---
+ vllm/v1/attention/ops/indexer_prefill_sm80.py | 58 +++++++++++++++++++
+ vllm/v1/attention/ops/mqa_logits_triton.py    | 36 +++++++-----
+ 3 files changed, 117 insertions(+), 21 deletions(-)
+ create mode 100644 vllm/v1/attention/ops/indexer_prefill_sm80.py
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index ef7146ddd5..f478c5536c 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -59,7 +59,7 @@ from vllm.v1.attention.backends.mla.indexer import (
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+ from vllm.v1.attention.ops.mqa_logits_triton import (
+-    fp8_mqa_logits_triton, fp8_paged_mqa_logits_triton,
++    bf16_mqa_logits_triton, fp8_mqa_logits_triton, fp8_paged_mqa_logits_triton,
+ )
+ from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+ from vllm.v1.worker.workspace import current_workspace_manager
+@@ -102,6 +102,13 @@ import os as _os
+ # Row-chunked prefill scoring on the Triton fallback: caps the [rows, N] fp32 logits
+ # transient (the indexer's largest allocation at long context). 0 = off.
+ _DSV4_LOGITS_ROW_CHUNK = int(_os.environ.get("DSV4_LOGITS_ROW_CHUNK", "64"))
++_DSV41_INDEXER_PREDECODE = _os.environ.get("DSV41_INDEXER_PREDECODE", "0") == "1"
++_DSV41_INDEXER_FUSED_POST = _os.environ.get("DSV41_INDEXER_FUSED_POST", "0") == "1"
++_DSV41_INDEXER_BLOCK_N = int(_os.environ.get("DSV41_INDEXER_BLOCK_N", "128"))
++if _DSV4_LOGITS_ROW_CHUNK < 0:
++    raise ValueError("DSV4_LOGITS_ROW_CHUNK must be nonnegative")
++if _DSV41_INDEXER_BLOCK_N not in (64, 128, 256):
++    raise ValueError("DSV41_INDEXER_BLOCK_N must be 64, 128 or 256")
+ 
+ 
+ def _top_k_per_row_prefill_torch(
+@@ -780,14 +787,27 @@ def sparse_attn_indexer(
+                 elif not is_deep_gemm_supported():
+                     assert not use_fp4_cache and q_scale_slice is None
+                     assert dcp_world_size == 1
++                    predecode = (
++                        _DSV41_INDEXER_PREDECODE or _DSV41_INDEXER_BLOCK_N != 128
++                    )
++                    if predecode:
++                        q_bf16 = q_slice.to(torch.bfloat16)
++                        k_bf16 = k_quant_cast.to(torch.bfloat16)
+                     step = _DSV4_LOGITS_ROW_CHUNK or q_slice.shape[0]
+                     for r0 in range(0, q_slice.shape[0], step):
+                         r1 = min(r0 + step, q_slice.shape[0])
+                         ks, ke = cu_seqlen_ks[r0:r1], cu_seqlen_ke[r0:r1]
+-                        logits = fp8_mqa_logits_triton(
+-                            q_slice[r0:r1], (k_quant_cast, k_scale_cast),
+-                            weights[row_start + r0:row_start + r1], ks, ke,
+-                        )
++                        if predecode:
++                            logits = bf16_mqa_logits_triton(
++                                q_bf16[r0:r1], (k_bf16, k_scale_cast),
++                                weights[row_start + r0:row_start + r1], ks, ke,
++                                block_n=_DSV41_INDEXER_BLOCK_N,
++                            )
++                        else:
++                            logits = fp8_mqa_logits_triton(
++                                q_slice[r0:r1], (k_quant_cast, k_scale_cast),
++                                weights[row_start + r0:row_start + r1], ks, ke,
++                            )
+                         candidates = (
+                             candidate_blocks[row_start + r0:row_start + r1]
+                             if candidate_blocks is not None else None
+@@ -796,9 +816,17 @@ def sparse_attn_indexer(
+                             logits, ks, ke, candidates, candidate_block_size,
+                             candidate_write,
+                         )
+-                        _top_k_per_row_prefill_torch(
+-                            logits, ks, ke, topk_indices[r0:r1], topk_tokens,
+-                        )
++                        if _DSV41_INDEXER_FUSED_POST and topk_tokens <= 2048:
++                            from vllm.v1.attention.ops.indexer_prefill_sm80 import (
++                                topk_prefill_sm80,
++                            )
++                            topk_prefill_sm80(
++                                logits, ks, topk_indices[r0:r1], topk_tokens,
++                            )
++                        else:
++                            _top_k_per_row_prefill_torch(
++                                logits, ks, ke, topk_indices[r0:r1], topk_tokens,
++                            )
+                     continue
+                 else:
+                     q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
+diff --git a/vllm/v1/attention/ops/indexer_prefill_sm80.py b/vllm/v1/attention/ops/indexer_prefill_sm80.py
+new file mode 100644
+index 0000000000..d43edb0201
+--- /dev/null
++++ b/vllm/v1/attention/ops/indexer_prefill_sm80.py
+@@ -0,0 +1,58 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact postprocessing of the existing torch.topk selection on SM80."""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _store_sorted_relative_indices(
++    values, columns, starts, output,
++    value_stride: tl.constexpr, column_stride: tl.constexpr,
++    start_stride: tl.constexpr, output_stride: tl.constexpr,
++    K: tl.constexpr, OUT_K: tl.constexpr, BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    i = tl.arange(0, BLOCK)
++    value = tl.load(values + row * value_stride + i, i < K, other=-float("inf"))
++    col = tl.load(columns + row * column_stride + i, i < K, other=0)
++    start = tl.load(starts + row * start_stride)
++    finite = (value == value) & (tl.abs(value) != float("inf"))
++    relative = tl.where((i < K) & finite, (col - start).to(tl.int32), 2147483647)
++    relative = tl.sort(relative, descending=False)
++    relative = tl.where(relative == 2147483647, -1, relative)
++    tl.store(output + row * output_stride + i, relative, i < OUT_K)
++
++
++def topk_prefill_sm80(
++    logits: torch.Tensor,
++    starts: torch.Tensor,
++    output: torch.Tensor,
++    topk: int,
++) -> None:
++    """Select with torch, fuse finite filtering, relative IDs, sorting and padding.
++
++    The caller must supply logits already masked outside each row's causal
++    interval. The SM80 MQA scorer and candidate mask both guarantee this.
++    Keeping torch.topk's default sorted=True preserves its tie selection.
++    """
++    if topk <= 0 or topk > 2048:
++        raise ValueError("SM80 fused top-k postprocessing supports 1..2048 entries")
++    assert logits.ndim == 2 and logits.dtype == torch.float32
++    assert output.shape == (logits.shape[0], topk)
++    assert output.dtype == torch.int32 and output.stride(1) == 1
++    assert starts.shape == (logits.shape[0],)
++    if logits.shape[0] == 0:
++        return
++    k = min(topk, logits.shape[1])
++    if k == 0:
++        output.fill_(-1)
++        return
++    values, columns = logits.topk(k, dim=-1)
++    _store_sorted_relative_indices[(logits.shape[0],)](
++        values, columns, starts, output,
++        values.stride(0), columns.stride(0), starts.stride(0), output.stride(0),
++        K=k, OUT_K=topk, BLOCK=triton.next_power_of_2(topk), num_warps=4,
++    )
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index 41ad181e97..a06404bec2 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -343,24 +343,34 @@ def fp8_mqa_logits_triton(
+     Returns:
+         logits:       [M, N] float32
+     """
++    # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
+     k_fp8, k_scales = kv
+-    k_scales = k_scales.reshape(-1)
+-
+-    M, num_heads, head_dim = q.shape
+-    N = k_fp8.shape[0]
++    return bf16_mqa_logits_triton(
++        q.to(torch.bfloat16), (k_fp8.to(torch.bfloat16), k_scales),
++        weights, cu_seqlen_ks, cu_seqlen_ke,
++    )
+ 
+-    # The grid covers every (m, n_block) and each tile stores its full row
+-    # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
+-    # is accepted for DeepGEMM signature parity only.
+-    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+ 
++def bf16_mqa_logits_triton(
++    q_bf16: torch.Tensor,
++    kv: tuple[torch.Tensor, torch.Tensor],
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    block_n: int = 128,
++) -> torch.Tensor:
++    """Score predecoded inputs, allowing K conversion reuse across row blocks."""
++    if block_n not in (64, 128, 256):
++        raise ValueError("SM80 indexer block_n must be 64, 128 or 256")
++    k_bf16, k_scales = kv
++    assert q_bf16.dtype == k_bf16.dtype == torch.bfloat16
++    k_scales = k_scales.reshape(-1)
++    M, num_heads, head_dim = q_bf16.shape
++    N = k_bf16.shape[0]
++    logits = torch.empty((M, N), dtype=torch.float32, device=q_bf16.device)
+     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
+     BLOCK_D = triton.next_power_of_2(head_dim)
+ 
+-    # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
+-    q_bf16 = q.to(torch.bfloat16)
+-    k_bf16 = k_fp8.to(torch.bfloat16)
+-
+     # Grid depends on the autotuned BLOCK_N.
+     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
+     _fp8_mqa_logits_kernel[grid](
+@@ -383,7 +393,7 @@ def fp8_mqa_logits_triton(
+         num_heads=num_heads,
+         head_dim=head_dim,
+         N=N,
+-        BLOCK_N=128,
++        BLOCK_N=block_n,
+         BLOCK_H=BLOCK_H,
+         BLOCK_D=BLOCK_D,
+         num_warps=4,
+-- 
+2.55.0
+

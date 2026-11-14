@@ -1,0 +1,3434 @@
+Subject: [PATCH] Integrate Curtis White TC-MoE with r7 arenas and fused apply
+
+DeepSeek port and original hook by Curtis White (CurtisAccelerate).
+Kernels by Morrowmake; codec adapted from Turboderp, MIT.
+Compile from source with torch 2.14 / CUDA 13.0; keep coop below 43 rows.
+
+Origin: CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE@88eb6e13de0ea5491579fddb195116a4176f4bc7; r10 integration
+Upstream: Morrowmake/vllm-cmp170hx@18305948acba3f4c4d912cdd56f2202d2ebd94e8
+
+diff --git a/NOTICE b/NOTICE
+--- a/NOTICE
++++ b/NOTICE
+@@ -13,3 +13,12 @@
+     reimplemented as a torch fallback in src/vllm_exl3/exl3.py (Copyright (c) 2025 Turboderp)
+ Their copyright and permission notices are reproduced in THIRD_PARTY_NOTICES.md,
+ which must be retained with any redistribution.
++
++TC-MoE addition (r10):
++DeepSeek V4.1 shape port, dispatch, shared workspace and original hook by
++Curtis White (CurtisAccelerate), from DeepSeekv41-Flash-EXL3-TC-MoE
++88eb6e13de0ea5491579fddb195116a4176f4bc7 (Apache-2.0). Kernels originate
++from Morrowmake/vllm-cmp170hx 18305948acba3f4c4d912cdd56f2202d2ebd94e8.
++EXL3 codec adapted from Turboderp (MIT). Original grants and detailed
++provenance are preserved in src/vllm_exl3/tc_moe/{LICENSE,NOTICE.md,codec.cuh}.
++Local changes: load/apply integration, validation, offline source build and gates.
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -2458,6 +2458,11 @@
+     limit: float | None = None,
+ ) -> torch.Tensor:
+     """One exl3_moe launch per layer, with fat-expert fallback. Supports mixed-K via exl3_moe_mixedk."""
++    from .tc_moe_hook import try_apply as tc_try_apply
++
++    tc_out = tc_try_apply(x2d, ids, weights, layer, expert_map, limit)
++    if tc_out is not None:
++        return tc_out
+     is_mixedk = getattr(layer, "_exl3_mixedk_unified", False)
+     if getattr(layer, "_exl3_mixed_store", None) is not None and not is_mixedk:
+         raise ValueError("EXL3 mixed-K cannot use the uniform-K fused/fat entry point")
+@@ -4050,6 +4055,9 @@
+         store = getattr(layer, "_exl3_mixed_store", None)
+         if store is not None:
+             layer._exl3_inners = store.build_inners(make_linear_exl3)
++            from .tc_moe_hook import try_build as tc_try_build
++
++            tc_try_build(layer, layer._exl3_inners)
+             layer._exl3_ptrs = None
+             logger.info(
+                 "EXL3 tensor-mixed-K: exact-width whole experts=%d, eager reference loop; "
+@@ -4330,6 +4338,9 @@
+                     mixed_k,
+                 )
+             self._logged = True
++        from .tc_moe_hook import try_build as tc_try_build
++
++        tc_try_build(layer, inners)
+         # Release transient load leftovers between MoE layers on UMA hosts.
+         gc.collect()
+         if torch is not None and torch.cuda.is_available():
+diff --git a/src/vllm_exl3/tc_moe/LICENSE b/src/vllm_exl3/tc_moe/LICENSE
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/LICENSE
+@@ -0,0 +1,201 @@
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/src/vllm_exl3/tc_moe/NOTICE.md b/src/vllm_exl3/tc_moe/NOTICE.md
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/NOTICE.md
+@@ -0,0 +1,25 @@
++# Attribution
++
++The DeepSeek V4.1 Flash port, the row dispatch, the shared workspace, the
++EXL3 hook, and the CMP 170HX measurements in this repository are by
++Curtis White (https://github.com/CurtisAccelerate).
++
++The kernels and the host-staged all-reduce started from other people's
++code. This repository does not include their weights.
++
++- Tensor-core EXL3 MoE kernels (`moe_v2`, `moe_prefill`) and the host-staged
++  all-reduce are ported from [Morrowmake/vllm-cmp170hx](https://github.com/Morrowmake/vllm-cmp170hx)
++  at `18305948acba3f4c4d912cdd56f2202d2ebd94e8`, Apache-2.0.
++  The published CMP 170HX recipe those numbers are compared with is
++  [Morrowmake/qwen38-flash-next-cmp170hx-recipe](https://github.com/Morrowmake/qwen38-flash-next-cmp170hx-recipe)
++  release 1.0.0.
++- The EXL3 codec is adapted from [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)
++  revision `d3739fd393337b1ff4d6c2a342b12f0c87a9592f` (MIT). The MIT grant is
++  in `vllm_exl3/tc_moe/codec.cuh`. Copyright (c) 2025 Turboderp.
++- The surrounding engine is [vLLM](https://github.com/vllm-project/vllm), Apache-2.0.
++- Serving measurements used the checkpoint
++  [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-3.0bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-3.0bpw)
++  revision `c5534b90602b4090980a1c3ded1eb3b4d99a38d5` (MIT). Those weights are
++  not in this repository. On the layers that were measured, the trellis last
++  dimension is 48, which is bits_x2 6 (K3), including layers 18 and 22.
++- The model is DeepSeek V4.1 Flash from DeepSeek.
+diff --git a/src/vllm_exl3/tc_moe/build_standalone.py b/src/vllm_exl3/tc_moe/build_standalone.py
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/build_standalone.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Build _dsv41_tc_moe_C (SM 8.0) without importing vLLM and without a GPU.
++
++Flags follow csrc/exl3/build_standalone.py at vllm-cmp170hx@18305948ac, plus
++-Xptxas -v. TORCH_LIBRARY is not stable ABI, so the .so matches this torch.
++"""
++
++import argparse
++import hashlib
++import json
++import subprocess
++import os
++import shutil
++import sys
++import tempfile
++from importlib.machinery import EXTENSION_SUFFIXES
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++NAME = "_dsv41_tc_moe_C"
++SOURCES = ("moe_v2.cu", "moe_prefill.cu", "module.cpp")
++
++
++def build(out: Path, build_dir: Path, verbose: bool) -> None:
++    os.environ["CUDA_VISIBLE_DEVICES"] = ""
++    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
++    os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get(
++        "PATH", ""
++    )
++    import torch
++    from torch.utils import cpp_extension
++
++    print(f"torch {torch.__version__}")
++    print(f"torch.version.cuda {torch.version.cuda}")
++    print(f"CUDA_HOME {cpp_extension.CUDA_HOME}")
++    if torch.version.cuda is None or cpp_extension.CUDA_HOME is None:
++        raise RuntimeError("A CUDA-enabled PyTorch and matching CUDA toolkit are required")
++    if torch.__version__.split("+")[0].split(".")[:2] != ["2", "14"]:
++        raise RuntimeError("r10 requires the server torch 2.14; do not reuse a 2.13 binary")
++    if torch.version.cuda != "13.0":
++        raise RuntimeError("r10 requires the server CUDA 13.0 torch build")
++    nvcc = subprocess.check_output(
++        [str(Path(cpp_extension.CUDA_HOME) / "bin/nvcc"), "--version"], text=True)
++    if "release 13.0," not in nvcc:
++        raise RuntimeError(f"Expected CUDA 13.0 toolkit: {nvcc}")
++    build_dir.mkdir(parents=True, exist_ok=True)
++    out.mkdir(parents=True, exist_ok=True)
++    maps = [
++        f"-ffile-prefix-map={HERE}=vllm_exl3/tc_moe",
++        f"-ffile-prefix-map={build_dir}=build",
++        f"-ffile-prefix-map={Path.home()}=source",
++        f"-ffile-prefix-map={Path(torch.__file__).resolve().parent}=torch",
++    ]
++    defines = ["-DNDEBUG", "-DUSE_CUDA", "-DPy_LIMITED_API=3"]
++    cuda_flags = [
++        "-O3", "-std=c++20", *defines,
++        "--expt-relaxed-constexpr", "--expt-extended-lambda",
++        "-Xptxas=-v",
++        "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
++        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__",
++        *[f"-Xcompiler={flag}" for flag in maps],
++    ]
++    cpp_extension.load(
++        name=NAME,
++        sources=[str(HERE / source) for source in SOURCES],
++        extra_include_paths=[str(HERE)],
++        extra_cuda_cflags=cuda_flags,
++        extra_cflags=["-O3", "-std=gnu++20", *defines, *maps],
++        build_directory=str(build_dir),
++        is_python_module=False,
++        verbose=verbose,
++        with_cuda=True,
++    )
++    source = build_dir / f"{NAME}.so"
++    destination = out / f"{NAME}.abi3.so"
++    with tempfile.NamedTemporaryFile(dir=out, prefix=NAME, suffix=".tmp", delete=False) as f:
++        temporary = Path(f.name)
++    try:
++        shutil.copy2(source, temporary)
++        os.replace(temporary, destination)
++    finally:
++        temporary.unlink(missing_ok=True)
++    for suffix in EXTENSION_SUFFIXES:
++        obsolete = out / (NAME + suffix)
++        if obsolete != destination and obsolete.exists():
++            obsolete.unlink()
++    plain = out / f"{NAME}.so"
++    if plain != destination and plain.exists():
++        plain.unlink()
++    receipt = dict(torch=torch.__version__, cuda=torch.version.cuda,
++                   nvcc=nvcc, arch="sm_80", cxx11_abi=torch._C._GLIBCXX_USE_CXX11_ABI,
++                   sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
++                   sources={p.name: hashlib.sha256(p.read_bytes()).hexdigest()
++                            for p in HERE.iterdir() if p.suffix in (".cu", ".cuh", ".h", ".cpp")})
++    (out / "build.json").write_text(json.dumps(receipt, indent=2) + "\n")
++    print(f"{destination} ({destination.stat().st_size} bytes)")
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--out", type=Path, required=True)
++    parser.add_argument("--build-dir", type=Path, required=True)
++    parser.add_argument("--verbose", action="store_true")
++    args = parser.parse_args()
++    build(args.out.resolve(), args.build_dir.resolve(), args.verbose)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/vllm_exl3/tc_moe/codec.cuh b/src/vllm_exl3/tc_moe/codec.cuh
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/codec.cuh
+@@ -0,0 +1,217 @@
++#pragma once
++
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// The codec implementation below is adapted from turboderp-org/exllamav3 and
++// keeps that project's MIT license. Both grants apply to this file.
++
++/*
++ * EXL3 codec adapted from turboderp-org/exllamav3, revision
++ * d3739fd393337b1ff4d6c2a342b12f0c87a9592f:
++ * quant/{pack.cu,frac.cu,codebook.cuh,exl3_dq.cuh,hadamard_inner.cuh}
++ * and modules/quant/exl3_lib/quantize.py.
++ * Modifications: per-lane eight-state ring window decoder, inverse lane
++ * permutation, BF16 operator integration, and FP32 normalized H128
++ * arithmetic.
++ *
++ * MIT License
++ *
++ * Copyright (c) 2025 Turboderp
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cstdint>
++
++namespace exl3 {
++
++constexpr float kH128Scale = 0.08838834764831845f;
++
++// Every supported (bits_x2, codebook) pair, as one dispatch key.
++constexpr int format_key(int bits_x2, int codebook) { return bits_x2 * 4 + codebook; }
++
++// One 16x16 tile is a ring of 256 * bits_x2 / 2 bits held in 4 * bits_x2
++// MSB-first uint32 words. Encoder lane L (0..31) owns ring states 8L..8L+7;
++// state i is the 16 bits ending at end(i) = (i + 1) * whole + [odd] (i + 1) / 2.
++// A lane's eight states lie in one window that starts at end(8L) - 16, so a
++// lane loads a few consecutive words once and every state offset inside the
++// window is a compile-time constant.
++template <int kBitsX2>
++struct TileRing {
++  static constexpr int kWhole = kBitsX2 / 2;
++  static constexpr bool kOdd = (kBitsX2 & 1) != 0;
++  static constexpr int kRingBits = 128 * kBitsX2;
++  static constexpr int kWords = 4 * kBitsX2;
++  static constexpr int kTileHalfwords = 8 * kBitsX2;
++  // end(8L + j) - end(8L); 8L is even, so the odd-rate term is (j + 1) / 2.
++  static constexpr int rel(int j) { return j * kWhole + (kOdd ? (j + 1) / 2 : 0); }
++  static constexpr int kWindowBits = rel(7) + 16;
++  static constexpr int kWindowWords = (kWindowBits + 31) / 32;
++  // Words to load for the worst in-word start offset of 31 bits.
++  static constexpr int kLoadWords = (31 + kWindowBits + 31) / 32;
++  static_assert(kLoadWords <= kWords, "window exceeds the ring");
++};
++
++// Lane-constant part of the window: first word (relative to the tile) and bit
++// offset inside it. Wrapping uses compare-and-subtract, not integer modulo.
++template <int kBitsX2>
++struct LaneWindow {
++  using Ring = TileRing<kBitsX2>;
++  int word[Ring::kLoadWords];
++  int shift;
++
++  __device__ __forceinline__ explicit LaneWindow(int lane) {
++    int start = (8 * lane + 1) * Ring::kWhole + (Ring::kOdd ? 4 * lane : 0) - 16;
++    if (start < 0) start += Ring::kRingBits;
++    shift = start & 31;
++    int w = start >> 5;
++#pragma unroll
++    for (int i = 0; i < Ring::kLoadWords; ++i) {
++      word[i] = w;
++      w = w + 1 == Ring::kWords ? 0 : w + 1;
++    }
++  }
++};
++
++// pack_trellis swaps 16-bit pairs, leaving MSB-first uint32 ring words made
++// of halfwords 2w (low) and 2w + 1 (high). A tile starts at a multiple of
++// 16 * bits_x2 bytes, so 32-bit loads are aligned whenever the base is.
++__device__ __forceinline__ uint32_t ring_word(const uint16_t* tile, int w, bool aligned) {
++  if (aligned) return __ldg(reinterpret_cast<const uint32_t*>(tile) + w);
++  return uint32_t(__ldg(tile + 2 * w)) | (uint32_t(__ldg(tile + 2 * w + 1)) << 16);
++}
++
++template <int kBitsX2>
++__device__ __forceinline__ void load_lane_words(
++    const uint16_t* tile, const LaneWindow<kBitsX2>& window, bool aligned,
++    uint32_t (&words)[TileRing<kBitsX2>::kLoadWords]) {
++#pragma unroll
++  for (int i = 0; i < TileRing<kBitsX2>::kLoadWords; ++i) {
++    words[i] = ring_word(tile, window.word[i], aligned);
++  }
++}
++
++// The 16-bit state at compile-time bit offset kOffset of the realigned window.
++template <int kOffset, int kWindowWords>
++__device__ __forceinline__ uint32_t window_state(const uint32_t (&u)[kWindowWords]) {
++  constexpr int q = kOffset >> 5;
++  constexpr int r = kOffset & 31;
++  if constexpr (r <= 16) {
++    return (u[q] >> (16 - r)) & 0xffffu;
++  } else {
++    return __funnelshift_l(u[q + 1], u[q], r) >> 16;
++  }
++}
++
++// Two codebook values at once. Each lane computes exactly the scalar
++// codebook arithmetic of the format: FP16 add (mcg) or FP16 fused
++// multiply-add (mul1) with round-to-nearest, then widening to FP32.
++template <int kCodebook>
++__device__ __forceinline__ float2 codebook_pair(uint32_t s0, uint32_t s1) {
++  if constexpr (kCodebook == 1) {
++    const uint32_t m0 = ((s0 * 0xCBAC1FEDu) & 0x8fff8fffu) ^ 0x3b603b60u;
++    const uint32_t m1 = ((s1 * 0xCBAC1FEDu) & 0x8fff8fffu) ^ 0x3b603b60u;
++    const uint32_t lo = __byte_perm(m0, m1, 0x5410);
++    const uint32_t hi = __byte_perm(m0, m1, 0x7632);
++    return __half22float2(__hadd2(*reinterpret_cast<const __half2*>(&lo),
++                                  *reinterpret_cast<const __half2*>(&hi)));
++  } else {
++    // Sum of the four product bytes, 0..1020, placed in the FP16 mantissa
++    // of 1024.0 (0x6400): exactly 1024 + sum.
++    const uint32_t sum0 = __dp4a(s0 * 0x83DCD12Du, 0x01010101u, 0u);
++    const uint32_t sum1 = __dp4a(s1 * 0x83DCD12Du, 0x01010101u, 0u);
++    const uint32_t packed = (sum0 | (sum1 << 16)) + 0x64006400u;
++    const uint32_t scale = 0x1eee1eeeu;
++    const uint32_t bias = 0xc931c931u;
++    return __half22float2(__hfma2(*reinterpret_cast<const __half2*>(&packed),
++                                  *reinterpret_cast<const __half2*>(&scale),
++                                  *reinterpret_cast<const __half2*>(&bias)));
++  }
++}
++
++// Decodes encoder lane `lane`'s eight states. Value j sits at tile row
++// 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1) and tile column
++// (lane >> 2) + 8 * (j >> 2): the inverse of the tensor-core lane permutation.
++template <int kBitsX2, int kCodebook>
++__device__ __forceinline__ void decode_lane(
++    const uint32_t (&words)[TileRing<kBitsX2>::kLoadWords], int shift, float (&value)[8]) {
++  using Ring = TileRing<kBitsX2>;
++  uint32_t u[Ring::kWindowWords];
++#pragma unroll
++  for (int i = 0; i < Ring::kWindowWords; ++i) {
++    const uint32_t next = i + 1 < Ring::kLoadWords ? words[i + 1] : 0u;
++    u[i] = __funnelshift_l(next, words[i], shift);
++  }
++  uint32_t state[8];
++  state[0] = window_state<Ring::rel(0), Ring::kWindowWords>(u);
++  state[1] = window_state<Ring::rel(1), Ring::kWindowWords>(u);
++  state[2] = window_state<Ring::rel(2), Ring::kWindowWords>(u);
++  state[3] = window_state<Ring::rel(3), Ring::kWindowWords>(u);
++  state[4] = window_state<Ring::rel(4), Ring::kWindowWords>(u);
++  state[5] = window_state<Ring::rel(5), Ring::kWindowWords>(u);
++  state[6] = window_state<Ring::rel(6), Ring::kWindowWords>(u);
++  state[7] = window_state<Ring::rel(7), Ring::kWindowWords>(u);
++#pragma unroll
++  for (int j = 0; j < 8; j += 2) {
++    const float2 pair = codebook_pair<kCodebook>(state[j], state[j + 1]);
++    value[j] = pair.x;
++    value[j + 1] = pair.y;
++  }
++}
++
++__device__ __forceinline__ int lane_tile_row(int lane, int j) {
++  return 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1);
++}
++__device__ __forceinline__ int lane_tile_col(int lane, int j) {
++  return (lane >> 2) + 8 * (j >> 2);
++}
++
++// H128 over one 128-value block held by a warp: lane holds elements
++// lane + 32 * i. Standard symmetric Sylvester ordering, distances 1..64 in
++// increasing order, each element computing exactly value + other (lower) or
++// other - value (upper), then the 1/sqrt(128) scale.
++__device__ __forceinline__ void hadamard128_warp(float (&v)[4], int lane) {
++#pragma unroll
++  for (int distance = 1; distance < 32; distance <<= 1) {
++    const bool upper = (lane & distance) != 0;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const float other = __shfl_xor_sync(0xffffffffu, v[i], distance);
++      v[i] = upper ? __fsub_rn(other, v[i]) : __fadd_rn(v[i], other);
++    }
++  }
++#pragma unroll
++  for (int distance = 1; distance < 4; distance <<= 1) {
++    float next[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const float other = v[i ^ distance];
++      next[i] = (i & distance) ? __fsub_rn(other, v[i]) : __fadd_rn(v[i], other);
++    }
++#pragma unroll
++    for (int i = 0; i < 4; ++i) v[i] = next[i];
++  }
++#pragma unroll
++  for (int i = 0; i < 4; ++i) v[i] = __fmul_rn(v[i], kH128Scale);
++}
++
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe/codec_moe_v2.cuh b/src/vllm_exl3/tc_moe/codec_moe_v2.cuh
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/codec_moe_v2.cuh
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++// Codec adapted from turboderp-org/exllamav3 (MIT); the MIT grant is in codec.cuh.
++#pragma once
++
++// Tensor-core forms of the EXL3 codec for the v2 MoE kernels (moe_v2.cu): a
++// lane's decoded tile values as an m16n8k16 A fragment, and the H128
++// transform in FP64. Built on codec.cuh, which this header leaves unchanged.
++
++#include "codec.cuh"
++
++namespace exl3 {
++namespace moe_v2 {
++
++// Two mul1 codebook values at once, as an FP16 pair (low half = s0): the byte
++// sum of the hash placed in the FP16 mantissa of 1024.0 (0x6400, the dp4a
++// accumulator; exactly 1024 + sum < 0x10000, so one byte permute packs the
++// pair), then the format's FP16 fused multiply-add with round-to-nearest.
++// The same values as codebook_pair<2> before its widening to FP32.
++__device__ __forceinline__ uint32_t mul1_half2(uint32_t s0, uint32_t s1) {
++  const uint32_t sum0 = __dp4a(s0 * 0x83DCD12Du, 0x01010101u, 0x6400u);
++  const uint32_t sum1 = __dp4a(s1 * 0x83DCD12Du, 0x01010101u, 0x6400u);
++  const uint32_t packed = __byte_perm(sum0, sum1, 0x5410);
++  const uint32_t scale = 0x1eee1eeeu;
++  const uint32_t bias = 0xc931c931u;
++  const __half2 value = __hfma2(*reinterpret_cast<const __half2*>(&packed),
++                                *reinterpret_cast<const __half2*>(&scale),
++                                *reinterpret_cast<const __half2*>(&bias));
++  return *reinterpret_cast<const uint32_t*>(&value);
++}
++
++// Encoder lane `lane`'s eight 16-bit states from its loaded window words.
++template <int kBitsX2>
++__device__ __forceinline__ void lane_states(
++    const uint32_t (&words)[TileRing<kBitsX2>::kLoadWords], int shift, uint32_t (&state)[8]) {
++  using Ring = TileRing<kBitsX2>;
++  uint32_t u[Ring::kWindowWords];
++#pragma unroll
++  for (int i = 0; i < Ring::kWindowWords; ++i) {
++    const uint32_t next = i + 1 < Ring::kLoadWords ? words[i + 1] : 0u;
++    u[i] = __funnelshift_l(next, words[i], shift);
++  }
++  state[0] = window_state<Ring::rel(0), Ring::kWindowWords>(u);
++  state[1] = window_state<Ring::rel(1), Ring::kWindowWords>(u);
++  state[2] = window_state<Ring::rel(2), Ring::kWindowWords>(u);
++  state[3] = window_state<Ring::rel(3), Ring::kWindowWords>(u);
++  state[4] = window_state<Ring::rel(4), Ring::kWindowWords>(u);
++  state[5] = window_state<Ring::rel(5), Ring::kWindowWords>(u);
++  state[6] = window_state<Ring::rel(6), Ring::kWindowWords>(u);
++  state[7] = window_state<Ring::rel(7), Ring::kWindowWords>(u);
++}
++
++// A lane's eight mul1 values as the m16n8k16 A fragment of W^T (fragment
++// row = tile column = output column, fragment column = tile row = k):
++// {a0a1, a2a3, a4a5, a6a7} = value pairs (0,1), (4,5), (2,3), (6,7) of
++// decode_lane's order.
++template <int kBitsX2>
++__device__ __forceinline__ void decode_lane_fragment_mul1(
++    const uint32_t (&words)[TileRing<kBitsX2>::kLoadWords], int shift, uint32_t (&a)[4]) {
++  uint32_t state[8];
++  lane_states<kBitsX2>(words, shift, state);
++  a[0] = mul1_half2(state[0], state[1]);
++  a[1] = mul1_half2(state[4], state[5]);
++  a[2] = mul1_half2(state[2], state[3]);
++  a[3] = mul1_half2(state[6], state[7]);
++}
++
++// hadamard128_warp in FP64 (scale 1/sqrt(128) rounded to FP64).
++__device__ __forceinline__ void hadamard128_warp_f64(double (&v)[4], int lane) {
++#pragma unroll
++  for (int distance = 1; distance < 32; distance <<= 1) {
++    const bool upper = (lane & distance) != 0;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const double other = __shfl_xor_sync(0xffffffffu, v[i], distance);
++      v[i] = upper ? __dsub_rn(other, v[i]) : __dadd_rn(v[i], other);
++    }
++  }
++#pragma unroll
++  for (int distance = 1; distance < 4; distance <<= 1) {
++    double next[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const double other = v[i ^ distance];
++      next[i] = (i & distance) ? __dsub_rn(other, v[i]) : __dadd_rn(v[i], other);
++    }
++#pragma unroll
++    for (int i = 0; i < 4; ++i) v[i] = next[i];
++  }
++#pragma unroll
++  for (int i = 0; i < 4; ++i) v[i] = __dmul_rn(v[i], 0.08838834764831844055);
++}
++
++}  // namespace moe_v2
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe/common.h b/src/vllm_exl3/tc_moe/common.h
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/common.h
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++
++#include <ATen/MemoryOverlap.h>
++#include <torch/types.h>
++#include <algorithm>
++#include <cstdint>
++#include <initializer_list>
++#include <limits>
++
++namespace exl3 {
++
++inline int64_t checked_add(int64_t a, int64_t b) {
++  TORCH_CHECK(a >= 0 && b >= 0 && a <= std::numeric_limits<int64_t>::max() - b,
++              "EXL3 workspace size overflow");
++  return a + b;
++}
++inline int64_t checked_mul(int64_t a, int64_t b) {
++  TORCH_CHECK(a >= 0 && b >= 0 &&
++                  (b == 0 || a <= std::numeric_limits<int64_t>::max() / b),
++              "EXL3 workspace size overflow");
++  return a * b;
++}
++inline int64_t workspace_elements(int64_t n) {
++  TORCH_CHECK(n <= std::numeric_limits<int64_t>::max() / sizeof(float),
++              "EXL3 workspace byte size overflow");
++  return n;
++}
++inline int64_t padded_size(int64_t n) {
++  TORCH_CHECK(n > 0 && n <= std::numeric_limits<int>::max() - 127,
++              "EXL3 logical dimensions must be positive and fit int32 padding");
++  return (n + 127) / 128 * 128;
++}
++inline void check_padded(int64_t n) {
++  TORCH_CHECK(n > 0 && n % 128 == 0 &&
++                  n <= std::numeric_limits<int>::max(),
++              "EXL3 padded dimensions must be positive H128 multiples fitting int32");
++}
++inline void check_tensor(const torch::Tensor& t, const torch::Tensor& x,
++                         at::ScalarType dtype, const char* name) {
++  TORCH_CHECK(t.is_cuda() && t.device() == x.device(), name,
++              " must be on the input CUDA device");
++  TORCH_CHECK(t.scalar_type() == dtype, name, " has incorrect dtype");
++  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
++}
++inline void check_integer(const torch::Tensor& t, const torch::Tensor& x,
++                          const char* name) {
++  TORCH_CHECK(t.scalar_type() == at::kInt || t.scalar_type() == at::kLong,
++              name, " must have int32 or int64 dtype");
++  check_tensor(t, x, t.scalar_type(), name);
++}
++inline void check_mutations(const torch::Tensor& out,
++                            const torch::Tensor& workspace,
++                            std::initializer_list<const torch::Tensor*> inputs) {
++  at::assert_no_internal_overlap(out);
++  at::assert_no_internal_overlap(workspace);
++  at::assert_no_overlap(out, workspace);
++  for (const auto& input : inputs) {
++    at::assert_no_overlap(out, *input);
++    at::assert_no_overlap(workspace, *input);
++  }
++}
++inline unsigned int launch_blocks(int64_t tasks) {
++  return static_cast<unsigned int>(std::min<int64_t>(tasks, 65535));
++}
++
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe/module.cpp b/src/vllm_exl3/tc_moe/module.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/module.cpp
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++// Codec adapted from turboderp-org/exllamav3 (MIT); the MIT grant is in codec.cuh.
++
++#include "moe_prefill.h"
++#include "moe_v2.h"
++
++#include <Python.h>
++#include <cuda_runtime_api.h>
++#include <torch/library.h>
++#include <torch/version.h>
++
++// TORCH_LIBRARY is not the stable ABI. This library loads only into the
++// PyTorch it was compiled against.
++
++TORCH_LIBRARY(_dsv41_tc_moe_C, m) {
++  m.def("moe_out_v2(Tensor x, Tensor topk_ids, Tensor topk_weights, "
++        "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
++        "int intermediate_size, int bits_x2, float limit, "
++        "Tensor(a!) out, Tensor(b!) workspace) -> ()");
++  m.def("moe_out_prefill(Tensor x, Tensor topk_ids, Tensor topk_weights, "
++        "Tensor packed_ptrs, Tensor packed_meta, Tensor expert_map, "
++        "int intermediate_size, int bits_x2, float limit, "
++        "Tensor(a!) out, Tensor(b!) workspace) -> ()");
++  m.def("moe_workspace_size_v2(int max_rows, int hidden, int intermediate, "
++        "int topk, int local_experts) -> int",
++        &exl3::moe_workspace_size_v2);
++  m.def("moe_workspace_size_prefill(int max_rows, int hidden, int intermediate, "
++        "int topk, int local_experts) -> int",
++        &exl3::moe_workspace_size_prefill);
++}
++
++TORCH_LIBRARY_IMPL(_dsv41_tc_moe_C, CUDA, m) {
++  m.impl("moe_out_v2", &exl3::moe_out_v2);
++  m.impl("moe_out_prefill", &exl3::moe_out_prefill);
++}
++
++namespace {
++
++PyObject* build_info(PyObject*, PyObject*) {
++  return Py_BuildValue("{s:i,s:s,s:i,s:i}", "abi_version", 1, "torch_version",
++                       TORCH_VERSION, "cuda_version", CUDART_VERSION,
++                       "cxx11_abi", _GLIBCXX_USE_CXX11_ABI);
++}
++
++PyMethodDef methods[] = {
++    {"build_info", build_info, METH_NOARGS, "Return the compiled ABI metadata."},
++    {nullptr, nullptr, 0, nullptr},
++};
++
++}  // namespace
++
++PyMODINIT_FUNC PyInit__dsv41_tc_moe_C() {
++  static PyModuleDef module = {PyModuleDef_HEAD_INIT, "_dsv41_tc_moe_C", nullptr, 0,
++                               methods};
++  return PyModule_Create(&module);
++}
+diff --git a/src/vllm_exl3/tc_moe/moe_prefill.cu b/src/vllm_exl3/tc_moe/moe_prefill.cu
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/moe_prefill.cu
+@@ -0,0 +1,1164 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++// Codec adapted from turboderp-org/exllamav3 (MIT); the MIT grant is in codec.cuh.
++//
++// EXL3 routed-expert MoE on the tensor cores for prefill-sized calls.
++// DS V4.1 Flash port of Morrowmake vllm-cmp170hx@18305948ac: hidden 5120,
++// intermediate 640 or 512, bits_x2 6 (K3) or 4 (K2), mul1 codebook (id 2).
++// The host switches on (intermediate, bits_x2). Calls larger than
++// VLLM_EXL3_TC_PREFILL_ROWS (default 2048) run as row sub-chunks on one
++// workspace; rows are independent, so the result matches one call.
++//
++// Arithmetic: the input and activation stages and the combine's per-route
++// transform are FP32; the combine sums the routes' weighted products in FP64
++// and rounds once to FP32, then to BF16. The expert GEMMs run m16n8k16 FP16
++// tensor-core MMAs on exactly decoded weights and a hi/lo FP16 split of the
++// activations. Everything is fixed-order and a row never depends on other rows.
++
++#include "moe_prefill.h"
++#include "common.h"
++#include "codec.cuh"
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAException.h>
++#include <c10/cuda/CUDAGuard.h>
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdlib>
++#include <limits>
++#include <type_traits>
++
++namespace exl3 {
++namespace moe_prefill {
++
++// Hidden is fixed. Intermediate and bits_x2 are the instance template arguments.
++constexpr int kHidden = 5120;
++constexpr int kCodebook = 2;
++// Rows per route tile (expert GEMM block).
++constexpr int kTileRows = 64;
++
++// Integers the route kernel writes into the workspace tail each call:
++//   [0] local assignment count, [1] route tile count, [2..3] unused,
++//   sorted[assignments]: local assignment ids grouped by local expert,
++//   tiles[assignments] (16-byte aligned): {expert, first sorted position, rows, 0},
++//   position[assignments]: sorted position of each assignment (-1: not local).
++struct Layout {
++  static constexpr int64_t kHeader = 4;
++  __host__ __device__ static constexpr int64_t sorted_offset() { return kHeader; }
++  __host__ __device__ static constexpr int64_t tiles_offset(int64_t assignments) {
++    return kHeader + (assignments + 3) / 4 * 4;
++  }
++  __host__ __device__ static constexpr int64_t position_offset(int64_t assignments) {
++    return tiles_offset(assignments) + 4 * assignments;
++  }
++  __host__ __device__ static constexpr int64_t ints(int64_t assignments) {
++    return position_offset(assignments) + assignments;
++  }
++};
++
++namespace {
++
++constexpr int kRouteThreads = 1024;
++constexpr int kOperandWarps = 8;
++
++// Expert GEMM block: kWarps warps, each owning Shape::kTPW adjacent n16 output
++// tiles, over one route tile of up to kTileRows rows; K streamed in kKC chunks,
++// kStages deep.
++constexpr int kWarps = 8;
++constexpr int kThreads = 32 * kWarps;
++constexpr int kKC = 64;
++constexpr int kSteps = kKC / 16;
++constexpr int kStages = 3;
++
++struct Routing {
++  const void* ids;
++  const void* expert_map;
++  const int64_t* pointers;
++  const int64_t* metadata;
++  int64_t global_experts;
++  int64_t local_experts;
++  int64_t topk;
++  bool ids64;
++  bool map64;
++};
++
++__device__ __forceinline__ int64_t integer_at(const void* ptr, bool wide, int64_t i) {
++  return wide ? static_cast<const int64_t*>(ptr)[i] : static_cast<const int32_t*>(ptr)[i];
++}
++__device__ __forceinline__ int64_t local_expert(const Routing& routing, int64_t assignment) {
++  const int64_t global = integer_at(routing.ids, routing.ids64, assignment);
++  if (global < 0 || global >= routing.global_experts) return -1;
++  const int64_t local = integer_at(routing.expert_map, routing.map64, global);
++  return local >= 0 && local < routing.local_experts ? local : -1;
++}
++__device__ __forceinline__ const half* expert_part(const Routing& routing, int64_t expert,
++                                                  int projection, int part) {
++  return reinterpret_cast<const half*>(routing.pointers[expert * 9 + projection * 3 + part]);
++}
++
++// Exclusive block-wide scan of two counters; also returns the totals.
++__device__ __forceinline__ void block_scan2(int a, int b, int& a_before, int& b_before,
++                                            int& a_total, int& b_total) {
++  __shared__ int warp_a[32];
++  __shared__ int warp_b[32];
++  const int lane = threadIdx.x & 31;
++  const int warp = threadIdx.x >> 5;
++  const int warps = blockDim.x >> 5;
++  int x = a;
++  int y = b;
++#pragma unroll
++  for (int d = 1; d < 32; d <<= 1) {
++    const int xu = __shfl_up_sync(0xffffffffu, x, d);
++    const int yu = __shfl_up_sync(0xffffffffu, y, d);
++    if (lane >= d) {
++      x += xu;
++      y += yu;
++    }
++  }
++  if (lane == 31) {
++    warp_a[warp] = x;
++    warp_b[warp] = y;
++  }
++  __syncthreads();
++  if (warp == 0) {
++    int wx = lane < warps ? warp_a[lane] : 0;
++    int wy = lane < warps ? warp_b[lane] : 0;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++      const int xu = __shfl_up_sync(0xffffffffu, wx, d);
++      const int yu = __shfl_up_sync(0xffffffffu, wy, d);
++      if (lane >= d) {
++        wx += xu;
++        wy += yu;
++      }
++    }
++    warp_a[lane] = wx;
++    warp_b[lane] = wy;
++  }
++  __syncthreads();
++  a_before = x - a + (warp > 0 ? warp_a[warp - 1] : 0);
++  b_before = y - b + (warp > 0 ? warp_b[warp - 1] : 0);
++  a_total = warp_a[warps - 1];
++  b_total = warp_b[warps - 1];
++}
++
++// Groups the local assignments by local expert into kTileRows-row tiles and
++// records each assignment's sorted position (one block). Order inside an
++// expert is arbitrary: a row's result never depends on its position. Traps
++// on an expert outside the served format (the caller's host checks cover the
++// shapes; formats and trellis alignment live in device metadata).
++template <int kIntermediate, int kBitsX2>
++__global__ void __launch_bounds__(kRouteThreads)
++route(Routing routing, int64_t assignments, int* table) {
++  extern __shared__ int route_shared[];
++  const int experts = static_cast<int>(routing.local_experts);
++  int* cursor = route_shared;
++  int* row_begin = cursor + experts;
++  int* tile_begin = row_begin + experts;   // experts + 1 entries
++  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
++    cursor[e] = 0;
++    for (int q = 0; q < 3; ++q) {
++      const int64_t* meta = routing.metadata + int64_t(e) * 12 + q * 4;
++      const int64_t in = q < 2 ? kHidden : kIntermediate;
++      const int64_t out = q < 2 ? kIntermediate : kHidden;
++      const uintptr_t trellis = static_cast<uintptr_t>(routing.pointers[int64_t(e) * 9 + q * 3]);
++      if (meta[0] != in || meta[1] != out || meta[2] != kBitsX2 || meta[3] != kCodebook ||
++          (trellis & 15) != 0) {
++        __trap();
++      }
++    }
++  }
++  __syncthreads();
++  for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
++    const int64_t e = local_expert(routing, a);
++    if (e >= 0) atomicAdd(&cursor[e], 1);
++  }
++  __syncthreads();
++  const int per = (experts + blockDim.x - 1) / blockDim.x;
++  const int e0 = min(experts, static_cast<int>(threadIdx.x) * per);
++  const int e1 = min(experts, e0 + per);
++  int rows = 0;
++  int tiles = 0;
++  for (int e = e0; e < e1; ++e) {
++    rows += cursor[e];
++    tiles += (cursor[e] + kTileRows - 1) / kTileRows;
++  }
++  int row_at, tile_at, row_total, tile_total;
++  block_scan2(rows, tiles, row_at, tile_at, row_total, tile_total);
++  for (int e = e0; e < e1; ++e) {
++    const int count = cursor[e];
++    row_begin[e] = row_at;
++    tile_begin[e] = tile_at;
++    cursor[e] = row_at;
++    row_at += count;
++    tile_at += (count + kTileRows - 1) / kTileRows;
++  }
++  if (threadIdx.x == 0) {
++    tile_begin[experts] = tile_total;
++    table[0] = row_total;
++    table[1] = tile_total;
++  }
++  __syncthreads();
++  int4* tile_table = reinterpret_cast<int4*>(table + Layout::tiles_offset(assignments));
++  for (int t = threadIdx.x; t < tile_total; t += blockDim.x) {
++    // Last expert whose first tile is at or before t (empty experts share
++    // their successor's start, so the search lands on the owner).
++    int lo = 0;
++    int hi = experts;
++    while (hi - lo > 1) {
++      const int mid = (lo + hi) >> 1;
++      if (tile_begin[mid] <= t) lo = mid; else hi = mid;
++    }
++    const int first = row_begin[lo] + (t - tile_begin[lo]) * kTileRows;
++    const int end = lo + 1 < experts ? row_begin[lo + 1] : row_total;
++    tile_table[t] = make_int4(lo, first, min(kTileRows, end - first), 0);
++  }
++  int* sorted = table + Layout::sorted_offset();
++  int* position = table + Layout::position_offset(assignments);
++  for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
++    const int64_t e = local_expert(routing, a);
++    int at = -1;
++    if (e >= 0) {
++      at = atomicAdd(&cursor[e], 1);
++      sorted[at] = static_cast<int>(a);
++    }
++    position[a] = at;
++  }
++}
++
++// --------------------------------------------------------------------------
++// Tensor-core operands.
++
++// Exponent e of the power of two that puts max |v| 2^e in [2^14, 2^15), with
++// 2^e and 2^-e normal FP32 (peak 0: e = 0).
++__device__ __forceinline__ int split_exponent(float peak) {
++  const int biased = static_cast<int>(__float_as_uint(peak) >> 23);
++  return peak == 0.0f ? 0 : min(141 - biased, 126);
++}
++__device__ __forceinline__ float pow2(int e) { return __uint_as_float(uint32_t(127 + e) << 23); }
++
++// H128 over one 128-value block held by the 8 lanes of an aligned lane group
++// (l = lane % 8): v[8 h + j] is element 64 h + 8 l + j. Exactly the per-element
++// operations and stage order of hadamard128_warp (distances 1..64 in
++// increasing order, lower element v + other, upper other - v, then the
++// 1/sqrt(128) scale), so the results are bitwise equal; distances 1, 2, 4 and
++// 64 run in registers, 8, 16, 32 by shuffles inside the group (3 shuffle
++// stages instead of 5). Every lane of the warp must call it.
++__device__ __forceinline__ void h128_register_stage(float (&v)[16], int distance) {
++  float next[16];
++#pragma unroll
++  for (int i = 0; i < 16; ++i) {
++    const float other = v[i ^ distance];
++    next[i] = (i & distance) ? __fsub_rn(other, v[i]) : __fadd_rn(v[i], other);
++  }
++#pragma unroll
++  for (int i = 0; i < 16; ++i) v[i] = next[i];
++}
++__device__ __forceinline__ void hadamard128_group(float (&v)[16], int lane) {
++  h128_register_stage(v, 1);
++  h128_register_stage(v, 2);
++  h128_register_stage(v, 4);
++#pragma unroll
++  for (int d = 1; d < 8; d <<= 1) {   // element distance 8 d
++    const bool upper = (lane & d) != 0;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) {
++      const float other = __shfl_xor_sync(0xffffffffu, v[i], d);
++      v[i] = upper ? __fsub_rn(other, v[i]) : __fadd_rn(v[i], other);
++    }
++  }
++  h128_register_stage(v, 8);           // element distance 64
++#pragma unroll
++  for (int i = 0; i < 16; ++i) v[i] = __fmul_rn(v[i], kH128Scale);
++}
++
++// Eight consecutive values as FP32 (exact widening); one 16-byte load when
++// the row base is 16-byte aligned (`vec`), element loads otherwise.
++__device__ __forceinline__ void load8(const __nv_bfloat16* p, bool vec, float* f) {
++  if (vec) {
++    const uint4 u = *reinterpret_cast<const uint4*>(p);
++    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
++#pragma unroll
++    for (int q = 0; q < 4; ++q) {
++      f[2 * q] = __uint_as_float(w[q] << 16);
++      f[2 * q + 1] = __uint_as_float(w[q] & 0xffff0000u);
++    }
++  } else {
++#pragma unroll
++    for (int j = 0; j < 8; ++j) f[j] = __bfloat162float(p[j]);
++  }
++}
++__device__ __forceinline__ void load8(const half* p, bool vec, float* f) {
++  if (vec) {
++    const uint4 u = *reinterpret_cast<const uint4*>(p);
++    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
++#pragma unroll
++    for (int q = 0; q < 4; ++q) {
++      const float2 pair = __half22float2(*reinterpret_cast<const __half2*>(&w[q]));
++      f[2 * q] = pair.x;
++      f[2 * q + 1] = pair.y;
++    }
++  } else {
++#pragma unroll
++    for (int j = 0; j < 8; ++j) f[j] = __half2float(p[j]);
++  }
++}
++// FP32 workspace rows: always 16-byte aligned (checked workspace base, row and
++// column offsets multiples of 8 floats).
++__device__ __forceinline__ void load8(const float* p, float* f) {
++  const float4 a = *reinterpret_cast<const float4*>(p);
++  const float4 b = *reinterpret_cast<const float4*>(p + 4);
++  f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w;
++  f[4] = b.x; f[5] = b.y; f[6] = b.z; f[7] = b.w;
++}
++__device__ __forceinline__ bool aligned16(const void* p) {
++  return (reinterpret_cast<uintptr_t>(p) & 15) == 0;
++}
++
++template <int kVals>
++__device__ __forceinline__ float lane_peak(const float (&v)[kVals]) {
++  float peak = 0.0f;
++#pragma unroll
++  for (int i = 0; i < kVals; ++i) peak = fmaxf(peak, fabsf(v[i]));
++  return peak;
++}
++
++__device__ __forceinline__ uint32_t pack_halves(__half a, __half b) {
++  return uint32_t(__half_as_ushort(a)) | (uint32_t(__half_as_ushort(b)) << 16);
++}
++// Eight consecutive operand values y = v 2^e as the FP16 high halves at `hi`
++// and the FP16-rounded residuals at `lo` (both 16-byte aligned).
++__device__ __forceinline__ void store8_split(const float* v, float scale, __half* hi,
++                                             __half* lo) {
++  uint32_t h[4];
++  uint32_t l[4];
++#pragma unroll
++  for (int q = 0; q < 4; ++q) {
++    const float y0 = __fmul_rn(v[2 * q], scale);
++    const float y1 = __fmul_rn(v[2 * q + 1], scale);
++    const __half h0 = __float2half_rn(y0);
++    const __half h1 = __float2half_rn(y1);
++    h[q] = pack_halves(h0, h1);
++    l[q] = pack_halves(__float2half_rn(__fsub_rn(y0, __half2float(h0))),
++                       __float2half_rn(__fsub_rn(y1, __half2float(h1))));
++  }
++  *reinterpret_cast<uint4*>(hi) = make_uint4(h[0], h[1], h[2], h[3]);
++  *reinterpret_cast<uint4*>(lo) = make_uint4(l[0], l[1], l[2], l[3]);
++}
++
++// One 512-column iteration of x * suh and H128. Recomputed for the store so
++// the kernel does not keep v[10][16] live (that spills). The second pass is
++// the same operations, so the stored halves match a single pass.
++__device__ __forceinline__ void gate_up_block(const __nv_bfloat16* row, const half* suh, bool vec,
++                                             int lane, int lane_col, int it, float (&v)[16]) {
++#pragma unroll
++  for (int h = 0; h < 2; ++h) {
++    const int col = 512 * it + 64 * h + lane_col;
++    float xf[8];
++    float sf[8];
++    load8(row + col, vec, xf);
++    load8(suh + col, vec, sf);
++#pragma unroll
++    for (int j = 0; j < 8; ++j) v[8 * h + j] = __fmul_rn(xf[j], sf[j]);
++  }
++  hadamard128_group(v, lane);
++}
++
++// One warp per (sorted position, gate/up projection): x * suh and H128 (the
++// shipped FP32 operations), then the split operand row (K halves high, then
++// K halves low) and its 2^-e. Lane group g of iteration it holds 128-block
++// 4 it + g. Hidden 5120 is 10 iterations. The peak pass and the store pass
++// recompute each block; the result is bitwise the held-v form.
++__global__ void __launch_bounds__(32 * kOperandWarps)
++gate_up_operand(const __nv_bfloat16* x, Routing routing, const int* table, __half* operand,
++                float* unscale) {
++  constexpr int kIters = kHidden / 512;
++  static_assert(kIters == 10, "hidden 5120");
++  const int lane = threadIdx.x & 31;
++  const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
++  const int* sorted = table + Layout::sorted_offset();
++  const int64_t tasks = int64_t(table[0]) * 2;
++  for (int64_t task = int64_t(blockIdx.x) * kOperandWarps + (threadIdx.x >> 5); task < tasks;
++       task += int64_t(gridDim.x) * kOperandWarps) {
++    const int64_t pos = task >> 1;
++    const int projection = static_cast<int>(task & 1);
++    const int64_t assignment = sorted[pos];
++    const half* suh_row = expert_part(routing, local_expert(routing, assignment), projection, 1);
++    const __nv_bfloat16* row = x + (assignment / routing.topk) * kHidden;
++    const bool vec = aligned16(row) && aligned16(suh_row);
++    float peak = 0.0f;
++#pragma unroll
++    for (int it = 0; it < kIters; ++it) {
++      float v[16];
++      gate_up_block(row, suh_row, vec, lane, lane_col, it, v);
++      peak = fmaxf(peak, lane_peak(v));
++    }
++#pragma unroll
++    for (int d = 16; d >= 1; d >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, d));
++    const int e = split_exponent(peak);
++    const float scale = pow2(e);
++    __half* out = operand + task * 2 * kHidden;
++#pragma unroll
++    for (int it = 0; it < kIters; ++it) {
++      float v[16];
++      gate_up_block(row, suh_row, vec, lane, lane_col, it, v);
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        const int col = 512 * it + 64 * h + lane_col;
++        store8_split(&v[8 * h], scale, out + col, out + kHidden + col);
++      }
++    }
++    if (lane == 0) unscale[pos * 3 + projection] = pow2(-e);
++  }
++}
++
++// Down transform of one value: gate and up output transforms already applied
++// (H128 done), then svh, SiLU(gate) * up and down suh (the shipped FP32
++// operations).
++__device__ __forceinline__ float down_input(float g, float u, float gate_svh, float up_svh,
++                                            float down_suh, float limit) {
++  float gv = __fmul_rn(g, gate_svh);
++  float uv = __fmul_rn(u, up_svh);
++  if (limit > 0.0f) {
++    gv = fminf(gv, limit);
++    uv = fminf(fmaxf(uv, -limit), limit);
++  }
++  const float silu = gv / __fadd_rn(1.0f, expf(-gv));
++  return __fmul_rn(__fmul_rn(silu, uv), down_suh);
++}
++
++// One warp per sorted position: gate and up output transforms (H128, svh),
++// SiLU(gate) * up, down suh, down H128, then the split down operand row and
++// its 2^-e. I = 640 is four lane-group blocks plus a 128-column warp tail.
++// I = 512 is four lane-group blocks and no tail. The peak covers both.
++template <int kIntermediate>
++__global__ void __launch_bounds__(32 * kOperandWarps)
++down_operand(Routing routing, const int* table, const float* gate_up, __half* operand,
++             float* unscale, float limit) {
++  static_assert(kIntermediate == 640 || kIntermediate == 512, "down intermediate");
++  constexpr int kTail = 512;
++  const int lane = threadIdx.x & 31;
++  const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
++  const int* sorted = table + Layout::sorted_offset();
++  const int64_t tasks = table[0];
++  for (int64_t pos = int64_t(blockIdx.x) * kOperandWarps + (threadIdx.x >> 5); pos < tasks;
++       pos += int64_t(gridDim.x) * kOperandWarps) {
++    const int64_t expert = local_expert(routing, sorted[pos]);
++    const half* gate_svh = expert_part(routing, expert, 0, 2);
++    const half* up_svh = expert_part(routing, expert, 1, 2);
++    const half* down_suh = expert_part(routing, expert, 2, 1);
++    const bool vec = aligned16(gate_svh) && aligned16(up_svh) && aligned16(down_suh);
++    const float* gate = gate_up + pos * 2 * kIntermediate;
++    const float* up = gate + kIntermediate;
++
++    float v[16];
++    {
++      float g[16];
++      float u[16];
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        load8(gate + lane_col + 64 * h, &g[8 * h]);
++        load8(up + lane_col + 64 * h, &u[8 * h]);
++      }
++      hadamard128_group(g, lane);
++      hadamard128_group(u, lane);
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        const int col = lane_col + 64 * h;
++        float gs[8];
++        float us[8];
++        float ds[8];
++        load8(gate_svh + col, vec, gs);
++        load8(up_svh + col, vec, us);
++        load8(down_suh + col, vec, ds);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++          v[8 * h + j] = down_input(g[8 * h + j], u[8 * h + j], gs[j], us[j], ds[j], limit);
++        }
++      }
++      hadamard128_group(v, lane);
++    }
++    float w[4] = {};
++    if constexpr (kIntermediate == 640) {
++      float g[4];
++      float u[4];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        g[i] = gate[kTail + lane + 32 * i];
++        u[i] = up[kTail + lane + 32 * i];
++      }
++      hadamard128_warp(g, lane);
++      hadamard128_warp(u, lane);
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const int col = kTail + lane + 32 * i;
++        w[i] = down_input(g[i], u[i], __half2float(gate_svh[col]), __half2float(up_svh[col]),
++                          __half2float(down_suh[col]), limit);
++      }
++      hadamard128_warp(w, lane);
++    }
++
++    float peak = lane_peak(v);
++    if constexpr (kIntermediate == 640) peak = fmaxf(peak, lane_peak(w));
++#pragma unroll
++    for (int d = 16; d >= 1; d >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, d));
++    const int e = split_exponent(peak);
++    const float scale = pow2(e);
++    __half* out = operand + pos * 2 * kIntermediate;
++#pragma unroll
++    for (int h = 0; h < 2; ++h) {
++      const int col = lane_col + 64 * h;
++      store8_split(&v[8 * h], scale, out + col, out + kIntermediate + col);
++    }
++    if constexpr (kIntermediate == 640) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const int k = kTail + lane + 32 * i;
++        const float y = __fmul_rn(w[i], scale);
++        const __half h = __float2half_rn(y);
++        out[k] = h;
++        out[kIntermediate + k] = __float2half_rn(__fsub_rn(y, __half2float(h)));
++      }
++    }
++    if (lane == 0) unscale[pos * 3 + 2] = pow2(-e);
++  }
++}
++
++// --------------------------------------------------------------------------
++// Expert GEMM.
++
++__device__ __forceinline__ uint32_t smem_address(const void* p) {
++  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
++}
++// 16-byte cp.async to a shared-memory address; src_size 0 zero-fills.
++__device__ __forceinline__ void copy16_to(uint32_t dst, const void* src, int src_size) {
++  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src),
++               "r"(src_size));
++}
++__device__ __forceinline__ void copy_commit() { asm volatile("cp.async.commit_group;"); }
++template <int kPending>
++__device__ __forceinline__ void copy_wait() {
++  asm volatile("cp.async.wait_group %0;" ::"n"(kPending));
++}
++// d = A B + c (FP16 in, FP32 accumulate).
++__device__ __forceinline__ void mma(const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
++                                    const float (&c)[4], float (&d)[4]) {
++  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
++      "{%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
++      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
++        "f"(c[2]), "f"(c[3]));
++}
++
++// Two mul1 codebook values as an FP16 pair (low half = s0): exactly
++// codebook_pair<2> before its widening to FP32.
++__device__ __forceinline__ uint32_t mul1_half2(uint32_t s0, uint32_t s1) {
++  const uint32_t sum0 = __dp4a(s0 * 0x83DCD12Du, 0x01010101u, 0x6400u);
++  const uint32_t sum1 = __dp4a(s1 * 0x83DCD12Du, 0x01010101u, 0x6400u);
++  const uint32_t packed = __byte_perm(sum0, sum1, 0x5410);
++  const uint32_t scale = 0x1eee1eeeu;
++  const uint32_t bias = 0xc931c931u;
++  const __half2 value = __hfma2(*reinterpret_cast<const __half2*>(&packed),
++                                *reinterpret_cast<const __half2*>(&scale),
++                                *reinterpret_cast<const __half2*>(&bias));
++  return *reinterpret_cast<const uint32_t*>(&value);
++}
++
++// A lane's eight decoded values as the m16n8k16 A fragment of W^T (fragment
++// row = output column, fragment column = k): value pairs (0,1), (4,5), (2,3),
++// (6,7) of decode_lane's order.
++template <int kBitsX2>
++__device__ __forceinline__ void decode_fragment(const uint32_t (&words)[TileRing<kBitsX2>::kLoadWords],
++                                                int shift, uint32_t (&a)[4]) {
++  using Ring = TileRing<kBitsX2>;
++  uint32_t u[Ring::kWindowWords];
++#pragma unroll
++  for (int i = 0; i < Ring::kWindowWords; ++i) {
++    const uint32_t next = i + 1 < Ring::kLoadWords ? words[i + 1] : 0u;
++    u[i] = __funnelshift_l(next, words[i], shift);
++  }
++  uint32_t s[8];
++  s[0] = window_state<Ring::rel(0), Ring::kWindowWords>(u);
++  s[1] = window_state<Ring::rel(1), Ring::kWindowWords>(u);
++  s[2] = window_state<Ring::rel(2), Ring::kWindowWords>(u);
++  s[3] = window_state<Ring::rel(3), Ring::kWindowWords>(u);
++  s[4] = window_state<Ring::rel(4), Ring::kWindowWords>(u);
++  s[5] = window_state<Ring::rel(5), Ring::kWindowWords>(u);
++  s[6] = window_state<Ring::rel(6), Ring::kWindowWords>(u);
++  s[7] = window_state<Ring::rel(7), Ring::kWindowWords>(u);
++  a[0] = mul1_half2(s[0], s[1]);
++  a[1] = mul1_half2(s[4], s[5]);
++  a[2] = mul1_half2(s[2], s[3]);
++  a[3] = mul1_half2(s[6], s[7]);
++}
++
++struct Gemm {
++  const int* table;
++  int64_t assignments;     // routing table capacity
++  const int64_t* pointers;
++  const __half* operand;   // [pos][projection][hi, lo][k]
++  const float* unscale;    // [pos][3]
++  float* out;              // [pos][projection][n]
++};
++
++// Compile-time GEMM shape: K, N, projections per launch (2: gate and up; 1:
++// down), the first projection's index in the expert's 3 matrices and the n16
++// output tiles per warp (each B fragment feeds TPW decoded A fragments).
++//
++// One stage of the K pipeline: the hi/lo operand rows of the route tile (row
++// = 64 halves in eight 16-byte chunks, chunk c stored at c ^ (row & 7)) at
++// offset 0, then the block's kBlockTiles adjacent trellis tiles of each k16
++// step at kStageW.
++template <int K, int N, int Projections, int First, int TPW, int Bits>
++struct Shape {
++  static constexpr int kK = K;
++  static constexpr int kN = N;
++  static constexpr int kProjections = Projections;
++  static constexpr int kFirst = First;
++  static constexpr int kTPW = TPW;
++  static constexpr int kBitsX2 = Bits;
++  static constexpr int kTileBytes = 16 * Bits;
++  static constexpr int kBlockTiles = kWarps * TPW;
++  static constexpr int kChunks = K / kKC;
++  static constexpr int kColBlocks = N / (16 * kBlockTiles);
++  static constexpr int kTilesN = N / 16;
++  static constexpr int64_t kRowHalves = int64_t(Projections) * 2 * K;
++  static constexpr int64_t kWChunk = int64_t(kSteps) * kTilesN * kTileBytes;
++  static constexpr uint32_t kStageW = 2 * kTileRows * kKC * 2;
++  static constexpr uint32_t kStageBytes = kStageW + kSteps * kBlockTiles * kTileBytes;
++  static constexpr int kSmemBytes = kStages * kStageBytes;
++  static_assert(K % kKC == 0 && N % (16 * kBlockTiles) == 0 && kChunks >= kStages - 1,
++                "served shape");
++  static_assert(kStageBytes % 16 == 0, "16-byte aligned stages");
++};
++
++template <class S>
++__device__ __forceinline__ uint32_t next_stage(uint32_t offset) {
++  return offset + S::kStageBytes == kStages * S::kStageBytes ? 0u : offset + S::kStageBytes;
++}
++__device__ __forceinline__ void ldmatrix4_at(uint32_t address, uint32_t (&r)[4]) {
++  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
++               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++               : "r"(address));
++}
++__device__ __forceinline__ uint32_t lds32(uint32_t address) {
++  uint32_t v;
++  asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(address));
++  return v;
++}
++
++// The K loop and epilogue of one block item for a route tile of kG 8-row
++// groups starting at group kGroup0 (rows in 8 (kGroup0 + kG) - 7 .. 8 kGroup0):
++// straight-line code, so the group MMAs of a k16 step overlap (a runtime group
++// bound made every group a separately serialised branch). The ldmatrix of
++// group g + 1 is issued before the MMAs of group g; each B fragment serves the
++// warp's S::kTPW n16 tiles. Shared addresses are per-lane constants plus the
++// stage offset; `load` issues the next chunk's copies into its own rotating
++// stage. Groups are independent rows, so two sequential passes are bitwise
++// one pass as long as each group still sums in increasing k.
++template <int kG, int kGroup0, class S, class Load>
++__device__ __forceinline__ void run_tile(const Gemm& p, uint32_t smem, Load& load, int rows,
++                                         int first, int pi, int cb) {
++  constexpr int TPW = S::kTPW;
++  const int lane = threadIdx.x & 31;
++  const int warp = threadIdx.x >> 5;
++  using Ring = TileRing<S::kBitsX2>;
++  float sum[TPW][kG][4];
++#pragma unroll
++  for (int j = 0; j < TPW; ++j) {
++#pragma unroll
++    for (int g = 0; g < kG; ++g) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) sum[j][g][i] = 0.0f;
++    }
++  }
++  const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++  // ldmatrix source of this lane: matrix lane / 8 = (hi k0..7, hi k8..15,
++  // lo k0..7, lo k8..15) of rows 8 g + lane % 8; for k16 step s the 16-byte
++  // vector (2 s + lane / 8 % 2) ^ (lane % 8) = 2 s ^ x.
++  const int x = ((lane >> 3) & 1) ^ (lane & 7);
++  const uint32_t b_lane = smem + (lane >> 4) * (kTileRows * kKC * 2) + (lane & 7) * (kKC * 2);
++  // Trellis words of this lane's window in the warp's first tile of step 0.
++  uint32_t w_lane[Ring::kLoadWords];
++  int shift;
++  {
++    const LaneWindow<S::kBitsX2> window(lane);
++    shift = window.shift;
++#pragma unroll
++    for (int i = 0; i < Ring::kLoadWords; ++i) {
++      w_lane[i] = smem + S::kStageW + TPW * warp * S::kTileBytes + 4 * window.word[i];
++    }
++  }
++
++#pragma unroll
++  for (int s = 0; s < kStages - 1; ++s) {
++    load();
++    copy_commit();
++  }
++  uint32_t read = 0;
++  for (int chunk = 0; chunk < S::kChunks; ++chunk) {
++    copy_wait<kStages - 2>();
++    __syncthreads();
++    if (chunk + kStages - 1 < S::kChunks) load();
++    copy_commit();
++#pragma unroll
++    for (int step = 0; step < kSteps; ++step) {
++      uint32_t a[TPW][4];
++#pragma unroll
++      for (int j = 0; j < TPW; ++j) {
++        uint32_t words[Ring::kLoadWords];
++#pragma unroll
++        for (int i = 0; i < Ring::kLoadWords; ++i) {
++          words[i] = lds32(w_lane[i] + read + step * (S::kBlockTiles * S::kTileBytes) +
++                           j * S::kTileBytes);
++        }
++        decode_fragment<S::kBitsX2>(words, shift, a[j]);
++      }
++      const uint32_t bsrc = b_lane + read + ((x ^ (2 * step)) * 16);
++      constexpr uint32_t kGroupBytes = 8 * kKC * 2;
++      uint32_t b[2][4];
++      ldmatrix4_at(bsrc + kGroup0 * kGroupBytes, b[0]);
++#pragma unroll
++      for (int g = 0; g < kG; ++g) {
++        if (g + 1 < kG) {
++          ldmatrix4_at(bsrc + (kGroup0 + g + 1) * kGroupBytes, b[(g + 1) & 1]);
++        }
++        const uint32_t(&bg)[4] = b[g & 1];
++#pragma unroll
++        for (int j = 0; j < TPW; ++j) {
++          // The k16 low products (C = 0, lo magnitude) seed the high MMA, so
++          // one truncating accumulate at hi magnitude per k16; the k16
++          // partial is then summed in FP32 (RN) in increasing k.
++          float d[4];
++          mma(a[j], bg[2], bg[3], zero, d);
++          mma(a[j], bg[0], bg[1], d, d);
++#pragma unroll
++          for (int i = 0; i < 4; ++i) sum[j][g][i] = __fadd_rn(sum[j][g][i], d[i]);
++        }
++      }
++    }
++    read = next_stage<S>(read);
++  }
++
++  // Lane holds output columns 16 tile + lane / 4 (+ 8) of rows 8 g + 2 (lane % 4) (+ 1).
++  const int t = lane & 3;
++#pragma unroll
++  for (int j = 0; j < TPW; ++j) {
++    const int col = (cb * S::kBlockTiles + TPW * warp + j) * 16 + (lane >> 2);
++#pragma unroll
++    for (int g = 0; g < kG; ++g) {
++#pragma unroll
++      for (int c = 0; c < 2; ++c) {
++        const int r = 8 * (kGroup0 + g) + 2 * t + c;
++        if (r < rows) {
++          const int64_t pos = first + r;
++          const float scale = p.unscale[pos * 3 + S::kFirst + pi];
++          float* out = p.out + (pos * S::kProjections + pi) * S::kN + col;
++          out[0] = __fmul_rn(sum[j][g][c], scale);
++          out[8] = __fmul_rn(sum[j][g][2 + c], scale);
++        }
++      }
++    }
++  }
++}
++
++// Block items: (route tile, projection, column block of 16 kBlockTiles), column
++// blocks fastest so concurrently running blocks share the tile's operand rows in L2.
++template <class S>
++__global__ void __launch_bounds__(kThreads, 1) gemm(Gemm p) {
++  extern __shared__ __align__(16) unsigned char gemm_shared[];
++  const uint32_t smem = smem_address(gemm_shared);
++  const int64_t items = int64_t(p.table[1]) * S::kProjections * S::kColBlocks;
++  const int64_t item = blockIdx.x;
++  if (item >= items) return;
++  const int64_t tile_index = item / (S::kProjections * S::kColBlocks);
++  const int rest = static_cast<int>(item % (S::kProjections * S::kColBlocks));
++  const int pi = rest / S::kColBlocks;
++  const int cb = rest % S::kColBlocks;
++  const int4 tile = reinterpret_cast<const int4*>(p.table + Layout::tiles_offset(p.assignments))[tile_index];
++  const int rows = tile.z;
++  const unsigned char* trellis = reinterpret_cast<const unsigned char*>(
++      p.pointers[int64_t(tile.x) * 9 + (S::kFirst + pi) * 3]);
++  const __half* operand =
++      p.operand + int64_t(tile.y) * S::kRowHalves + int64_t(pi) * 2 * S::kK;
++
++  // Per-thread cp.async work of a stage: operand vectors v = tid + kThreads i
++  // (16 bytes: chunk v % 8 of row v / 8 % 64, part v / 512), i.e. rows r0 and
++  // r0 + 32 of both parts at shared offsets 0 / 4096 (row + 32) / 8192 (part
++  // 1), and trellis vectors tid + kThreads j of the block's tiles. Sources
++  // advance by one chunk per load. Rows past the tile's 8-row groups are
++  // never read; rows past the tile inside them are zero-filled from row 0.
++  const int tid = threadIdx.x;
++  static_assert(kThreads == 256 && kTileRows == 64 && kKC == 64, "operand copy layout");
++  constexpr int kStepVectors = S::kBlockTiles * S::kTileBytes / 16;
++  constexpr int kWVectors = kSteps * kStepVectors;
++  constexpr int kWCopies = (kWVectors + kThreads - 1) / kThreads;
++  const int r0 = tid >> 3;
++  const int ck = tid & 7;
++  const int padded_rows = (rows + 7) & ~7;
++  const bool live0 = r0 < padded_rows;
++  const bool live1 = r0 + 32 < padded_rows;
++  const int size0 = r0 < rows ? 16 : 0;
++  const int size1 = r0 + 32 < rows ? 16 : 0;
++  const __half* src0 = operand + int64_t(r0 < rows ? r0 : 0) * S::kRowHalves + ck * 8;
++  const __half* src1 = operand + int64_t(r0 + 32 < rows ? r0 + 32 : 0) * S::kRowHalves + ck * 8;
++  const uint32_t b_dst = smem + r0 * (kKC * 2) + (ck ^ (r0 & 7)) * 16;
++  // The last trellis copy covers only threads tid < kWVectors - (kWCopies - 1) kThreads.
++  const bool w_last_live = tid + (kWCopies - 1) * kThreads < kWVectors;
++  const unsigned char* w_src[kWCopies];
++#pragma unroll
++  for (int j = 0; j < kWCopies; ++j) {
++    const int w = j + 1 < kWCopies || w_last_live ? tid + j * kThreads : tid;
++    w_src[j] = trellis +
++               (int64_t(w / kStepVectors) * S::kTilesN + int64_t(cb) * S::kBlockTiles) * S::kTileBytes +
++               (w % kStepVectors) * 16;
++  }
++  const uint32_t w_dst = smem + S::kStageW + tid * 16;
++  uint32_t stage = 0;
++
++  auto load = [&]() {
++    if (live0) {
++      copy16_to(b_dst + stage, src0, size0);
++      copy16_to(b_dst + stage + 8192, src0 + S::kK, size0);
++    }
++    if (live1) {
++      copy16_to(b_dst + stage + 4096, src1, size1);
++      copy16_to(b_dst + stage + 12288, src1 + S::kK, size1);
++    }
++#pragma unroll
++    for (int j = 0; j < kWCopies; ++j) {
++      if (j + 1 < kWCopies || w_last_live) {
++        copy16_to(w_dst + stage + j * kThreads * 16, w_src[j], 16);
++      }
++      w_src[j] += S::kWChunk;
++    }
++    src0 += kKC;
++    src1 += kKC;
++    stage = next_stage<S>(stage);
++  };
++
++  // Down K2 (TPW 2, bits_x2 4) keeps sum[2][8][4] and spills 8 bytes at the
++  // 255-register cap. Groups are independent rows, so a tile wider than 4
++  // groups runs as two passes of at most 4. Each group still sums in
++  // increasing k, which is bitwise the single pass. The other shapes fit in
++  // one pass; their source snapshots stay out of this function so they do not
++  // pick up the extra live pointers.
++  const int groups = (rows + 7) >> 3;
++  if constexpr (S::kTPW == 2 && S::kBitsX2 == 4) {
++    const __half* const src0_base = src0;
++    const __half* const src1_base = src1;
++    const unsigned char* w_src_base[kWCopies];
++#pragma unroll
++    for (int j = 0; j < kWCopies; ++j) w_src_base[j] = w_src[j];
++    auto rewind = [&]() {
++      copy_wait<0>();
++      __syncthreads();
++      src0 = src0_base;
++      src1 = src1_base;
++#pragma unroll
++      for (int j = 0; j < kWCopies; ++j) w_src[j] = w_src_base[j];
++      stage = 0;
++    };
++    switch (groups) {
++      case 1: run_tile<1, 0, S>(p, smem, load, rows, tile.y, pi, cb); break;
++      case 2: run_tile<2, 0, S>(p, smem, load, rows, tile.y, pi, cb); break;
++      case 3: run_tile<3, 0, S>(p, smem, load, rows, tile.y, pi, cb); break;
++      case 4: run_tile<4, 0, S>(p, smem, load, rows, tile.y, pi, cb); break;
++      case 5:
++        run_tile<4, 0, S>(p, smem, load, rows, tile.y, pi, cb);
++        rewind();
++        run_tile<1, 4, S>(p, smem, load, rows, tile.y, pi, cb);
++        break;
++      case 6:
++        run_tile<4, 0, S>(p, smem, load, rows, tile.y, pi, cb);
++        rewind();
++        run_tile<2, 4, S>(p, smem, load, rows, tile.y, pi, cb);
++        break;
++      case 7:
++        run_tile<4, 0, S>(p, smem, load, rows, tile.y, pi, cb);
++        rewind();
++        run_tile<3, 4, S>(p, smem, load, rows, tile.y, pi, cb);
++        break;
++      case 8:
++        run_tile<4, 0, S>(p, smem, load, rows, tile.y, pi, cb);
++        rewind();
++        run_tile<4, 4, S>(p, smem, load, rows, tile.y, pi, cb);
++        break;
++      default: break;
++    }
++  } else {
++    switch (groups) {
++#define EXL3_GROUPS(G) \
++      case G: run_tile<G, 0, S>(p, smem, load, rows, tile.y, pi, cb); break;
++      EXL3_GROUPS(1) EXL3_GROUPS(2) EXL3_GROUPS(3) EXL3_GROUPS(4)
++      EXL3_GROUPS(5) EXL3_GROUPS(6) EXL3_GROUPS(7) EXL3_GROUPS(8)
++#undef EXL3_GROUPS
++      default: break;
++    }
++  }
++}
++
++// Eight consecutive sums: one 16-byte store per 8 BF16 when the output base
++// is 16-byte aligned, element stores otherwise.
++__device__ __forceinline__ void store8_sum(__nv_bfloat16* out, bool vec, const float* sum) {
++  if (vec) {
++    uint32_t w[4];
++#pragma unroll
++    for (int q = 0; q < 4; ++q) {
++      w[q] = uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(sum[2 * q]))) |
++             (uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(sum[2 * q + 1]))) << 16);
++    }
++    *reinterpret_cast<uint4*>(out) = make_uint4(w[0], w[1], w[2], w[3]);
++  } else {
++#pragma unroll
++    for (int j = 0; j < 8; ++j) out[j] = __float2bfloat16_rn(sum[j]);
++  }
++}
++// One warp per (token, 512-column span; lane group g holds 128-block g of the
++// span): each local route's down output transform (H128, svh) in the shipped
++// FP32 operations, then its routing-weight product summed in FP64 in route
++// order and rounded to FP32 once, then to BF16 (round to nearest even). The
++// route loop is warp-uniform.
++template <typename Out>
++__global__ void combine(const float* down, const float* weights, Routing routing,
++                        const int* table, int64_t assignments, int64_t rows, Out* out) {
++  constexpr int kSpans = kHidden / 512;
++  static_assert(kSpans == 10, "hidden 5120 is ten 512-column spans");
++  const int lane = threadIdx.x & 31;
++  const int lane_col = 128 * (lane >> 3) + 8 * (lane & 7);
++  const int* position = table + Layout::position_offset(assignments);
++  const bool out_vec = aligned16(out);
++  // One task per warp (no grid-stride loop), so the shuffles are in provably
++  // converged code (a task loop makes ptxas call a WARPSYNC stub per shuffle).
++  {
++    const int64_t task = int64_t(blockIdx.x) * kOperandWarps + (threadIdx.x >> 5);
++    if (task >= rows * kSpans) return;
++    const int64_t row = task / kSpans;
++    const int base = static_cast<int>(task % kSpans) * 512 + lane_col;
++    double sum[16];
++#pragma unroll
++    for (int i = 0; i < 16; ++i) sum[i] = 0.0;
++    for (int64_t route = 0; route < routing.topk; ++route) {
++      const int64_t assignment = row * routing.topk + route;
++      const int pos = position[assignment];
++      if (pos < 0) continue;
++      const half* svh = expert_part(routing, local_expert(routing, assignment), 2, 2);
++      const bool vec = aligned16(svh);
++      const double weight = weights[assignment];
++      const float* src = down + int64_t(pos) * kHidden + base;
++      float v[16];
++      load8(src, v);
++      load8(src + 64, v + 8);
++      hadamard128_group(v, lane);
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        float s[8];
++        load8(svh + base + 64 * h, vec, s);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++          const double value = __fmul_rn(v[8 * h + j], s[j]);
++          sum[8 * h + j] = fma(value, weight, sum[8 * h + j]);
++        }
++      }
++    }
++    float rounded[16];
++#pragma unroll
++    for (int i = 0; i < 16; ++i) rounded[i] = __double2float_rn(sum[i]);
++    Out* dst = out + row * kHidden + base;
++    store8_sum(dst, out_vec, rounded);
++    store8_sum(dst + 64, out_vec, rounded + 8);
++  }
++}
++
++unsigned int warp_grid(int64_t tasks) {
++  return static_cast<unsigned int>(
++      std::min<int64_t>((tasks + kOperandWarps - 1) / kOperandWarps, 65535));
++}
++
++template <class S>
++void launch_gemm(const Gemm& p, int64_t max_items, cudaStream_t stream) {
++  static const bool configured = [] {
++    C10_CUDA_CHECK(cudaFuncSetAttribute(gemm<S>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                        S::kSmemBytes));
++    return true;
++  }();
++  (void)configured;
++  TORCH_CHECK(max_items <= std::numeric_limits<int>::max(), "EXL3 MoE prefill grid too large");
++  gemm<S><<<static_cast<unsigned int>(max_items), kThreads, S::kSmemBytes, stream>>>(p);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++bool served_shape(int64_t hidden, int64_t intermediate) {
++  return hidden == kHidden && (intermediate == 640 || intermediate == 512);
++}
++
++template <int kIntermediate>
++int64_t workspace_count(int64_t assignments) {
++  const int64_t operand = assignments * 2 * 2 * kHidden / 2;   // FP16 gate/up rows (later down)
++  const int64_t gate_up = assignments * 2 * kIntermediate;
++  const int64_t unscale = (assignments * 3 + 3) / 4 * 4;
++  return operand + gate_up + unscale + (Layout::ints(assignments) + 3) / 4 * 4;
++}
++
++int64_t prefill_row_cap() {
++  const char* env = std::getenv("VLLM_EXL3_TC_PREFILL_ROWS");
++  if (env == nullptr || env[0] == '\0') return 2048;
++  char* end = nullptr;
++  const long value = std::strtol(env, &end, 10);
++  if (end == env || *end != '\0' || value < 1) return 2048;
++  return value;
++}
++
++// One row sub-chunk. Rows do not depend on each other, so several chunks on
++// the same workspace match one call.
++template <int kIntermediate, int kBitsX2>
++void run_chunk(const __nv_bfloat16* x, const void* ids, bool ids64, const float* weights,
++               const void* expert_map, bool map64, int64_t global_experts,
++               const int64_t* pointers, const int64_t* metadata, int64_t local_experts,
++               int64_t rows, int64_t topk, float limit, __nv_bfloat16* out, float* workspace,
++               cudaStream_t stream) {
++  using GateUpShape = Shape<kHidden, kIntermediate, 2, 0, 1, kBitsX2>;
++  using DownShape = Shape<kIntermediate, kHidden, 1, 2, 2, kBitsX2>;
++  const int64_t assignments = rows * topk;
++  Routing routing{ids, expert_map, pointers, metadata, global_experts, local_experts, topk,
++                  ids64, map64};
++  __half* operand = reinterpret_cast<__half*>(workspace);
++  float* down_result = workspace + assignments * kIntermediate;
++  float* gate_up = workspace + assignments * 2 * kHidden;
++  float* unscale = gate_up + assignments * 2 * kIntermediate;
++  int* table = reinterpret_cast<int*>(unscale + (assignments * 3 + 3) / 4 * 4);
++  route<kIntermediate, kBitsX2>
++      <<<1, kRouteThreads, (3 * local_experts + 1) * sizeof(int), stream>>>(routing, assignments,
++                                                                           table);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  const int64_t max_tiles = std::min<int64_t>(
++      assignments, assignments / kTileRows + std::min<int64_t>(local_experts, assignments) + 1);
++  gate_up_operand<<<warp_grid(2 * assignments), 32 * kOperandWarps, 0, stream>>>(
++      x, routing, table, operand, unscale);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  Gemm p{};
++  p.table = table;
++  p.assignments = assignments;
++  p.pointers = pointers;
++  p.operand = operand;
++  p.unscale = unscale;
++  p.out = gate_up;
++  launch_gemm<GateUpShape>(p, max_tiles * GateUpShape::kProjections * GateUpShape::kColBlocks,
++                           stream);
++  down_operand<kIntermediate><<<warp_grid(assignments), 32 * kOperandWarps, 0, stream>>>(
++      routing, table, gate_up, operand, unscale, limit);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  p.out = down_result;
++  launch_gemm<DownShape>(p, max_tiles * DownShape::kProjections * DownShape::kColBlocks, stream);
++  const int64_t combine_blocks = (rows * (kHidden / 512) + kOperandWarps - 1) / kOperandWarps;
++  TORCH_CHECK(combine_blocks <= std::numeric_limits<int>::max(), "EXL3 MoE prefill grid too large");
++  const unsigned int grid = static_cast<unsigned int>(combine_blocks);
++  combine<<<grid, 32 * kOperandWarps, 0, stream>>>(down_result, weights, routing, table,
++                                                   assignments, rows, out);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace moe_prefill
++
++int64_t moe_workspace_size_prefill(int64_t max_rows, int64_t hidden_size,
++                                   int64_t intermediate_size, int64_t topk,
++                                   int64_t local_experts) {
++  TORCH_CHECK(max_rows >= 0 && topk >= 0 && local_experts >= 0,
++              "EXL3 rows/topk/local_experts must be nonnegative");
++  TORCH_CHECK(moe_prefill::served_shape(hidden_size, intermediate_size),
++              "EXL3 MoE prefill covers hidden 5120 and intermediate 640 or 512 only");
++  if (local_experts == 0) return 0;
++  const int64_t assignments = checked_mul(max_rows, topk);
++  TORCH_CHECK(assignments <= std::numeric_limits<int>::max(),
++              "EXL3 MoE has too many routed assignments");
++  const int64_t count = intermediate_size == 640
++                            ? moe_prefill::workspace_count<640>(assignments)
++                            : moe_prefill::workspace_count<512>(assignments);
++  return workspace_elements(count);
++}
++
++void moe_out_prefill(const torch::Tensor& x, const torch::Tensor& topk_ids,
++                     const torch::Tensor& topk_weights,
++                     const torch::Tensor& packed_ptrs,
++                     const torch::Tensor& packed_meta,
++                     const torch::Tensor& expert_map, int64_t intermediate_size,
++                     int64_t bits_x2, double limit,
++                     torch::Tensor& out, torch::Tensor& workspace) {
++  TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
++  check_tensor(x, x, at::kBFloat16, "x");
++  check_integer(topk_ids, x, "topk_ids");
++  check_integer(expert_map, x, "expert_map");
++  check_tensor(topk_weights, x, at::kFloat, "topk_weights");
++  check_tensor(packed_ptrs, x, at::kLong, "packed_ptrs");
++  check_tensor(packed_meta, x, at::kLong, "packed_meta");
++  check_tensor(out, x, at::kBFloat16, "out");
++  check_tensor(workspace, x, at::kFloat, "workspace");
++  TORCH_CHECK(x.dim() == 2 && out.dim() == 2 && topk_ids.dim() == 2 &&
++                  topk_weights.dim() == 2 && expert_map.dim() == 1 &&
++                  packed_ptrs.dim() == 3 && packed_meta.dim() == 3,
++              "EXL3 MoE tensor ranks mismatch");
++  const int64_t rows = x.size(0);
++  const int64_t hidden = x.size(1);
++  const int64_t topk = topk_ids.size(1);
++  const int64_t experts = packed_ptrs.size(0);
++  TORCH_CHECK(topk_ids.size(0) == rows && topk_weights.sizes() == topk_ids.sizes() &&
++                  out.sizes() == x.sizes(), "EXL3 MoE row/topk/output geometry mismatch");
++  TORCH_CHECK(packed_ptrs.size(1) == 3 && packed_ptrs.size(2) == 3 &&
++                  packed_meta.size(0) == experts && packed_meta.size(1) == 3 &&
++                  packed_meta.size(2) == 4, "EXL3 MoE pointer/metadata geometry mismatch");
++  TORCH_CHECK(experts > 0 && experts <= kMoePrefillMaxExperts,
++              "EXL3 MoE prefill needs 1..", kMoePrefillMaxExperts, " local experts");
++  TORCH_CHECK(rows == 0 || rows >= kMoePrefillMinRows,
++              "EXL3 MoE prefill serves calls of at least ", kMoePrefillMinRows, " rows");
++  TORCH_CHECK((intermediate_size == 640 || intermediate_size == 512) &&
++                  (bits_x2 == 6 || bits_x2 == 4) && hidden == 5120,
++              "EXL3 TC MoE prefill supports hidden 5120 and (intermediate, bits_x2) in "
++              "{(640,6),(512,6),(640,4),(512,4)} only");
++  const int64_t cap = moe_prefill::prefill_row_cap();
++  const int64_t chunk_rows = rows == 0 ? 0 : std::min(rows, cap);
++  const int64_t required =
++      moe_workspace_size_prefill(chunk_rows, hidden, intermediate_size, topk, experts);
++  TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
++  TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 16 == 0,
++              "EXL3 MoE workspace must be 16-byte aligned");
++  check_mutations(out, workspace,
++                  {&x, &topk_ids, &topk_weights, &packed_ptrs, &packed_meta, &expert_map});
++  if (rows == 0) return;
++  const c10::cuda::CUDAGuard guard(x.device());
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
++  const bool ids64 = topk_ids.scalar_type() == at::kLong;
++  const bool map64 = expert_map.scalar_type() == at::kLong;
++  const auto* x_base = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
++  const char* ids_base = static_cast<const char*>(topk_ids.data_ptr());
++  const size_t id_bytes = static_cast<size_t>(topk_ids.element_size());
++  const float* weight_base = topk_weights.data_ptr<float>();
++  auto* out_base = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
++  const auto launch = [&](auto intermediate, auto bits) {
++    constexpr int kI = decltype(intermediate)::value;
++    constexpr int kBits = decltype(bits)::value;
++    for (int64_t done = 0; done < rows;) {
++      const int64_t n = std::min(cap, rows - done);
++      moe_prefill::run_chunk<kI, kBits>(
++          x_base + done * hidden, ids_base + done * topk * id_bytes, ids64,
++          weight_base + done * topk, expert_map.data_ptr(), map64, expert_map.numel(),
++          packed_ptrs.data_ptr<int64_t>(), packed_meta.data_ptr<int64_t>(), experts, n, topk,
++          static_cast<float>(limit), out_base + done * hidden, workspace.data_ptr<float>(),
++          stream);
++      done += n;
++    }
++  };
++  if (intermediate_size == 640 && bits_x2 == 6) {
++    launch(std::integral_constant<int, 640>{}, std::integral_constant<int, 6>{});
++  } else if (intermediate_size == 512 && bits_x2 == 6) {
++    launch(std::integral_constant<int, 512>{}, std::integral_constant<int, 6>{});
++  } else if (intermediate_size == 640 && bits_x2 == 4) {
++    launch(std::integral_constant<int, 640>{}, std::integral_constant<int, 4>{});
++  } else {
++    launch(std::integral_constant<int, 512>{}, std::integral_constant<int, 4>{});
++  }
++}
++
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe/moe_prefill.h b/src/vllm_exl3/tc_moe/moe_prefill.h
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/moe_prefill.h
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++
++#include <torch/types.h>
++
++#include <cstdint>
++
++namespace exl3 {
++
++constexpr int64_t kMoePrefillMinRows = 65;
++constexpr int64_t kMoePrefillMaxExperts = 4096;
++
++int64_t moe_workspace_size_prefill(int64_t max_rows, int64_t hidden_size,
++                                   int64_t intermediate_size, int64_t topk,
++                                   int64_t local_experts);
++
++void moe_out_prefill(const torch::Tensor& x, const torch::Tensor& topk_ids,
++                     const torch::Tensor& topk_weights,
++                     const torch::Tensor& packed_ptrs,
++                     const torch::Tensor& packed_meta,
++                     const torch::Tensor& expert_map, int64_t intermediate_size,
++                     int64_t bits_x2, double limit, torch::Tensor& out,
++                     torch::Tensor& workspace);
++
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe/moe_v2.cu b/src/vllm_exl3/tc_moe/moe_v2.cu
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/moe_v2.cu
+@@ -0,0 +1,1122 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++// Codec adapted from turboderp-org/exllamav3 (MIT); the MIT grant is in codec.cuh.
++//
++// EXL3 routed-expert MoE on the tensor cores for decode-sized calls.
++// DS V4.1 Flash port of Morrowmake vllm-cmp170hx@18305948ac: hidden 5120,
++// intermediate 640 or 512, bits_x2 6 (K3) or 4 (K2), mul1 codebook (id 2).
++// The host switches on (intermediate, bits_x2); any other pair is a
++// TORCH_CHECK failure. Arithmetic is the pinned kernel's: m16n8k16 FP16 MMAs
++// on exactly decoded weights, a hi/lo FP16 split of the scaled activations,
++// and FP64 input, activation and combine stages. Results are deterministic
++// and a row never depends on other rows.
++
++#include "moe_v2.h"
++#include "common.h"
++#include "codec_moe_v2.cuh"
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAException.h>
++
++#include <limits>
++#include <type_traits>
++
++namespace exl3 {
++namespace moe_v2 {
++namespace {
++
++// The route + gate/up operand launch (block 0 routes with these threads; the
++// other blocks run one warp per H128 block of a row).
++constexpr int kRouteInputThreads = 640;
++// Route kernel shared memory: three int arrays per local expert.
++constexpr int64_t kMaxRouteExperts = 4096;
++
++// Integers the route kernel writes into the workspace each call:
++//   [0] local assignment count, [1] row-tile count, [2..3] unused,
++//   sorted[assignments]: local assignment ids grouped by local expert,
++//   tiles[assignments] (16-byte aligned): {expert, first sorted index, rows, 0},
++//   experts[assignments]: the local expert of each sorted entry,
++//   by_assignment[assignments]: the local expert of each assignment (-1: none),
++//   tile_trellis[assignments][3] (int64), tile_columns[assignments][3]: per row
++//   tile and projection the trellis address and padded_out / 16.
++struct RouteLayout {
++  static constexpr int64_t kHeader = 4;
++  __host__ __device__ static constexpr int64_t sorted_offset() { return kHeader; }
++  __host__ __device__ static constexpr int64_t tiles_offset(int64_t assignments) {
++    return kHeader + (assignments + 3) / 4 * 4;
++  }
++  __host__ __device__ static constexpr int64_t experts_offset(int64_t assignments) {
++    return tiles_offset(assignments) + 4 * assignments;
++  }
++  __host__ __device__ static constexpr int64_t by_assignment_offset(int64_t assignments) {
++    return experts_offset(assignments) + assignments;
++  }
++  // Per row tile and projection: the expert's trellis address (int64, 8-byte
++  // aligned) and its tile columns (padded_out / 16).
++  __host__ __device__ static constexpr int64_t tile_trellis_offset(int64_t assignments) {
++    return (by_assignment_offset(assignments) + assignments + 1) / 2 * 2;
++  }
++  __host__ __device__ static constexpr int64_t tile_columns_offset(int64_t assignments) {
++    return tile_trellis_offset(assignments) + 2 * 3 * assignments;
++  }
++  __host__ __device__ static constexpr int64_t ints(int64_t assignments) {
++    return tile_columns_offset(assignments) + 3 * assignments;
++  }
++};
++
++struct Routing {
++  const void* ids;
++  const void* expert_map;
++  const int64_t* pointers;
++  const int64_t* metadata;
++  int64_t global_experts;
++  int64_t local_experts;
++  int64_t topk;
++  bool ids64;
++  bool map64;
++};
++
++__device__ __forceinline__ int64_t integer_at(const void* ptr, bool wide, int64_t i) {
++  return wide ? static_cast<const int64_t*>(ptr)[i]
++              : static_cast<const int32_t*>(ptr)[i];
++}
++__device__ __forceinline__ int64_t local_expert(const Routing& routing, int64_t assignment) {
++  const int64_t global = integer_at(routing.ids, routing.ids64, assignment);
++  if (global < 0 || global >= routing.global_experts) return -1;
++  const int64_t local = integer_at(routing.expert_map, routing.map64, global);
++  return local >= 0 && local < routing.local_experts ? local : -1;
++}
++// [trellis, suh, svh] of one projection of one local expert.
++__device__ __forceinline__ const int64_t* expert_pointers(const Routing& routing,
++                                                          int64_t expert, int projection) {
++  return routing.pointers + expert * 9 + projection * 3;
++}
++__device__ __forceinline__ const half* expert_suh(const Routing& routing, int64_t expert,
++                                                  int projection) {
++  return reinterpret_cast<const half*>(expert_pointers(routing, expert, projection)[1]);
++}
++__device__ __forceinline__ const half* expert_svh(const Routing& routing, int64_t expert,
++                                                  int projection) {
++  return reinterpret_cast<const half*>(expert_pointers(routing, expert, projection)[2]);
++}
++
++// Exclusive block-wide scan of two counters; also returns the totals.
++__device__ __forceinline__ void block_scan2(int a, int b, int& a_before, int& b_before,
++                                            int& a_total, int& b_total) {
++  __shared__ int warp_a[32];
++  __shared__ int warp_b[32];
++  const int lane = threadIdx.x & 31;
++  const int warp = threadIdx.x >> 5;
++  const int warps = blockDim.x >> 5;
++  int x = a;
++  int y = b;
++#pragma unroll
++  for (int d = 1; d < 32; d <<= 1) {
++    const int xu = __shfl_up_sync(0xffffffffu, x, d);
++    const int yu = __shfl_up_sync(0xffffffffu, y, d);
++    if (lane >= d) {
++      x += xu;
++      y += yu;
++    }
++  }
++  if (lane == 31) {
++    warp_a[warp] = x;
++    warp_b[warp] = y;
++  }
++  __syncthreads();
++  if (warp == 0) {
++    int wx = lane < warps ? warp_a[lane] : 0;
++    int wy = lane < warps ? warp_b[lane] : 0;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++      const int xu = __shfl_up_sync(0xffffffffu, wx, d);
++      const int yu = __shfl_up_sync(0xffffffffu, wy, d);
++      if (lane >= d) {
++        wx += xu;
++        wy += yu;
++      }
++    }
++    warp_a[lane] = wx;
++    warp_b[lane] = wy;
++  }
++  __syncthreads();
++  a_before = x - a + (warp > 0 ? warp_a[warp - 1] : 0);
++  b_before = y - b + (warp > 0 ? warp_b[warp - 1] : 0);
++  a_total = warp_a[warps - 1];
++  b_total = warp_b[warps - 1];
++}
++
++// Groups the local assignments by local expert into tiles of up to
++// block_rows rows (one block, every call), records each sorted entry's
++// expert and each assignment's expert, and each row tile's trellis address
++// and tile columns per projection. Order inside an expert is arbitrary: each
++// assignment's result depends only on its own row, never on its position or
++// neighbours.
++template <int kIntermediate, int kBitsX2>
++__device__ __forceinline__ void route_block(const Routing& routing, int64_t assignments,
++                                            int block_rows, int* table) {
++  extern __shared__ int route_shared[];
++  const int experts = static_cast<int>(routing.local_experts);
++  int* cursor = route_shared;              // counts, then fill cursors
++  int* row_begin = cursor + experts;
++  int* tile_begin = row_begin + experts;   // experts + 1 entries
++  for (int e = threadIdx.x; e < experts; e += blockDim.x) cursor[e] = 0;
++  __syncthreads();
++  int* by_assignment = table + RouteLayout::by_assignment_offset(assignments);
++  for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
++    const int64_t e = local_expert(routing, a);
++    by_assignment[a] = static_cast<int>(e);
++    if (e >= 0) atomicAdd(&cursor[e], 1);
++  }
++  __syncthreads();
++  const int per = (experts + blockDim.x - 1) / blockDim.x;
++  const int e0 = min(experts, static_cast<int>(threadIdx.x) * per);
++  const int e1 = min(experts, e0 + per);
++  int rows = 0;
++  int tiles = 0;
++  for (int e = e0; e < e1; ++e) {
++    rows += cursor[e];
++    tiles += (cursor[e] + block_rows - 1) / block_rows;
++  }
++  int row_at, tile_at, row_total, tile_total;
++  block_scan2(rows, tiles, row_at, tile_at, row_total, tile_total);
++  for (int e = e0; e < e1; ++e) {
++    const int count = cursor[e];
++    row_begin[e] = row_at;
++    tile_begin[e] = tile_at;
++    cursor[e] = row_at;
++    row_at += count;
++    tile_at += (count + block_rows - 1) / block_rows;
++  }
++  if (threadIdx.x == 0) {
++    tile_begin[experts] = tile_total;
++    table[0] = row_total;
++    table[1] = tile_total;
++  }
++  __syncthreads();
++  int4* tile_table = reinterpret_cast<int4*>(table + RouteLayout::tiles_offset(assignments));
++  for (int t = threadIdx.x; t < tile_total; t += blockDim.x) {
++    // Last expert whose first tile is at or before t (empty experts share
++    // their successor's start, so the search lands on the owner).
++    int lo = 0;
++    int hi = experts;
++    while (hi - lo > 1) {
++      const int mid = (lo + hi) >> 1;
++      if (tile_begin[mid] <= t) lo = mid; else hi = mid;
++    }
++    const int first = row_begin[lo] + (t - tile_begin[lo]) * block_rows;
++    const int end = lo + 1 < experts ? row_begin[lo + 1] : row_total;
++    tile_table[t] = make_int4(lo, first, min(block_rows, end - first), 0);
++    int64_t* tile_trellis = reinterpret_cast<int64_t*>(
++        table + RouteLayout::tile_trellis_offset(assignments));
++    int* tile_columns = table + RouteLayout::tile_columns_offset(assignments);
++    for (int q = 0; q < 3; ++q) {
++      const int64_t* meta = routing.metadata + int64_t(lo) * 12 + q * 4;
++      // Served shape only. Gate/up are (hidden, I); down is (I, hidden).
++      // bits_x2 is the instance; codebook 2 is mul1. Anything else traps.
++      constexpr int64_t kHidden = 5120;
++      const int64_t in = q < 2 ? kHidden : kIntermediate;
++      const int64_t out = q < 2 ? kIntermediate : kHidden;
++      if (meta[0] != in || meta[1] != out || meta[2] != kBitsX2 || meta[3] != 2) __trap();
++      tile_trellis[t * 3 + q] = routing.pointers[int64_t(lo) * 9 + q * 3];
++      tile_columns[t * 3 + q] = static_cast<int>(meta[1] / 16);
++    }
++  }
++  int* sorted = table + RouteLayout::sorted_offset();
++  int* sorted_experts = table + RouteLayout::experts_offset(assignments);
++  for (int64_t a = threadIdx.x; a < assignments; a += blockDim.x) {
++    const int64_t e = local_expert(routing, a);
++    if (e >= 0) {
++      const int at = atomicAdd(&cursor[e], 1);
++      sorted[at] = static_cast<int>(a);
++      sorted_experts[at] = static_cast<int>(e);
++    }
++  }
++}
++
++__device__ __forceinline__ double silu(double g) { return g / __dadd_rn(1.0, exp(-g)); }
++
++// Lane order of a K-long row (MMA B operand): k step k / 16, then lane t's k
++// values 2t, 2t + 1, 2t + 8, 2t + 9 (t = (k % 8) / 2).
++__device__ __forceinline__ int64_t lane_position(int64_t k) {
++  const int kk = static_cast<int>(k & 15);
++  return (k & ~int64_t(15)) + ((kk & 7) >> 1) * 4 + ((kk >> 3) << 1) + (kk & 1);
++}
++
++// The tensor-core B operand of one row: e per scale group (the peak over the
++// group's warps) puts max |v| 2^e in [2^14, 2^15) (2^e and 2^-e stay normal
++// FP32), hi = f16(v 2^e) (exact scaling), lo = f16(v 2^e - hi), stored at
++// lane_position(k) of the row's high and low FP16 rows.
++template <int kVals>
++__device__ __forceinline__ float warp_peak(const float (&v)[kVals]) {
++  float peak = 0.0f;
++#pragma unroll
++  for (int i = 0; i < kVals; ++i) peak = fmaxf(peak, fabsf(v[i]));
++#pragma unroll
++  for (int d = 16; d >= 1; d >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, d));
++  return peak;
++}
++__device__ __forceinline__ int halves_exponent(float peak) {
++  const int biased = static_cast<int>(__float_as_uint(peak) >> 23);
++  return peak == 0.0f ? 0 : min(141 - biased, 126);
++}
++// The lane's values at k = first + lane + 32 i, scaled by 2^e.
++template <int kVals>
++__device__ __forceinline__ void store_scaled_halves(const float (&v)[kVals], int lane, int first,
++                                                    int e, __half* hi, __half* lo) {
++  const float scale = __uint_as_float(uint32_t(127 + e) << 23);
++#pragma unroll
++  for (int i = 0; i < kVals; ++i) {
++    const int64_t at = lane_position(first + lane + 32 * i);
++    const float y = __fmul_rn(v[i], scale);
++    const __half h = __float2half_rn(y);
++    hi[at] = h;
++    lo[at] = __float2half_rn(__fsub_rn(y, __half2float(h)));
++  }
++}
++
++// Where the down GEMM wants its input: per assignment [hi | lo] FP16 rows of
++// ipad halves, and one 2^-e per (assignment, down K slice) (the same value
++// for every slice: one exponent per row).
++struct DownHalves {
++  __half* halves;
++  float* unscale;
++};
++
++// One task: the routing entry at sorted position pos, 128-column block
++// `block`; returns false past the routed count, else the transformed values
++// (lane holds columns block * 128 + lane + 32 i) and the assignment. Gate and
++// up arrive as kSlices K-slice partials (slice_stride apart), summed in
++// increasing slice order; then the gate and up output transforms (H128, svh),
++// SiLU(gate) * up, down suh and the down H128, all in FP64. Three dependent
++// memory round trips: the routing table (count, sorted entry and its expert
++// together), then all partials with the expert's pointers, then the svh/suh
++// values.
++template <int kSlices>
++__device__ __forceinline__ bool activation_block(const Routing& routing, const int* table,
++                                                 int64_t assignments, int64_t intermediate,
++                                                 int64_t ipad, const float* gate, const float* up,
++                                                 int64_t slice_stride, int64_t pos, int64_t block,
++                                                 int lane, double limit, double (&v)[4],
++                                                 int64_t& assignment) {
++  const int* sorted = table + RouteLayout::sorted_offset();
++  const int* sorted_experts = table + RouteLayout::experts_offset(assignments);
++  const int count = __ldg(table);
++  assignment = __ldg(sorted + pos);
++  const int64_t expert = __ldg(sorted_experts + pos);
++  if (pos >= count) return false;
++  const int64_t base = block * 128 + lane;
++  const half* gate_svh = expert_svh(routing, expert, 0);
++  const half* up_svh = expert_svh(routing, expert, 1);
++  const half* down_suh = expert_suh(routing, expert, 2);
++  float gate_scale[4];
++  float up_scale[4];
++  float down_scale[4];
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    gate_scale[i] = __half2float(gate_svh[base + 32 * i]);
++    up_scale[i] = __half2float(up_svh[base + 32 * i]);
++    down_scale[i] = __half2float(down_suh[base + 32 * i]);
++  }
++  // Sum K-slice partials as they load, increasing slice order. Adding +0
++  // first is bitwise the same as starting from slice 0, and it keeps the
++  // 16-slice case from holding gs/us[16][4].
++  double g[4] = {0.0, 0.0, 0.0, 0.0};
++  double u[4] = {0.0, 0.0, 0.0, 0.0};
++#pragma unroll
++  for (int s = 0; s < kSlices; ++s) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      g[i] = __dadd_rn(g[i], double(gate[s * slice_stride + assignment * ipad + base + 32 * i]));
++      u[i] = __dadd_rn(u[i], double(up[s * slice_stride + assignment * ipad + base + 32 * i]));
++    }
++  }
++  hadamard128_warp_f64(g, lane);
++  hadamard128_warp_f64(u, lane);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    const int64_t col = base + 32 * i;
++    double gv = __dmul_rn(g[i], double(gate_scale[i]));
++    double uv = __dmul_rn(u[i], double(up_scale[i]));
++    if (limit > 0.0) {
++      gv = fmin(gv, limit);
++      uv = fmin(fmax(uv, -limit), limit);
++    }
++    v[i] = 0.0;
++    if (col < intermediate) {
++      v[i] = __dmul_rn(__dmul_rn(silu(gv), uv), double(down_scale[i]));
++    }
++  }
++  hadamard128_warp_f64(v, lane);
++  return true;
++}
++
++// The activation stage: rounded once to FP32 and written as the down GEMM's
++// tensor-core operand with one 2^e per row (down_slices copies of 2^-e). One
++// thread block per sorted position (kRowBlocks warps = ipad / 128, one per
++// H128 block), the row peak from the warps' peaks in shared memory.
++template <int kSlices, int kRowBlocks>
++__global__ void __launch_bounds__(32 * kRowBlocks)
++activate_down_row(Routing routing, const int* table, int64_t assignments, int64_t intermediate,
++                  int64_t ipad, const float* gate, const float* up, int64_t slice_stride,
++                  DownHalves halves, int down_slices, double limit) {
++  __shared__ float warp_peaks[kRowBlocks];
++  const int lane = threadIdx.x & 31;
++  const int block = threadIdx.x >> 5;
++  // Uniform trip count per thread block (barriers inside).
++  for (int64_t pos = blockIdx.x; pos < assignments; pos += gridDim.x) {
++    double v[4];
++    int64_t assignment;
++    if (!activation_block<kSlices>(routing, table, assignments, intermediate, ipad, gate, up,
++                                   slice_stride, pos, block, lane, limit, v, assignment)) {
++      break;
++    }
++    float f[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) f[i] = __double2float_rn(v[i]);
++    const float peak = warp_peak(f);
++    if (lane == 0) warp_peaks[block] = peak;
++    __syncthreads();
++    float row_peak = 0.0f;
++#pragma unroll
++    for (int w = 0; w < kRowBlocks; ++w) row_peak = fmaxf(row_peak, warp_peaks[w]);
++    const int e = halves_exponent(row_peak);
++    __half* hi = halves.halves + assignment * 2 * ipad;
++    store_scaled_halves(f, lane, block * 128, e, hi, hi + ipad);
++    if (block == 0 && lane < down_slices) {
++      halves.unscale[assignment * down_slices + lane] = __uint_as_float(uint32_t(127 - e) << 23);
++    }
++    __syncthreads();
++  }
++}
++
++// One block per (token, 128-column block), one warp per route (blockDim =
++// 32 * min(topk, 32), at least 4 warps). Warp w handles routes w, w + warps,
++// ...: the local route's down output (the sum of kSlices K-slice partials,
++// slice_stride apart, in increasing slice order) transform (H128, svh) in
++// FP64 into shared memory, every route's loads in flight at once. Then
++// threads 0..127 apply exactly one routing-weight FMA per local route in
++// route order (FP64) and round to FP32, then to BF16. Local experts come from
++// the routing table's by-assignment array. Dynamic shared memory:
++// combine_shared_bytes(topk).
++constexpr int kCombineMaxThreads = 1024;
++size_t combine_shared_bytes(int64_t topk) {
++  return size_t(topk) * (128 * sizeof(double) + sizeof(float) + sizeof(int));
++}
++template <int kSlices>
++__global__ void __launch_bounds__(kCombineMaxThreads)
++combine_routes(const float* down, const float* weights, Routing routing, const int* table,
++               int64_t rows, int64_t hidden, int64_t hpad, int64_t slice_stride,
++               __nv_bfloat16* out) {
++  extern __shared__ __align__(16) unsigned char combine_shared[];
++  const int64_t topk = routing.topk;
++  double* values = reinterpret_cast<double*>(combine_shared);      // [topk][128]
++  float* route_weight = reinterpret_cast<float*>(values + topk * 128);
++  int* route_local = reinterpret_cast<int*>(route_weight + topk);
++  const int* by_assignment = table + RouteLayout::by_assignment_offset(rows * topk);
++  const int lane = threadIdx.x & 31;
++  const int warp = threadIdx.x >> 5;
++  const int64_t blocks = hpad / 128;
++  for (int64_t task = blockIdx.x; task < rows * blocks; task += gridDim.x) {
++    const int64_t row = task / blocks;
++    const int64_t col0 = (task % blocks) * 128;
++    for (int64_t r = warp; r < topk; r += blockDim.x / 32) {
++      const int64_t assignment = row * topk + r;
++      const int64_t expert = __ldg(by_assignment + assignment);
++      if (lane == 0) {
++        route_local[r] = expert >= 0;
++        route_weight[r] = weights[assignment];
++      }
++      if (expert < 0) continue;
++      const half* svh = expert_svh(routing, expert, 2);
++      float v[kSlices][4];
++#pragma unroll
++      for (int s = 0; s < kSlices; ++s) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++          v[s][i] = down[s * slice_stride + assignment * hpad + col0 + lane + 32 * i];
++        }
++      }
++      float scale[4];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) scale[i] = __half2float(svh[col0 + lane + 32 * i]);
++      double x[4];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        x[i] = v[0][i];
++#pragma unroll
++        for (int s = 1; s < kSlices; ++s) x[i] = __dadd_rn(x[i], double(v[s][i]));
++      }
++      hadamard128_warp_f64(x, lane);
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        values[r * 128 + lane + 32 * i] = __dmul_rn(x[i], double(scale[i]));
++      }
++    }
++    __syncthreads();
++    if (threadIdx.x < 128) {
++      double sum = 0.0;
++      for (int64_t r = 0; r < topk; ++r) {
++        if (route_local[r]) {
++          sum = __fma_rn(values[r * 128 + threadIdx.x], double(route_weight[r]), sum);
++        }
++      }
++      const int64_t col = col0 + threadIdx.x;
++      if (col < hidden) out[row * hidden + col] = __float2bfloat16_rn(__double2float_rn(sum));
++    }
++    __syncthreads();
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Lane-tile expert GEMM (bits_x2 10, codebook 2).
++//
++// An item is one warp's kNT output n16 tiles x one K slice of one route tile;
++// no shared memory and no block barriers. The warp decodes its own 16x16
++// trellis tiles straight into m16n8k16 A fragments (A = W^T: 16 output
++// columns x 16 k; decode_lane_fragment_mul1) and multiplies them on the tensor
++// cores (FP16 in, FP32 out, C = 0 per k16 step) with B = 16 k x 8 columns: per
++// group of four route rows, columns 0..3 hold the rows' high FP16 parts and
++// 4..7 the low parts of their activations scaled by a power of two per row
++// and scale group (store_scaled_halves; produced once per call by
++// route_and_gate_up_input and activate_down_row, read straight from global
++// memory). The k16 results are summed in FP32 in increasing k per K slice,
++// high and low apart; the slice partial (hi + lo) 2^-e goes to the workspace
++// and the consumer kernel sums the slices in increasing slice order (FP64).
++// Everything is fixed-order: a row's result never depends on other rows.
++constexpr int kLaneRows = 8;                    // route rows per tile
++constexpr int64_t kLaneMaxAssignments = 1024;   // routed rows the workspace layout covers
++constexpr int kLaneThreads = 256;
++constexpr int kLaneAhead = 3;                   // k steps prefetched to L2
++
++struct LaneProblem {
++  const int* table;
++  int64_t assignments;       // routing table capacity
++  int k_tiles;               // K / 16
++  int n_tiles;               // N / 16
++  int projections;           // 2: gate (out0) and up (out1); 1: down (out0)
++  int first_projection;
++  float* out0;               // [slice][assignment][N] partials
++  float* out1;
++  int64_t slice_stride;
++  // B operand: per (assignment, projection) row [hi | lo] FP16 rows of K
++  // halves in lane order, and 2^-e per (assignment, projection, K slice).
++  const __half* halves;
++  const float* unscale;
++};
++
++__device__ __forceinline__ void mma_f16_f32(const uint32_t (&a)[4], uint2 b, float (&d)[4]) {
++  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
++      "{%4, %5, %6, %7}, {%8, %9}, {%10, %10, %10, %10};"
++      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b.x), "r"(b.y), "f"(0.0f));
++}
++
++// One warp: kNT output n16 tiles x kKT k16 steps of one route tile with
++// kGroups n8 row groups (row_of: lane r holds tile row r's assignment), k
++// outer: the kNT tiles of a k step are adjacent in the trellis (immediate
++// offsets from three per-lane word pointers); the next k step's tiles and B
++// fragments are in flight while this one decodes.
++template <int kGroups, int kNT, int kKT, int kBitsX2, bool kAligned>
++__device__ __forceinline__ void lane_tiles(const LaneProblem& p, int pi, int slice, int row_of,
++                                           int rows, const uint16_t* trellis, int64_t tiles_n,
++                                           int n0, int lane, const LaneWindow<kBitsX2>& window,
++                                           float* out) {
++  using Ring = TileRing<kBitsX2>;
++  constexpr int kTileWords = Ring::kTileHalfwords / 2;
++  const int kt0 = slice * kKT;
++  const int slices = p.k_tiles / kKT;
++  const int64_t row_halves = 2 * int64_t(p.k_tiles) * 16;
++  const int t = lane & 3;
++  const int gq = lane >> 2;
++  // B source of this lane: column gq of each group = hi (gq < 4) or lo of
++  // row 4g + gq % 4, k values 2t, 2t + 1, 2t + 8, 2t + 9 of each k step.
++  const uint2* bsrc[kGroups];
++  bool bok[kGroups];
++#pragma unroll
++  for (int g = 0; g < kGroups; ++g) {
++    const int r = 4 * g + (gq & 3);
++    bok[g] = r < rows;
++    const int64_t assignment = __shfl_sync(0xffffffffu, row_of, bok[g] ? r : 0);
++    bsrc[g] = reinterpret_cast<const uint2*>(
++                  p.halves + (assignment * p.projections + pi) * row_halves +
++                  (gq >> 2) * (row_halves / 2) + kt0 * 16) + t;
++  }
++  // 2^-e of the rows this lane stores: 4g + 2t + c (lanes t < 2).
++  float unscale[kGroups][2];
++#pragma unroll
++  for (int g = 0; g < kGroups; ++g) {
++#pragma unroll
++    for (int c = 0; c < 2; ++c) {
++      const int r = 4 * g + 2 * (t & 1) + c;
++      const int64_t assignment = __shfl_sync(0xffffffffu, row_of, r < rows ? r : 0);
++      unscale[g][c] = __ldg(p.unscale + (assignment * p.projections + pi) * slices + slice);
++    }
++  }
++  const uint16_t* step = trellis + (int64_t(kt0) * tiles_n + n0) * Ring::kTileHalfwords;
++  const int64_t stride = tiles_n * Ring::kTileHalfwords;
++  const uint32_t* wp[Ring::kLoadWords];
++#pragma unroll
++  for (int i = 0; i < Ring::kLoadWords; ++i) {
++    wp[i] = reinterpret_cast<const uint32_t*>(step) + window.word[i];
++  }
++  uint32_t words[kNT][Ring::kLoadWords];
++  auto fetch = [&](int j) {
++    if constexpr (kAligned) {
++#pragma unroll
++      for (int i = 0; i < Ring::kLoadWords; ++i) words[j][i] = __ldg(wp[i] + j * kTileWords);
++    } else {
++      load_lane_words<kBitsX2>(step + j * Ring::kTileHalfwords, window, false, words[j]);
++    }
++  };
++#pragma unroll
++  for (int j = 0; j < kNT; ++j) fetch(j);
++  uint2 bnext[kGroups];
++#pragma unroll
++  for (int g = 0; g < kGroups; ++g) bnext[g] = bok[g] ? __ldg(bsrc[g]) : make_uint2(0u, 0u);
++  float acc[kNT][kGroups][4];
++#pragma unroll
++  for (int j = 0; j < kNT; ++j) {
++#pragma unroll
++    for (int g = 0; g < kGroups; ++g) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) acc[j][g][i] = 0.0f;
++    }
++  }
++  // L2 prefetch kLaneAhead k steps ahead: lane = 128-byte line of the step.
++  constexpr int kStepBytes = kNT * Ring::kTileHalfwords * 2;
++  const char* ahead = reinterpret_cast<const char*>(step + kLaneAhead * stride) +
++                      min(lane * 128, kStepBytes - 1);
++#pragma unroll 1
++  for (int kt = 0; kt < kKT; ++kt) {
++    if (lane * 128 < kStepBytes + 127 && kt + kLaneAhead < kKT) {
++      asm volatile("prefetch.global.L2 [%0];" ::"l"(ahead));
++    }
++    ahead += stride * 2;
++    const bool more = kt + 1 < kKT;
++    uint2 b[kGroups];
++#pragma unroll
++    for (int g = 0; g < kGroups; ++g) {
++      b[g] = bnext[g];
++      if (more && bok[g]) bnext[g] = __ldg(bsrc[g] + 4 * (kt + 1));
++    }
++    if constexpr (kAligned) {
++#pragma unroll
++      for (int i = 0; i < Ring::kLoadWords; ++i) wp[i] += stride / 2;
++    } else {
++      step += stride;
++    }
++#pragma unroll
++    for (int j = 0; j < kNT; ++j) {
++      uint32_t a[4];
++      decode_lane_fragment_mul1<kBitsX2>(words[j], window.shift, a);
++      if (more) fetch(j);
++#pragma unroll
++      for (int g = 0; g < kGroups; ++g) {
++        float d[4];
++        mma_f16_f32(a, b[g], d);
++#pragma unroll
++        for (int i = 0; i < 4; ++i) acc[j][g][i] = __fadd_rn(acc[j][g][i], d[i]);
++      }
++    }
++  }
++  // Lanes t < 2 hold the high sums of rows 4g + 2t + {0, 1}; lane t + 2 the
++  // low sums of the same rows and columns.
++  const int64_t n_stride = int64_t(p.n_tiles) * 16;
++#pragma unroll
++  for (int g = 0; g < kGroups; ++g) {
++#pragma unroll
++    for (int c = 0; c < 2; ++c) {
++      const int r = 4 * g + 2 * (t & 1) + c;
++      const int64_t assignment = __shfl_sync(0xffffffffu, row_of, r < rows ? r : 0);
++#pragma unroll
++      for (int j = 0; j < kNT; ++j) {
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++          const int i = 2 * h + c;
++          const float low = __shfl_xor_sync(0xffffffffu, acc[j][g][i], 2);
++          if (t < 2 && r < rows) {
++            out[assignment * n_stride + (n0 + j) * 16 + gq + 8 * h] =
++                __fmul_rn(__fadd_rn(acc[j][g][i], low), unscale[g][c]);
++          }
++        }
++      }
++    }
++  }
++}
++
++// The unaligned-trellis variant, out of line: inlining it beside the aligned
++// one costs the hot loops about 3 % (register allocation and code layout).
++template <int kGroups, int kNT, int kKT, int kBitsX2>
++__device__ __noinline__ void lane_tiles_unaligned(LaneProblem p, int pi, int slice, int row_of,
++                                                  int rows, const uint16_t* trellis,
++                                                  int64_t tiles_n, int n0, int lane,
++                                                  float* out) {
++  const LaneWindow<kBitsX2> window(lane);
++  lane_tiles<kGroups, kNT, kKT, kBitsX2, false>(p, pi, slice, row_of, rows, trellis, tiles_n, n0,
++                                               lane, window, out);
++}
++
++// Warp items: (route tile, projection, K slice, column group of kNT n16
++// tiles), column groups fastest so a block's warps share B rows in L1.
++template <int kNT, int kKT, int kBitsX2>
++__global__ void __launch_bounds__(kLaneThreads, 1)
++moe_lane_kernel(LaneProblem p) {
++  const int lane = threadIdx.x & 31;
++  const LaneWindow<kBitsX2> window(lane);
++  const int slices = p.k_tiles / kKT;
++  const int groups_n = p.n_tiles / kNT;
++  const int64_t per_tile = int64_t(p.projections) * slices * groups_n;
++  const int64_t items = int64_t(p.table[1]) * per_tile;
++  const int* sorted = p.table + RouteLayout::sorted_offset();
++  const int4* tiles = reinterpret_cast<const int4*>(p.table + RouteLayout::tiles_offset(p.assignments));
++  const long long* tile_trellis = reinterpret_cast<const long long*>(
++      p.table + RouteLayout::tile_trellis_offset(p.assignments));
++  const int* tile_columns = p.table + RouteLayout::tile_columns_offset(p.assignments);
++  const int64_t warps = int64_t(gridDim.x) * (kLaneThreads / 32);
++  for (int64_t item = int64_t(blockIdx.x) * (kLaneThreads / 32) + (threadIdx.x >> 5);
++       item < items; item += warps) {
++    const int64_t tile_index = item / per_tile;
++    int rest = static_cast<int>(item % per_tile);
++    const int column_group = rest % groups_n;
++    rest /= groups_n;
++    const int slice = rest % slices;
++    const int pi = rest / slices;
++    const int projection = p.first_projection + pi;
++    // One round trip for the tile, its trellis address and columns (written
++    // by the route kernel, which also checked the format).
++    const int4 tile = tiles[tile_index];
++    const uint16_t* trellis = reinterpret_cast<const uint16_t*>(
++        __ldg(tile_trellis + tile_index * 3 + projection));
++    const int64_t tiles_n = __ldg(tile_columns + tile_index * 3 + projection);
++    const int rows = tile.z;
++    const int row_of = lane < rows ? sorted[tile.y + lane] : 0;
++    const int n0 = column_group * kNT;
++    const bool aligned = (reinterpret_cast<uintptr_t>(trellis) & 3) == 0;
++    float* out = (pi == 0 ? p.out0 : p.out1) + slice * p.slice_stride;
++#define EXL3_LANE_GROUPS(G)                                                                        \
++    if (aligned) {                                                                                 \
++      lane_tiles<G, kNT, kKT, kBitsX2, true>(p, pi, slice, row_of, rows, trellis, tiles_n, n0,     \
++                                            lane, window, out);                                    \
++    } else {                                                                                       \
++      lane_tiles_unaligned<G, kNT, kKT, kBitsX2>(p, pi, slice, row_of, rows, trellis, tiles_n, n0, \
++                                                lane, out);                                        \
++    }
++    if (rows <= 4) {
++      EXL3_LANE_GROUPS(1);
++    } else {
++      EXL3_LANE_GROUPS(2);
++    }
++#undef EXL3_LANE_GROUPS
++  }
++}
++
++// One launch: block 0 routes (route_block) while the other blocks form the
++// gate/up tensor-core B operand straight from topk_ids (independent of the
++// routing table). Hidden 5120 is 40 H128 blocks. 20 warps (640 threads) each
++// own two H128 blocks: the short path's one 2^e per row reduces over all of
++// them, and a long-path 1280-column group is blocks 2w and 2w+1 (kSplit 2).
++// x * suh and H128 stay in FP64, rounded once to FP32. A group spans kSplit
++// GEMM K slices, each given its own copy of 2^-e.
++template <int kScaleK, int kSplit, int kIntermediate, int kBitsX2>
++__global__ void __launch_bounds__(kRouteInputThreads)
++route_and_gate_up_input(Routing routing, int64_t assignments, int block_rows, int* table,
++                        const __nv_bfloat16* x, int64_t hidden, int64_t hpad, __half* halves,
++                        float* unscale) {
++  if (blockIdx.x == 0) {
++    route_block<kIntermediate, kBitsX2>(routing, assignments, block_rows, table);
++    return;
++  }
++  constexpr int kH128PerWarp = 2;
++  constexpr int kBlocks = kScaleK / 128;
++  constexpr int kWarps = kRouteInputThreads / 32;
++  constexpr int kWarpsPerGroup = kBlocks / kH128PerWarp;
++  static_assert(kBlocks % kH128PerWarp == 0, "a scale group holds whole H128 pairs");
++  static_assert(kWarps % kWarpsPerGroup == 0 && kSplit <= 32,
++                "input warps must tile whole groups");
++  __shared__ float block_peaks[2][kWarps][kH128PerWarp];
++  const int lane = threadIdx.x & 31;
++  const int warp = threadIdx.x >> 5;
++  const int group = warp / kWarpsPerGroup;
++  const int local = warp - group * kWarpsPerGroup;
++  const int64_t slices = hpad / kScaleK * kSplit;
++  // Uniform trip count per thread block (barriers inside).
++  for (int64_t assignment = blockIdx.x - 1; assignment < assignments;
++       assignment += gridDim.x - 1) {
++    const __nv_bfloat16* row = x + (assignment / routing.topk) * hidden;
++    const int64_t expert = local_expert(routing, assignment);
++    float saved[2][kH128PerWarp][4];
++#pragma unroll
++    for (int sub = 0; sub < kH128PerWarp; ++sub) {
++      const int64_t base = (int64_t(warp) * kH128PerWarp + sub) * 128;
++      float xs[4];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const int64_t col = base + lane + 32 * i;
++        xs[i] = col < hidden ? __bfloat162float(row[col]) : 0.0f;
++      }
++      float v[2][4] = {};
++      if (expert >= 0) {
++        const half* suh[2] = {expert_suh(routing, expert, 0), expert_suh(routing, expert, 1)};
++        float scale[2][4];
++#pragma unroll
++        for (int q = 0; q < 2; ++q) {
++#pragma unroll
++          for (int i = 0; i < 4; ++i) {
++            const int64_t col = base + lane + 32 * i;
++            scale[q][i] = col < hidden ? __half2float(suh[q][col]) : 0.0f;
++          }
++        }
++#pragma unroll
++        for (int q = 0; q < 2; ++q) {
++          double block[4];
++#pragma unroll
++          for (int i = 0; i < 4; ++i) block[i] = __dmul_rn(double(xs[i]), double(scale[q][i]));
++          hadamard128_warp_f64(block, lane);
++#pragma unroll
++          for (int i = 0; i < 4; ++i) v[q][i] = __double2float_rn(block[i]);
++        }
++      }
++#pragma unroll
++      for (int q = 0; q < 2; ++q) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) saved[q][sub][i] = v[q][i];
++        const float peak = warp_peak(v[q]);
++        if (lane == 0) block_peaks[q][warp][sub] = peak;
++      }
++    }
++    __syncthreads();
++    if (expert >= 0) {
++#pragma unroll
++      for (int q = 0; q < 2; ++q) {
++        float group_peak = 0.0f;
++#pragma unroll
++        for (int w = 0; w < kWarpsPerGroup; ++w) {
++#pragma unroll
++          for (int s = 0; s < kH128PerWarp; ++s) {
++            group_peak = fmaxf(group_peak, block_peaks[q][group * kWarpsPerGroup + w][s]);
++          }
++        }
++        const int e = halves_exponent(group_peak);
++#pragma unroll
++        for (int sub = 0; sub < kH128PerWarp; ++sub) {
++          __half* hi = halves + (assignment * 2 + q) * 2 * hpad + int64_t(group) * kScaleK;
++          store_scaled_halves(saved[q][sub], lane, (local * kH128PerWarp + sub) * 128, e, hi,
++                              hi + hpad);
++        }
++        if (local == 0 && lane < kSplit) {
++          unscale[(assignment * 2 + q) * slices + group * kSplit + lane] =
++              __uint_as_float(uint32_t(127 - e) << 23);
++        }
++      }
++    }
++    __syncthreads();
++  }
++}
++
++// DS V4.1 shape. Hidden is 5120. Column groups are 4 n16 tiles so they divide
++// 40 (I = 640), 32 (I = 512) and 320 (down N). Gate/up K is 320 n16 tiles.
++// Short calls: 20-tile slices (16 slices) and one 2^e over the whole row
++// (kSplit 16). Long calls, from 160 assignments: 40-tile slices (8 slices)
++// and one 2^e per 1280 columns (kSplit 2). Down K is I/16 tiles. Short is 20
++// tiles at I = 640 and 16 at I = 512 (two slices); long is the whole K (one
++// slice). The 160-assignment switch is unchanged.
++template <int kIntermediate, int kBitsX2>
++struct LaneShape {
++  static constexpr int64_t kHidden = 5120;
++  static constexpr int64_t kInter = kIntermediate;
++  static constexpr int kBits = kBitsX2;
++  static constexpr int kColumnTiles = 4;
++  static constexpr int kGateUpShortScaleK = 5120;
++  static constexpr int kGateUpShortSliceTiles = 20;
++  static constexpr int kGateUpLongScaleK = 1280;
++  static constexpr int kGateUpLongSliceTiles = 40;
++  static constexpr int kDownShortSliceTiles = kIntermediate == 640 ? 20 : 16;
++  static constexpr int kDownLongSliceTiles = kIntermediate / 16;
++  static constexpr int64_t kLongSliceAssignments = 160;
++  static constexpr int64_t kLongDownAssignments = 160;
++  static constexpr int kGateUpShortSlices = int(kHidden / (16 * kGateUpShortSliceTiles));
++  static constexpr int kGateUpLongSlices = int(kHidden / (16 * kGateUpLongSliceTiles));
++  static constexpr int kDownShortSlices = int(kInter / (16 * kDownShortSliceTiles));
++  static constexpr int kDownLongSlices = int(kInter / (16 * kDownLongSliceTiles));
++  static constexpr int kGateUpSlices = kGateUpShortSlices;
++  static constexpr int kDownSlices = kDownShortSlices;
++  static constexpr int kActivateBlocks = kIntermediate / 128;
++  static constexpr int kActivateThreads = kIntermediate / 4;
++  static_assert(kBits == 4 || kBits == 6, "bits_x2 instance");
++  static_assert(kInter == 512 || kInter == 640, "intermediate instance");
++  static_assert(kGateUpShortSlices == 16 && kGateUpLongSlices == 8, "gate/up slice counts");
++  static_assert(kDownShortSlices == 2 && kDownLongSlices == 1, "down slice counts");
++  static_assert(kGateUpShortScaleK / (16 * kGateUpShortSliceTiles) == 16, "short kSplit");
++  static_assert(kGateUpLongScaleK / (16 * kGateUpLongSliceTiles) == 2, "long kSplit");
++  static_assert(kGateUpShortScaleK / (16 * kGateUpShortSliceTiles) <= 32, "kSplit bound");
++  static_assert(kHidden % kGateUpShortScaleK == 0 && kHidden % kGateUpLongScaleK == 0,
++                "scale groups divide K");
++  static_assert(kHidden % (16 * kColumnTiles) == 0 && kInter % (16 * kColumnTiles) == 0,
++                "column groups divide N");
++  static_assert(kInter % (16 * kDownShortSliceTiles) == 0, "down short slices");
++  static_assert(kInter % (16 * kDownLongSliceTiles) == 0, "down long slices");
++  static_assert(kGateUpShortSlices >= kGateUpLongSlices && kDownShortSlices >= kDownLongSlices &&
++                    kDownShortSlices <= 32,
++                "workspace covers the short path");
++  static_assert(kRouteInputThreads / 32 * 2 == kHidden / 128, "two H128 blocks per warp");
++};
++
++// Both intermediates use the same slice counts, so the workspace formula is
++// shared. ipad still scales the gate/up partials.
++constexpr int kGateUpSlices = LaneShape<640, 6>::kGateUpSlices;
++constexpr int kDownSlices = LaneShape<640, 6>::kDownSlices;
++static_assert(kGateUpSlices == LaneShape<512, 4>::kGateUpSlices, "shared gate/up workspace");
++static_assert(kDownSlices == LaneShape<512, 4>::kDownSlices, "shared down workspace");
++
++template <int kI, int kBits>
++void check_shape(int64_t hpad, int64_t ipad, int64_t assignments) {
++  using S = LaneShape<kI, kBits>;
++  TORCH_CHECK(hpad == S::kHidden && ipad == S::kInter,
++              "EXL3 MoE v2 supports padded hidden 5120 and intermediate 640 or 512 only");
++  TORCH_CHECK(assignments <= kLaneMaxAssignments,
++              "EXL3 MoE v2 supports at most 1024 routed assignments per call");
++}
++
++template <int kBits, int kKT>
++void launch_lane(const LaneProblem& p, int64_t max_tiles, cudaStream_t stream) {
++  constexpr int kColumnTiles = 4;
++  auto* kernel = &moe_lane_kernel<kColumnTiles, kKT, kBits>;
++  static const int64_t resident = [kernel] {
++    int device = 0;
++    int sms = 0;
++    int per_sm = 0;
++    C10_CUDA_CHECK(cudaGetDevice(&device));
++    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
++    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel,
++                                                                 kLaneThreads, 0));
++    return int64_t(std::max(sms, 1)) * std::max(per_sm, 1);
++  }();
++  const int64_t per_tile = int64_t(p.projections) * (p.k_tiles / kKT) *
++                           (p.n_tiles / kColumnTiles);
++  constexpr int64_t kWarps = kLaneThreads / 32;
++  const int64_t grid = std::min((max_tiles * per_tile + kWarps - 1) / kWarps, resident);
++  if (grid <= 0) return;
++  kernel<<<static_cast<unsigned int>(grid), kLaneThreads, 0, stream>>>(p);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// FP32 workspace elements before the routing table: gate, up and down slice
++// partials; the gate/up and down B operands (FP16 hi and lo rows) and their
++// 2^-e per (row, slice), rounded up to whole 16-byte groups.
++int64_t lane_workspace(int64_t assignments, int64_t hpad, int64_t ipad) {
++  const int64_t gate_up = checked_mul(2 * kGateUpSlices, ipad);
++  const int64_t down = checked_mul(kDownSlices, hpad);
++  const int64_t operands = checked_add(checked_mul(2, hpad), ipad);   // FP16 hi + lo
++  const int64_t unscale = (assignments * (2 * kGateUpSlices + kDownSlices) + 3) / 4 * 4;
++  return checked_add(
++      checked_mul(assignments, checked_add(checked_add(gate_up, down), operands)), unscale);
++}
++
++}  // namespace
++}  // namespace moe_v2
++
++int64_t moe_workspace_size_v2(int64_t max_rows, int64_t hidden_size,
++                              int64_t intermediate_size, int64_t topk,
++                              int64_t local_experts) {
++  using namespace moe_v2;
++  TORCH_CHECK(max_rows >= 0 && topk >= 0 && local_experts >= 0,
++              "EXL3 rows/topk/local_experts must be nonnegative");
++  const int64_t hpad = padded_size(hidden_size);
++  const int64_t ipad = padded_size(intermediate_size);
++  TORCH_CHECK(hpad == 5120 && (ipad == 640 || ipad == 512),
++              "EXL3 MoE v2 supports hidden 5120 and intermediate 640 or 512 only");
++  if (local_experts == 0) return 0;
++  const int64_t assignments = checked_mul(max_rows, topk);
++  TORCH_CHECK(assignments <= kLaneMaxAssignments,
++              "EXL3 MoE v2 supports at most 1024 routed assignments per call");
++  return workspace_elements(
++      checked_add(lane_workspace(assignments, hpad, ipad), RouteLayout::ints(assignments)));
++}
++
++template <int kI, int kBits>
++void moe_out_v2_shaped(const torch::Tensor& x, const torch::Tensor& topk_ids,
++                       const torch::Tensor& topk_weights,
++                       const torch::Tensor& packed_ptrs,
++                       const torch::Tensor& packed_meta,
++                       const torch::Tensor& expert_map, double limit,
++                       torch::Tensor& out, torch::Tensor& workspace) {
++  using namespace moe_v2;
++  using S = LaneShape<kI, kBits>;
++  const int64_t rows = x.size(0);
++  const int64_t hidden = x.size(1);
++  const int64_t topk = topk_ids.size(1);
++  const int64_t experts = packed_ptrs.size(0);
++  const int64_t hpad = padded_size(hidden);
++  const int64_t ipad = padded_size(kI);
++  const int64_t assignments = checked_mul(rows, topk);
++  check_shape<kI, kBits>(hpad, ipad, assignments);
++  const c10::cuda::CUDAGuard guard(x.device());
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
++  Routing routing{topk_ids.data_ptr(), expert_map.data_ptr(),
++                  packed_ptrs.data_ptr<int64_t>(), packed_meta.data_ptr<int64_t>(),
++                  expert_map.numel(), experts, topk,
++                  topk_ids.scalar_type() == at::kLong, expert_map.scalar_type() == at::kLong};
++  float* input = workspace.data_ptr<float>();
++  const float* down_out = input;
++  int64_t down_stride = 0;
++  const int* route_table = nullptr;
++  if (experts > 0 && assignments > 0) {
++    const int64_t gate_up_stride = assignments * ipad;
++    down_stride = assignments * hpad;
++    float* gate = input;
++    float* up = gate + S::kGateUpSlices * gate_up_stride;
++    float* down = up + S::kGateUpSlices * gate_up_stride;
++    __half* gate_up_halves = reinterpret_cast<__half*>(down + S::kDownSlices * down_stride);
++    __half* down_halves = gate_up_halves + assignments * 2 * 2 * hpad;
++    float* gate_up_unscale = reinterpret_cast<float*>(down_halves + assignments * 2 * ipad);
++    float* down_unscale = gate_up_unscale + assignments * 2 * S::kGateUpSlices;
++    int* table = reinterpret_cast<int*>(
++        gate_up_unscale + (assignments * (2 * S::kGateUpSlices + S::kDownSlices) + 3) / 4 * 4);
++    route_table = table;
++    down_out = down;
++    const auto gate_up = [&](auto scale_k, auto slice_tiles) {
++      constexpr int kScaleK = decltype(scale_k)::value;
++      constexpr int kSplit = kScaleK / (16 * decltype(slice_tiles)::value);
++      route_and_gate_up_input<kScaleK, kSplit, kI, kBits>
++          <<<launch_blocks(1 + assignments),
++             kRouteInputThreads, (3 * experts + 1) * sizeof(int), stream>>>(
++              routing, assignments, kLaneRows, table,
++              reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), hidden, hpad,
++              gate_up_halves, gate_up_unscale);
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++    };
++    const bool long_slices = assignments >= S::kLongSliceAssignments;
++    if (long_slices) {
++      gate_up(std::integral_constant<int, S::kGateUpLongScaleK>{},
++              std::integral_constant<int, S::kGateUpLongSliceTiles>{});
++    } else {
++      gate_up(std::integral_constant<int, S::kGateUpShortScaleK>{},
++              std::integral_constant<int, S::kGateUpShortSliceTiles>{});
++    }
++    const int64_t max_tiles = std::min<int64_t>(
++        assignments, assignments / kLaneRows + std::min<int64_t>(experts, assignments) + 1);
++    LaneProblem p{};
++    p.table = table;
++    p.assignments = assignments;
++    p.k_tiles = static_cast<int>(hpad / 16);
++    p.n_tiles = static_cast<int>(ipad / 16);
++    p.projections = 2;
++    p.first_projection = 0;
++    p.out0 = gate;
++    p.out1 = up;
++    p.slice_stride = gate_up_stride;
++    p.halves = gate_up_halves;
++    p.unscale = gate_up_unscale;
++    const bool long_down = assignments >= S::kLongDownAssignments;
++    const int down_used = long_down ? S::kDownLongSlices : S::kDownShortSlices;
++    const auto activate = [&](auto slices) {
++      activate_down_row<decltype(slices)::value, S::kActivateBlocks>
++          <<<launch_blocks(assignments), S::kActivateThreads, 0, stream>>>(
++              routing, table, assignments, kI, ipad, gate, up, gate_up_stride,
++              DownHalves{down_halves, down_unscale}, down_used, limit);
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++    };
++    if (long_slices) {
++      launch_lane<kBits, S::kGateUpLongSliceTiles>(p, max_tiles, stream);
++      activate(std::integral_constant<int, S::kGateUpLongSlices>{});
++    } else {
++      launch_lane<kBits, S::kGateUpShortSliceTiles>(p, max_tiles, stream);
++      activate(std::integral_constant<int, S::kGateUpShortSlices>{});
++    }
++    p.k_tiles = static_cast<int>(ipad / 16);
++    p.n_tiles = static_cast<int>(hpad / 16);
++    p.projections = 1;
++    p.first_projection = 2;
++    p.out0 = down;
++    p.out1 = nullptr;
++    p.slice_stride = down_stride;
++    p.halves = down_halves;
++    p.unscale = down_unscale;
++    if (long_down) {
++      launch_lane<kBits, S::kDownLongSliceTiles>(p, max_tiles, stream);
++    } else {
++      launch_lane<kBits, S::kDownShortSliceTiles>(p, max_tiles, stream);
++    }
++  } else {
++    routing.topk = 0;
++  }
++  const size_t shared = combine_shared_bytes(routing.topk);
++  TORCH_CHECK(shared <= 48 * 1024, "EXL3 MoE topk too large for the combine stage");
++  const auto combine = [&](auto slices) {
++    combine_routes<decltype(slices)::value>
++        <<<launch_blocks(rows * (hpad / 128)),
++           32 * static_cast<int>(std::min<int64_t>(std::max<int64_t>(routing.topk, 4), 32)),
++           shared, stream>>>(
++            down_out, topk_weights.data_ptr<float>(), routing, route_table, rows, hidden, hpad,
++            down_stride, reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
++  };
++  if (assignments >= S::kLongDownAssignments) {
++    combine(std::integral_constant<int, S::kDownLongSlices>{});
++  } else {
++    combine(std::integral_constant<int, S::kDownSlices>{});
++  }
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
++                const torch::Tensor& topk_weights,
++                const torch::Tensor& packed_ptrs,
++                const torch::Tensor& packed_meta,
++                const torch::Tensor& expert_map, int64_t intermediate_size,
++                int64_t bits_x2, double limit,
++                torch::Tensor& out, torch::Tensor& workspace) {
++  using namespace moe_v2;
++  TORCH_CHECK(x.is_cuda(), "EXL3 x must be CUDA");
++  check_tensor(x, x, at::kBFloat16, "x");
++  check_integer(topk_ids, x, "topk_ids");
++  check_integer(expert_map, x, "expert_map");
++  check_tensor(topk_weights, x, at::kFloat, "topk_weights");
++  check_tensor(packed_ptrs, x, at::kLong, "packed_ptrs");
++  check_tensor(packed_meta, x, at::kLong, "packed_meta");
++  check_tensor(out, x, at::kBFloat16, "out");
++  check_tensor(workspace, x, at::kFloat, "workspace");
++  TORCH_CHECK(x.dim() == 2 && out.dim() == 2 && topk_ids.dim() == 2 &&
++                  topk_weights.dim() == 2 && expert_map.dim() == 1 &&
++                  packed_ptrs.dim() == 3 && packed_meta.dim() == 3,
++              "EXL3 MoE tensor ranks mismatch");
++  const int64_t rows = x.size(0);
++  const int64_t hidden = x.size(1);
++  const int64_t topk = topk_ids.size(1);
++  const int64_t experts = packed_ptrs.size(0);
++  TORCH_CHECK(topk_ids.size(0) == rows && topk_weights.sizes() == topk_ids.sizes() &&
++                  out.sizes() == x.sizes(), "EXL3 MoE row/topk/output geometry mismatch");
++  TORCH_CHECK(packed_ptrs.size(1) == 3 && packed_ptrs.size(2) == 3 &&
++                  packed_meta.size(0) == experts && packed_meta.size(1) == 3 &&
++                  packed_meta.size(2) == 4, "EXL3 MoE pointer/metadata geometry mismatch");
++  TORCH_CHECK(experts <= kMaxRouteExperts, "EXL3 MoE has too many local experts");
++  const int64_t required =
++      moe_workspace_size_v2(rows, hidden, intermediate_size, topk, experts);
++  TORCH_CHECK(workspace.numel() >= required, "EXL3 MoE workspace is too small");
++  TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 16 == 0,
++              "EXL3 MoE workspace must be 16-byte aligned");
++  check_mutations(out, workspace,
++                  {&x, &topk_ids, &topk_weights, &packed_ptrs, &packed_meta, &expert_map});
++  if (rows == 0) return;
++  if (intermediate_size == 640 && bits_x2 == 6) {
++    moe_out_v2_shaped<640, 6>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
++                              limit, out, workspace);
++  } else if (intermediate_size == 512 && bits_x2 == 6) {
++    moe_out_v2_shaped<512, 6>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
++                              limit, out, workspace);
++  } else if (intermediate_size == 640 && bits_x2 == 4) {
++    moe_out_v2_shaped<640, 4>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
++                              limit, out, workspace);
++  } else if (intermediate_size == 512 && bits_x2 == 4) {
++    moe_out_v2_shaped<512, 4>(x, topk_ids, topk_weights, packed_ptrs, packed_meta, expert_map,
++                              limit, out, workspace);
++  } else {
++    TORCH_CHECK(false,
++                "EXL3 TC MoE v2 supports (intermediate, bits_x2) in "
++                "{(640,6),(512,6),(640,4),(512,4)} only");
++  }
++}
++
++
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe/moe_v2.h b/src/vllm_exl3/tc_moe/moe_v2.h
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe/moe_v2.h
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#pragma once
++
++#include <torch/types.h>
++#include <cstdint>
++
++namespace exl3 {
++
++// Decode tensor-core MoE for DS V4.1: hidden 5120, intermediate 640 or 512,
++// bits_x2 4 or 6, mul1 codebook. At most 1024 routed assignments per call.
++int64_t moe_workspace_size_v2(int64_t max_rows, int64_t hidden_size,
++                              int64_t intermediate_size, int64_t topk,
++                              int64_t local_experts);
++void moe_out_v2(const torch::Tensor& x, const torch::Tensor& topk_ids,
++                const torch::Tensor& topk_weights,
++                const torch::Tensor& packed_ptrs,
++                const torch::Tensor& packed_meta,
++                const torch::Tensor& expert_map, int64_t intermediate_size,
++                int64_t bits_x2, double limit, torch::Tensor& out,
++                torch::Tensor& workspace);
++
++}  // namespace exl3
+diff --git a/src/vllm_exl3/tc_moe_hook.py b/src/vllm_exl3/tc_moe_hook.py
+new file mode 100644
+--- /dev/null
++++ b/src/vllm_exl3/tc_moe_hook.py
+@@ -0,0 +1,205 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Curtis White's DeepSeek TC-MoE hook, adapted to the r7 plugin.
++
++Kernels: Morrowmake; DeepSeek port and original hook: Curtis White
++(CurtisAccelerate). See tc_moe/NOTICE.md and codec.cuh for provenance.
++"""
++
++import logging
++import math
++import os
++
++import torch
++
++logger = logging.getLogger("vllm.exl3.tc_moe")
++_OPS = None
++_WORKSPACES = {}
++HIDDEN, EXPERTS, TOPK = 5120, 384, 6
++
++
++def settings():
++    enabled = os.getenv("DSV41_TC_MOE", "0") == "1"
++    v2 = enabled and os.getenv("VLLM_EXL3_TC_MOE_V2", "1") == "1"
++    prefill = enabled and os.getenv("VLLM_EXL3_TC_MOE_PREFILL", "1") == "1"
++    cap = int(os.getenv("VLLM_EXL3_TC_PREFILL_ROWS", "2048"))
++    if not 65 <= cap <= 2048:
++        raise ValueError("VLLM_EXL3_TC_PREFILL_ROWS must be 65..2048")
++    return v2, prefill, cap
++
++
++def select_path(rows, v2, prefill, cap):
++    if v2 and 43 <= rows <= 64:
++        return "v2"
++    if prefill and rows >= 65:
++        # The native prefill op subchunks internally at cap, on one stream.
++        return "prefill"
++    return None
++
++
++def _log_once(layer, reason):
++    reasons = getattr(layer, "_exl3_tc_reasons", None)
++    if reasons is None:
++        reasons = layer._exl3_tc_reasons = set()
++    if reason not in reasons:
++        reasons.add(reason)
++        name = (getattr(layer, "layer_name", None)
++                or getattr(layer, "prefix", None)
++                or getattr(layer, "_exl3_layer_idx", "?"))
++        logger.info("EXL3 TC MoE layer=%s fallback to coop/stock: %s", name, reason)
++
++
++def reject(layer, inners):
++    if len(inners) != EXPERTS:
++        return f"local experts {len(inners)} (need {EXPERTS})"
++    if (getattr(layer, "_exl3_mixed_k", False)
++            or getattr(layer, "_exl3_mixedk_unified", False)
++            or getattr(layer, "_exl3_mixed_store", None) is not None):
++        return "heterogeneous K within a layer"
++    if getattr(layer, "_exl3_hidden_size", None) != HIDDEN:
++        return "hidden width"
++    inter = getattr(layer, "_exl3_intermediate_local", None)
++    if inter not in (512, 640):
++        return f"intermediate {inter} (need 512/640)"
++    act = getattr(getattr(layer, "moe_config", None), "activation", None)
++    if getattr(act, "value", act) not in (None, "silu"):
++        return "activation (need gated silu)"
++    if tuple(getattr(layer, "_exl3_codebook_flags", ())) != (False, True) * 3:
++        return "codebook (need mul1 on all projections)"
++    first = inners[0].get("gate")
++    if first is None:
++        return "gateless"
++    device = first.trellis.device
++    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (8, 0):
++        return "device (need sm_80 CUDA)"
++    bits = first.trellis.shape[-1] // 8
++    if bits not in (4, 6):
++        return f"bits_x2 {bits} (need K2/K3)"
++    for pack in inners:
++        for name in ("gate", "up", "down"):
++            linear = pack.get(name)
++            if linear is None:
++                return f"missing {name}"
++            if getattr(linear, "bias", None) is not None:
++                return f"{name} bias"
++            n_in, n_out = (inter, HIDDEN) if name == "down" else (HIDDEN, inter)
++            expected = (n_in // 16, n_out // 16, bits * 8)
++            t, a, b = linear.trellis, linear.suh, linear.svh
++            if tuple(t.shape) != expected or t.dtype != torch.int16:
++                return f"{name} trellis geometry/K/dtype"
++            if a.numel() != n_in or b.numel() != n_out:
++                return f"{name} scale lengths"
++            if a.dtype != torch.float16 or b.dtype != torch.float16:
++                return f"{name} scale dtype"
++            for tensor in (t, a, b):
++                if (tensor.device != device or not tensor.is_contiguous()
++                        or tensor.data_ptr() % 16):
++                    return f"{name} device/layout/alignment"
++    return None
++
++
++def _ops():
++    global _OPS
++    if _OPS is None:
++        torch.ops.load_library(os.getenv(
++            "VLLM_EXL3_TC_MOE_SO", "/opt/dsv41-tc-moe/_dsv41_tc_moe_C.abi3.so"))
++        _OPS = torch.ops._dsv41_tc_moe_C
++    return _OPS
++
++
++def try_build(layer, inners):
++    """Bind final arena views after load; never repack or expand weights."""
++    layer._exl3_tc = None
++    if os.getenv("DSV41_TC_MOE", "0") != "1":
++        return
++    try:
++        v2, prefill, cap = settings()
++        reason = reject(layer, inners)
++        if reason or not (v2 or prefill):
++            _log_once(layer, reason or "both paths off")
++            return
++        ops = _ops()
++        device = inners[0]["gate"].trellis.device
++        inter = int(layer._exl3_intermediate_local)
++        bits = int(inners[0]["gate"].trellis.shape[-1] // 8)
++        ptrs, meta = [], []
++        for pack in inners:
++            pp, mm = [], []
++            for name in ("gate", "up", "down"):
++                linear = pack[name]
++                pp.append([v.data_ptr() for v in
++                           (linear.trellis, linear.suh, linear.svh)])
++                dims = (inter, HIDDEN) if name == "down" else (HIDDEN, inter)
++                mm.append([*dims, bits, 2])
++            ptrs.append(pp)
++            meta.append(mm)
++        # One H=5120,I=640 workspace per device; all routed layers run in order.
++        key = (device.index, v2, prefill, cap)
++        workspace = _WORKSPACES.get(key)
++        if workspace is None:
++            nv = ops.moe_workspace_size_v2(64, HIDDEN, 640, TOPK, EXPERTS) if v2 else 0
++            np = (ops.moe_workspace_size_prefill(cap, HIDDEN, 640, TOPK, EXPERTS)
++                  if prefill else 0)
++            workspace = torch.empty(max(nv, np), dtype=torch.float32, device=device)
++            _WORKSPACES[key] = workspace
++        tc = dict(ops=ops, ptrs=torch.tensor(ptrs, dtype=torch.int64, device=device),
++                  meta=torch.tensor(meta, dtype=torch.int64, device=device),
++                  emap=torch.arange(EXPERTS, dtype=torch.int32, device=device),
++                  workspace=workspace, intermediate=inter, bits_x2=bits,
++                  v2=v2, prefill=prefill, cap=cap,
++                  owners=inners)
++        # Populate per-kernel occupancy/shared-memory statics before graph capture.
++        for path, rows in (("v2", 48), ("prefill", 65)):
++            if not tc[path]:
++                continue
++            x = torch.zeros((rows, HIDDEN), dtype=torch.bfloat16, device=device)
++            ids = torch.zeros((rows, TOPK), dtype=torch.int64, device=device)
++            weights = torch.full((rows, TOPK), 1 / TOPK,
++                                 dtype=torch.float32, device=device)
++            out = torch.empty_like(x)
++            getattr(ops, "moe_out_" + path)(
++                x, ids, weights, tc["ptrs"], tc["meta"], tc["emap"], inter,
++                bits, 10.0, out, workspace)
++        torch.cuda.current_stream(device).synchronize()
++        layer._exl3_tc = tc
++        _log_once(layer, "rows 1..42 retain coop; TC begins at 43")
++        logger.info("EXL3 TC MoE ready layer=%s I=%s K=%s v2=%s prefill=%s "
++                    "cap=%s shared_ws=%.1fMiB (Curtis White / Morrowmake)",
++                    getattr(layer, "prefix", getattr(layer, "layer_name", "?")),
++                    inter, bits // 2, v2, prefill, cap,
++                    workspace.numel() * 4 / 1048576)
++    except Exception as exc:
++        _log_once(layer, f"setup failed: {exc}")
++
++
++def try_apply(x, ids, weights, layer, expert_map, limit):
++    tc = getattr(layer, "_exl3_tc", None)
++    if tc is None:
++        return None
++    if x.dim() != 2 or x.shape[1] != HIDDEN or x.dtype != torch.bfloat16:
++        _log_once(layer, "activation geometry/dtype (need BF16)")
++        return None
++    if (ids.dim() != 2 or tuple(ids.shape) != (x.shape[0], TOPK)
++            or tuple(weights.shape) != tuple(ids.shape)
++            or ids.dtype not in (torch.int32, torch.int64)):
++        _log_once(layer, "routing geometry/dtype (need top-6)")
++        return None
++    emap = tc["emap"] if expert_map is None else expert_map
++    if (not x.is_cuda or any(t.device != x.device for t in
++                            (ids, weights, emap, tc["ptrs"]))
++            or emap.dim() != 1 or emap.numel() != EXPERTS
++            or emap.dtype not in (torch.int32, torch.int64)):
++        _log_once(layer, "routing device/map")
++        return None
++    if limit is not None and not math.isfinite(float(limit)):
++        _log_once(layer, "nonfinite clamp")
++        return None
++    path = select_path(int(x.shape[0]), tc["v2"], tc["prefill"], tc["cap"])
++    if path is None:
++        return None
++    out = torch.empty_like(x, memory_format=torch.contiguous_format)
++    # Do not catch launch failures: CUDA errors cannot safely become coop outputs.
++    getattr(tc["ops"], "moe_out_" + path)(
++        x.contiguous(), ids.contiguous(), weights.float().contiguous(),
++        tc["ptrs"], tc["meta"], emap.contiguous(), tc["intermediate"],
++        tc["bits_x2"], float(limit or 0), out, tc["workspace"])
++    return out

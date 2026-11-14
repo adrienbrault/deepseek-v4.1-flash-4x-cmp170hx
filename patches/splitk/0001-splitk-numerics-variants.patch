@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+# Default-off BF16x2/FP32 probability products and legacy RoPE rounding.
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -2432,0 +2433,21 @@
++def _splitk_numerics_pv(p, k, PV_PRECISION: tl.constexpr):
++    # QK is unchanged. Only the unnormalized softmax probability operand changes.
++    if PV_PRECISION == 1:
++        p_hi = p.to(tl.bfloat16)
++        p_lo = (p - p_hi.to(tl.float32)).to(tl.bfloat16)
++        return tl.dot(p_lo, k, acc=tl.dot(p_hi, k))
++    elif PV_PRECISION == 2:
++        # Deliberately slow diagnostic: full FP32 operands, no TF32 truncation.
++        return tl.dot(p.to(tl.float32), k.to(tl.float32), input_precision="ieee")
++    else:
++        return tl.dot(p.to(k.dtype), k)
++
++
++@functools.cache
++def _sm80_sparse_numerics_note(pv_precision, rope_round):
++    # Host constants only; called during warmup, cached before graph capture.
++    logger.info("SM80_SPARSE_NUMERICS pv_precision=%s rope_round=%s",
++                pv_precision, rope_round)
++
++
++@triton.jit
+@@ -2467,0 +2489 @@
++    PV_PRECISION: tl.constexpr = 0,
+@@ -2553,2 +2575,2 @@
+-        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++        acc_nope = acc_nope * alpha[:, None] + _splitk_numerics_pv(p, k_nope, PV_PRECISION)
++        acc_rope = acc_rope * alpha[:, None] + _splitk_numerics_pv(p, k_rope, PV_PRECISION)
+@@ -2621,2 +2643,2 @@
+-            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++            acc_nope = acc_nope * alpha[:, None] + _splitk_numerics_pv(p, k_nope, PV_PRECISION)
++            acc_rope = acc_rope * alpha[:, None] + _splitk_numerics_pv(p, k_rope, PV_PRECISION)
+@@ -2706,0 +2729 @@
++    PV_PRECISION: tl.constexpr = 0,
+@@ -2799,2 +2822,2 @@
+-        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++        acc_nope = acc_nope * alpha[:, None] + _splitk_numerics_pv(p, k_nope, PV_PRECISION)
++        acc_rope = acc_rope * alpha[:, None] + _splitk_numerics_pv(p, k_rope, PV_PRECISION)
+@@ -2870,2 +2893,2 @@
+-            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++            acc_nope = acc_nope * alpha[:, None] + _splitk_numerics_pv(p, k_nope, PV_PRECISION)
++            acc_rope = acc_rope * alpha[:, None] + _splitk_numerics_pv(p, k_rope, PV_PRECISION)
+@@ -3356,0 +3380 @@
++    ROUND_BEFORE_ROPE: tl.constexpr = False,
+@@ -3446,0 +3471,3 @@
++        if ROUND_BEFORE_ROPE:
++            # Match legacy's BF16 store before its separate inverse RoPE.
++            out = out.to(tl.bfloat16).to(tl.float32)
+@@ -4104,0 +4132,6 @@
++    pv_precision = ("bf16", "bf16x2", "fp32").index(sm80_config.pv_precision) if use_sm80 else 0
++    round_before_rope = use_sm80 and sm80_config.rope_round == "bf16"
++    if pv_precision:
++        assert q.dtype == torch.bfloat16, "numerics variants require BF16 Q"
++    if pv_precision or round_before_rope:
++        _sm80_sparse_numerics_note(sm80_config.pv_precision, sm80_config.rope_round)
+@@ -4176,0 +4210 @@
++            PV_PRECISION=pv_precision,
+@@ -4314,0 +4349 @@
++            PV_PRECISION=pv_precision,
+@@ -4358,0 +4394 @@
++        ROUND_BEFORE_ROPE=round_before_rope,
+--- a/vllm/v1/attention/ops/sm80_sparse_config.py
++++ b/vllm/v1/attention/ops/sm80_sparse_config.py
+@@ -20,0 +21,2 @@
++    pv_precision: str = "bf16"
++    rope_round: str = "fused"
+@@ -40,0 +43,3 @@
++            or self.pv_precision not in ("bf16", "bf16x2", "fp32")
++            or self.rope_round not in ("fused", "bf16")
++            or (self.legacy and (self.pv_precision != "bf16" or self.rope_round != "fused"))

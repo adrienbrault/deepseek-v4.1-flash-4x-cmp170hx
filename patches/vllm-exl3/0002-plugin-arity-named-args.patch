@@ -1,0 +1,18 @@
+# 0007: vllm-exl3 _exl3_moe_arity also counts pybind11 named parameters (vcruz305 fork exl3_moe_mixedk documents name: type, not argN; arity None made mixed-K launches drop their trailing args and failed check_runtime).
+--- a/src/vllm_exl3/exl3.py	2026-10-20 15:38:02
++++ b/src/vllm_exl3/exl3.py	2026-10-20 15:38:02
+@@ -1586,6 +1586,14 @@
+     idx = [int(m) for m in re.findall(r"\barg(\d+)\s*:", doc)]
+     if idx:
+         return max(idx) + 1
++    # pybind11 bindings declared with py::arg names document "name: type" instead of argN
++    # (the vcruz305 fork's exl3_moe_mixedk); count the parameters of the first signature line.
++    head = doc.split("\n", 1)[0]
++    if "(" in head and ")" in head:
++        inner = head[head.index("(") + 1 : head.rindex(")")]
++        names = re.findall(r"(?:^|,\s*)([A-Za-z_]\w*)\s*:", inner)
++        if names:
++            return len(names)
+     try:
+         import inspect
+ 

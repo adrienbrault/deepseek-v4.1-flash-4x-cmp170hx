@@ -1,0 +1,561 @@
+[
+  {
+    "file": "patches/vllm/0001-Support-software-FP8-cache-conversions-on-Ampere.patch",
+    "purpose": "Support software FP8 cache conversions on Ampere",
+    "targets": [
+      "vllm/models/deepseek_v4/common/ops/cache_utils.py",
+      "vllm/models/deepseek_v4/common/ops/fused_indexer_q.py",
+      "vllm/models/deepseek_v41/common/ops/cache_utils.py",
+      "vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py",
+      "vllm/models/deepseek_v41/common/ops/indexer_k_store.py",
+      "vllm/v1/attention/ops/fp8_sm80.py",
+      "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "1b959572fc5051f760e40e179e74e79410a500a200466923939290a5d7b5b784"
+  },
+  {
+    "file": "patches/vllm/0002-Add-an-Ampere-fallback-for-sparse-indexer-scoring.patch",
+    "purpose": "Add an Ampere fallback for sparse indexer scoring",
+    "targets": [
+      "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "vllm/v1/attention/backends/mla/indexer.py",
+      "vllm/v1/attention/ops/mqa_logits_triton.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "a6e6acc4f0108191a9f59e2f13d70a1ea3a72773297d878d6b3e6f71084bc28d"
+  },
+  {
+    "file": "patches/vllm/0003-Connect-DeepSeek-V4.1-sparse-attention-on-SM80.patch",
+    "purpose": "Connect DeepSeek V4.1 sparse attention on SM80",
+    "targets": [
+      "vllm/models/deepseek_v41/amd/rocm.py",
+      "vllm/models/deepseek_v41/ampere/__init__.py",
+      "vllm/models/deepseek_v41/ampere/ampere_sparse.py",
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/v1/attention/backends/registry.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "9e75db181bd8bda9f9e57d5dda8fa0219e108a3500ffb1d1fd680f72582acab1"
+  },
+  {
+    "file": "patches/vllm/0004-Serve-V4.1-Engram-rows-from-bounded-SSD-storage.patch",
+    "purpose": "Serve V4.1 Engram rows from bounded SSD storage",
+    "targets": [
+      "vllm/model_executor/model_loader/weight_utils.py",
+      "vllm/models/deepseek_v41/common/engram.py",
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/models/deepseek_v41/ssd/__init__.py",
+      "vllm/models/deepseek_v41/ssd/engram_ssd.py",
+      "vllm/models/deepseek_v41/ssd/row_store.cpp"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "e9309260eee338b59b25d119d14f483ebf3dbebab7a6538c0efa125b43973fc9"
+  },
+  {
+    "file": "patches/vllm/0005-Forward-V4.1-shared-cache-sources-across-pipeline-cu.patch",
+    "purpose": "Forward V4.1 shared cache sources across pipeline cuts",
+    "targets": [
+      "vllm/models/deepseek_v41/ampere/ampere_sparse.py",
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/models/deepseek_v41/pp_shadow.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "8e0195af462ba284b0ae4a70ef28f123f7975a5a4d26b422ee810094a72f8437"
+  },
+  {
+    "file": "patches/vllm/0006-Load-a-private-DSpark-embedding-on-the-last-pipeline.patch",
+    "purpose": "Load a private DSpark embedding on the last pipeline rank",
+    "targets": [
+      "vllm/models/deepseek_v41/nvidia/dspark.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "0b3ec73a91b6794b7b85047fda882a6a8935898454b94f641ca282c153d637bc"
+  },
+  {
+    "file": "patches/vllm/0007-Stage-Ampere-MXFP4-MoE-repacking-through-host-memory.patch",
+    "purpose": "Stage Ampere MXFP4 MoE repacking through host memory",
+    "targets": [
+      "vllm/model_executor/layers/quantization/mxfp4.py",
+      "vllm/models/deepseek_v41/marlin_staged.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "567d80d6693b1000f70237191c1e1f6117c3f610be67fbf0ca1827c0db033545"
+  },
+  {
+    "file": "patches/vllm/0008-Add-startup-memory-census-and-opt-in-phase-diagnosti.patch",
+    "purpose": "Add startup memory census and opt-in phase diagnostics",
+    "targets": [
+      "vllm/utils/dsv41_diagnostics.py",
+      "vllm/v1/engine/core.py",
+      "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+      "vllm/v1/worker/gpu_worker.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "7288cdec243e943a76f047d12be5a5b000548866c153784fe0f5162504e28c91"
+  },
+  {
+    "file": "patches/vllm/0009-Serialize-auxiliary-streams-during-breakable-graph-c.patch",
+    "purpose": "Serialize auxiliary streams during breakable graph capture",
+    "targets": [
+      "vllm/utils/multi_stream_utils.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "89f2857242e04aec4e9f04aa691212917d014fac032c609faa697b535ba473bb"
+  },
+  {
+    "file": "patches/vllm/0010-Allocate-only-local-layers-in-projected-KV-cache-gro.patch",
+    "purpose": "Allocate only local layers in projected KV cache groups",
+    "targets": [
+      "vllm/v1/core/kv_cache_planning.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "807f8a12b3926b46e0b6ec405c232ff1ac7eb49b937ac95932051bcc483bd782"
+  },
+  {
+    "file": "patches/vllm/0011-Enable-device-trimmed-DSpark-indexer-rows-on-Ampere.patch",
+    "purpose": "Enable device-trimmed DSpark indexer rows on Ampere",
+    "targets": [
+      "tests/v1/attention/test_sm80_adaptive_indexer.py",
+      "vllm/v1/attention/backends/mla/indexer.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "1355e94622654338d288da4caf7bbbfd6dccb9b23ef901182c016fa32dcf1e8d"
+  },
+  {
+    "file": "patches/vllm/0012-Add-exact-bit-based-E4M3FN-decode-for-sparse-attenti.patch",
+    "purpose": "Add exact bit-based E4M3FN decode for sparse attention",
+    "targets": [
+      "vllm/v1/attention/ops/fp8_sm80.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "512d3c7b10fe7a34462881704f0d8b5b72278ca33c1af6830dfc10fdfdb3abc4"
+  },
+  {
+    "file": "patches/vllm/0013-Add-opt-in-offline-tuned-sparse-decode-on-SM80.patch",
+    "purpose": "Add opt-in offline-tuned sparse decode on SM80",
+    "targets": [
+      "tests/kernels/attention/test_sm80_sparse_cpu.py",
+      "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "vllm/v1/attention/ops/sm80_sparse_config.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "38042cc5b172ce9ee7ba0c379cb2229c36d836281dff659f96b1168b4f54beee"
+  },
+  {
+    "file": "patches/vllm/0014-Add-SM80-sparse-attention-correctness-and-offline-tu.patch",
+    "purpose": "Add SM80 sparse attention correctness and offline tuning tool",
+    "targets": [
+      "benchmarks/kernels/benchmark_sm80_sparse_decode.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "8dfe88e1189b544d12ea582e1749d62e4c2e003dbee5042ad7cef68e724bb17c"
+  },
+  {
+    "file": "patches/vllm/0015-Add-opt-in-vocabulary-parallel-sampling-for-V4.1-DSp.patch",
+    "purpose": "Add opt-in vocabulary-parallel sampling for V4.1 DSpark",
+    "targets": [
+      "benchmarks/kernels/bench_tp_sampling.py",
+      "tests/v1/worker/test_gpu_sampler_flags.py",
+      "tests/v1/worker/test_vocab_parallel_sampling.py",
+      "vllm/envs.py",
+      "vllm/models/deepseek_v41/nvidia/dspark.py",
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu/sample/distributed.py",
+      "vllm/v1/worker/gpu/sample/distributed_sampler.py",
+      "vllm/v1/worker/gpu/sample/gumbel.py",
+      "vllm/v1/worker/gpu/sample/sampler.py",
+      "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+      "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "c98f6d0e2e864a68772f0d4051f86ffd83b79d4dcb6c4cdc494319553279486a"
+  },
+  {
+    "file": "patches/vllm/0016-Export-bounded-per-rank-prefill-profiles.patch",
+    "purpose": "Export bounded per-rank prefill profiles",
+    "targets": [
+      "vllm/utils/dsv41_diagnostics.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "4837e87f541be6c3da42a4b34344441ebd535ed760323e4171acccb8486fcab4"
+  },
+  {
+    "file": "patches/vllm/0017-Add-opt-in-SM80-prefill-indexer-reuse-and-fused-post.patch",
+    "purpose": "Add opt-in SM80 prefill indexer reuse and fused postprocessing",
+    "targets": [
+      "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "vllm/v1/attention/ops/indexer_prefill_sm80.py",
+      "vllm/v1/attention/ops/mqa_logits_triton.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "b3569026a6d51f8c9604912523566ba2f5625097746d1671af2299f586c49714"
+  },
+  {
+    "file": "patches/vllm/0018-Allow-SM80-indexer-row-sharding-with-candidate-propa.patch",
+    "purpose": "Allow SM80 indexer row sharding with candidate propagation",
+    "targets": [
+      "vllm/model_executor/layers/sparse_attn_indexer.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "945efd0bfb80215c6d881992057c42b9d493c4193cc0f7fd6c720505423e50fc"
+  },
+  {
+    "file": "patches/vllm/0019-Pipeline-opt-in-SM80-EXL3-prefill-compute-and-reduct.patch",
+    "purpose": "Pipeline opt-in SM80 EXL3 prefill compute and reductions",
+    "targets": [
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/utils/dsv41_prefill_overlap.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "c1f8641adb147a75d998293b6f18bc70bded528f32eaf08db0308dac84934196"
+  },
+  {
+    "file": "patches/vllm/0020-Add-opt-in-SM80-kernels-for-delayed-mHC-decode-seams.patch",
+    "purpose": "Add opt-in SM80 kernels for delayed mHC decode seams",
+    "targets": [
+      "benchmarks/kernels/benchmark_mhc_sm80.py",
+      "tests/kernels/mhc/test_mhc_sm80_cpu.py",
+      "vllm/envs.py",
+      "vllm/model_executor/kernels/mhc/sm80.py",
+      "vllm/model_executor/kernels/mhc/sm80_config.py",
+      "vllm/model_executor/kernels/mhc/tilelang.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "54f6c97402c24362061b9bb4ad0dd4fc58fcdb735b05b8e1895eaab5ff12dc66"
+  },
+  {
+    "file": "patches/vllm/0021-Overlap-whole-request-V4.1-TP4-verify-microbatches-w.patch",
+    "purpose": "Overlap whole-request V4.1 TP4 verify microbatches with upstream DBO",
+    "targets": [
+      "tests/v1/worker/test_gpu_ubatch_slicing.py",
+      "vllm/config/parallel.py",
+      "vllm/config/vllm.py",
+      "vllm/distributed/device_communicators/cuda_communicator.py",
+      "vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py",
+      "vllm/envs.py",
+      "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "vllm/models/deepseek_v41/attention.py",
+      "vllm/models/deepseek_v41/common/engram.py",
+      "vllm/models/deepseek_v41/nvidia/model.py",
+      "vllm/v1/attention/backends/mla/indexer.py",
+      "vllm/v1/worker/gpu/cudagraph_utils.py",
+      "vllm/v1/worker/gpu/dp_utils.py",
+      "vllm/v1/worker/gpu/dsv41_tbo.py",
+      "vllm/v1/worker/gpu/model_runner.py",
+      "vllm/v1/worker/gpu/ubatch_utils.py",
+      "vllm/v1/worker/ubatching.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "5c5f2d877e36feb0da52ebbf382d50c51eb1a9c6e0f900a182f8d2a8b8706c23"
+  },
+  {
+    "file": "patches/vllm/0022-Add-opt-in-two-shot-INT8-TP4-IPC-all-reduce-on-SM80.patch",
+    "purpose": "Add opt-in two-shot INT8 TP4 IPC all-reduce on SM80",
+    "targets": [
+      "tests/distributed/test_custom_all_reduce.py",
+      "vllm/distributed/device_communicators/cuda_communicator.py",
+      "vllm/distributed/device_communicators/dsv41_int8_all_reduce.py",
+      "vllm/envs.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "ebd1d512b42f3e45f090d4ff7b93fd6a51cc564eeb28c41465ace03d156c74ea"
+  },
+  {
+    "file": "patches/vllm/0023-Apply-the-inverse-RoPE-in-the-un-tuned-sparse-decode.patch",
+    "purpose": "Apply the inverse RoPE in the un-tuned sparse decode fallback",
+    "targets": [
+      "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "cf91976d623b773ae07486d3b8ad8439681ad71ad409b93aa0c38a809cfd8a1e"
+  },
+  {
+    "file": "patches/vllm/0024-Fix-the-SM80-adaptive-gate-s-packed-KV-fixture.patch",
+    "purpose": "Fix the SM80 adaptive gate's packed KV fixture",
+    "targets": [
+      "tests/kernels/attention/sm80_adaptive_gate.py",
+      "tests/kernels/attention/test_sm80_adaptive_gate_cpu.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "cb14502bf506d361f2ac49e3650a32f95e87945ca9583d87f5d4ada973c125c4"
+  },
+  {
+    "file": "patches/vllm/0025-Preserve-FP32-projection-values-at-the-SM80-fused-mH.patch",
+    "purpose": "Preserve FP32 projection values at the SM80 fused mHC seam",
+    "targets": [
+      "benchmarks/kernels/benchmark_mhc_sm80.py",
+      "tests/kernels/mhc/test_mhc_sm80_cpu.py",
+      "vllm/model_executor/kernels/mhc/sm80.py",
+      "vllm/model_executor/kernels/mhc/torch.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "85d0c50d01bc8f4391f63de78826b585db92ad027fbb3b7e564adb4f15b0c599"
+  },
+  {
+    "file": "patches/vllm/0026-filter-dspark-unused-shards.patch",
+    "purpose": "filter dspark unused shards",
+    "targets": [
+      "vllm/models/deepseek_v41/nvidia/dspark.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+    "sha256": "cc7837e7a750198b52d5b74c037f6c1dfd73ff4b729dd6606b8cf0fc4b8a428d"
+  },
+  {
+    "file": "patches/vllm-exl3/0001-plugin-gemv-half-param.patch",
+    "purpose": "plugin gemv half param",
+    "targets": [
+      "csrc/p2b_batched.cu\t2026-10-20 12:37:55"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "2dcdb6ce3530c5b8bf8ef14c10041fd42c90fe1a1d1b6a0a8958ebf202cf2657"
+  },
+  {
+    "file": "patches/vllm-exl3/0002-plugin-arity-named-args.patch",
+    "purpose": "plugin arity named args",
+    "targets": [
+      "src/vllm_exl3/exl3.py\t2026-10-20 15:38:02"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "c409effc8f336dc6a47d58af51bf4c2ddeb5bd42e77e54d77b7831680c72d5ca"
+  },
+  {
+    "file": "patches/vllm-exl3/0003-require-direct-fill-arenas.patch",
+    "purpose": "require direct fill arenas",
+    "targets": [
+      "src/vllm_exl3/exl3.py"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "4103f0faa2bfff2cbfd59164a8b01bada50323ebb31948cb6a976725a7ec2ebb"
+  },
+  {
+    "file": "patches/vllm-exl3/0004-plugin-ep-offset-only-with-ep.patch",
+    "purpose": "plugin ep offset only with ep",
+    "targets": [
+      "src/vllm_exl3/exl3.py\t2026-10-20 17:19:48"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "d01dbf77b70bd247b488b9d3cd50d13101f7333cf932f02276fc8876a40037da"
+  },
+  {
+    "file": "patches/vllm-exl3/0005-tp-aligned-rotated-trellis-arenas.patch",
+    "purpose": "tp aligned rotated trellis arenas",
+    "targets": [
+      "src/vllm_exl3/exl3.py",
+      "src/vllm_exl3/mixed_k_guard.py"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "42a2e619350fb69083024ee99ab9789347166a8931b58d382d5543ce538cad8b"
+  },
+  {
+    "file": "patches/vllm-exl3/0006-curtis-tensor-core-moe.patch",
+    "purpose": "Integrate Curtis White TC-MoE with r7 arenas and fused apply",
+    "targets": [
+      "NOTICE",
+      "src/vllm_exl3/exl3.py",
+      "src/vllm_exl3/tc_moe/LICENSE",
+      "src/vllm_exl3/tc_moe/NOTICE.md",
+      "src/vllm_exl3/tc_moe/build_standalone.py",
+      "src/vllm_exl3/tc_moe/codec.cuh",
+      "src/vllm_exl3/tc_moe/codec_moe_v2.cuh",
+      "src/vllm_exl3/tc_moe/common.h",
+      "src/vllm_exl3/tc_moe/module.cpp",
+      "src/vllm_exl3/tc_moe/moe_prefill.cu",
+      "src/vllm_exl3/tc_moe/moe_prefill.h",
+      "src/vllm_exl3/tc_moe/moe_v2.cu",
+      "src/vllm_exl3/tc_moe/moe_v2.h",
+      "src/vllm_exl3/tc_moe_hook.py"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "fdfe4d2a09a9da0e09fbb039c53124c263fe0af4761189f1e0b58b783bc281a2"
+  },
+  {
+    "file": "patches/vllm-exl3/0007-build-cxx20-for-torch-2.14.patch",
+    "purpose": "build cxx20 for torch 2.14",
+    "targets": [
+      "setup.py\t2026-10-20 21:41:50"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "1e48fff36459600cee0f2b4d9b0a7ad97acf57a54e76344af79b6dbf58307052"
+  },
+  {
+    "file": "patches/vllm-exl3/0008-load-reclaim-fast.patch",
+    "purpose": "load reclaim fast",
+    "targets": [
+      "src/vllm_exl3/exl3.py",
+      "tests/test_load_reclaim_fast.py"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "2189ba8748a06df59b6dcaf192e3814767cd5e91d73fd9875e2245311fb42f53"
+  },
+  {
+    "file": "patches/vllm-exl3/0009-load-strided-bounce.patch",
+    "purpose": "load strided bounce",
+    "targets": [
+      "src/vllm_exl3/exl3.py"
+    ],
+    "license": "AGPL-3.0-only",
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "sha256": "707a1a6d188cdea5072152af9b8a5b6f0858808ce4811d51bacbbb6470a8c3bb"
+  },
+  {
+    "file": "patches/native/0001-ptr.patch",
+    "purpose": "Hoist invariant cooperative kernel pointer arithmetic",
+    "targets": [
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "d9479e55f0b4573aa15c3b62aa6f367fe476a8c6d469cd9bf70b9fd0a72856a8"
+  },
+  {
+    "file": "patches/native/0002-rowclamp.patch",
+    "purpose": "Clamp routed rows at the block boundary",
+    "targets": [
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "1cc765f11f132d22559fa940b7deeb3744cbe94bff3f57b0556ee07af4c5e289"
+  },
+  {
+    "file": "patches/native/0003-noclamp.patch",
+    "purpose": "Remove redundant per-iteration row clamps",
+    "targets": [
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "b6cb687570f88c6432bccc9d4834997f2dbbca19512eb5f44e0766391b829bbd"
+  },
+  {
+    "file": "patches/native/0004-laneclamp.patch",
+    "purpose": "Clamp only the lanes that need a boundary check",
+    "targets": [
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "d45ff7c3cb05b0d4da36561424c0b2a70b7f7fa3be1252ba3063378ad84c26d7"
+  },
+  {
+    "file": "patches/native/0005-pitch.patch",
+    "purpose": "Pad shared scratch pitch by four columns",
+    "targets": [
+      "quant/comp_units/opera_coop_inst_k2.cu",
+      "quant/comp_units/opera_coop_inst_k3.cu",
+      "quant/comp_units/opera_coop_inst_k4.cu",
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "63456bb2f38382f6bf823a7800a53faa8b39187b1d1512957316d2368b52650d"
+  },
+  {
+    "file": "patches/native/0006-stores.patch",
+    "purpose": "Suppress stores to padded rows that no reader consumes",
+    "targets": [
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "da9311671f50b31827c2118fd5557ac48e186d0173a5c63cb1cc1ca5a0ac35c8"
+  },
+  {
+    "file": "patches/native/0007-fixed512.patch",
+    "purpose": "Specialize guarded intermediate width 512",
+    "targets": [
+      "quant/opera_coop.cu",
+      "quant/opera_coop_kernel.cuh"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "bb25dc37fbbe31c274663d2053d4fc177867900d1da8cd4e8341ba3e8bd6f3b3"
+  },
+  {
+    "file": "patches/native/0008-fixed640.patch",
+    "purpose": "Specialize guarded intermediate width 640 while retaining the 512 and generic paths",
+    "targets": [
+      "quant/opera_coop.cu"
+    ],
+    "license": "MIT",
+    "base": "native header SHA256 0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219",
+    "sha256": "58c3daada939d588e9d89df0fe51dc01fdfade466a965144ed805bc04fe916ad"
+  },
+  {
+    "file": "patches/engram/0001-fused-dequant.patch",
+    "purpose": "Fuse Engram row dequantization",
+    "targets": [
+      "vllm/models/deepseek_v41/ssd/engram_ssd.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27",
+    "sha256": "7f49c6fe264d4eb1cf2966edc35fb3ad27cfa7350697fc7b6c06db737066266b"
+  },
+  {
+    "file": "patches/engram/0002-row-prefetch.patch",
+    "purpose": "Prefetch NVMe rows before their consuming layer",
+    "targets": [
+      "vllm/models/deepseek_v41/common/engram.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27",
+    "sha256": "c631c905b8829ddf4348182d8034ffaa912f45a821b0648c7b4d2f98bb0fd3b3"
+  },
+  {
+    "file": "patches/engram/0003-bounded-row-cache.patch",
+    "purpose": "Bound the host row cache",
+    "targets": [
+      "vllm/models/deepseek_v41/ssd/row_store.cpp"
+    ],
+    "license": "Apache-2.0",
+    "base": "sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27",
+    "sha256": "cd088d8a3d2f8777b7df3f0c94e3728739b37e06a51a8e4bc8b473555d9c432c"
+  },
+  {
+    "file": "patches/splitk/0001-splitk-numerics-variants.patch",
+    "purpose": "Add the BF16x2 probability product selected by the served sparse table",
+    "targets": [
+      "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "vllm/v1/attention/ops/sm80_sparse_config.py"
+    ],
+    "license": "Apache-2.0",
+    "base": "sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27",
+    "sha256": "279522c240b9d08ddc99836c98c401e0461b1f177284d531cdf9dd78fba623ca"
+  }
+]

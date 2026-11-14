@@ -1,0 +1,22 @@
+--- a/quant/opera_coop_kernel.cuh
++++ b/quant/opera_coop_kernel.cuh
+@@ -656,7 +656,7 @@
+     // tile*16 + frag*8 + 2*(l%4) (+1)
+     if constexpr (REG && !HALF)
+     {
+-        // rows >= nrows hold row 0's products (patch_coop_rowclamp.py) and are never read below
++        // Padded rows (including rowclamp values) are never consumed by the reduction.
+         const int rr = 2 * (lane & 3);
+         float* red0 = sh_red + (wk * ROWS + rr) * red_pitch<WIDE>() + wn * COLS;
+         float* red1 = red0 + red_pitch<WIDE>();
+@@ -666,8 +666,8 @@
+             for (int f = 0; f < 2; ++f)
+             {
+                 const int col = t * 16 + f * 8 + (lane >> 2);
+-                red0[col] = acc0[t][f].x;
+-                red1[col] = acc0[t][f].y;
++                if (rr < nrows) red0[col] = acc0[t][f].x;
++                if (rr + 1 < nrows) red1[col] = acc0[t][f].y;
+             }
+     }
+     else if (r0_ok)

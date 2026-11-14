@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_lora_argmax = dsv41_lora_argmax:register

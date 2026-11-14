@@ -1,0 +1,246 @@
+From 18b39453207569b6966afc2b2febb9eb91ecd92c Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 20:56:12 +0200
+Subject: [PATCH 19/20] Pipeline opt-in SM80 EXL3 prefill compute and
+ reductions
+
+Move only the final MoE reduction out of the fused runner and pipeline balanced token chunks with PyNCCL on a side stream. Restrict the path to SM80 TP4 EXL3 without EP, DP or ubatching; serialize decode and capture. Provide a strict live-layer parity gate.
+
+Origin: Local TP4 prefill overlap experiment
+
+Upstream: Not submitted; operator GPU validation pending
+
+
+Signed-off-by: Adrien Brault <adrien.brault@gmail.com>
+---
+ vllm/models/deepseek_v41/nvidia/model.py |  41 ++++++-
+ vllm/utils/dsv41_prefill_overlap.py      | 150 +++++++++++++++++++++++
+ 2 files changed, 190 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/utils/dsv41_prefill_overlap.py
+
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index f8b175696a..e0350af023 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import typing
+ from collections.abc import Callable, Iterable
+ from functools import partial
+@@ -147,6 +148,30 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
+         reduce_results: bool = True,
+     ):
+         config = vllm_config.model_config.hf_config
++        self._dsv41_prefill_chunk = int(os.environ.get("DSV41_PREFILL_MOE_CHUNK", "0"))
++        if vllm_config.parallel_config.tensor_parallel_size == 1:
++            self._dsv41_prefill_chunk = 0
++        if self._dsv41_prefill_chunk:
++            parallel = vllm_config.parallel_config
++            if not (
++                self._dsv41_prefill_chunk >= 128
++                and current_platform.is_device_capability(80)
++                and parallel.tensor_parallel_size == 4
++                and parallel.pipeline_parallel_size == 1
++                and parallel.data_parallel_size == 1
++                and not parallel.enable_expert_parallel
++                and not parallel.use_ubatching
++                and not use_sequence_parallel
++                and reduce_results
++                and vllm_config.lora_config is None
++                and vllm_config.quant_config is not None
++                and vllm_config.quant_config.get_name() == "exl3"
++                and not envs.VLLM_BATCH_INVARIANT
++            ):
++                raise ValueError(
++                    "DSV41_PREFILL_MOE_CHUNK requires SM80 TP4/PP1/DP1 EXL3, "
++                    "no EP, SP, ubatching, LoRA or fused mHC reduction; chunk >=128"
++                )
+         n_routed_experts = config.n_routed_experts
+         n_activated_experts = config.num_experts_per_tok
+         if extract_layer_index(prefix) >= config.num_hidden_layers:
+@@ -163,9 +188,23 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
+             n_routed_experts=n_routed_experts,
+             n_activated_experts=n_activated_experts,
+             num_hash_layers=0,
+-            reduce_results=reduce_results,
++            reduce_results=reduce_results and not self._dsv41_prefill_chunk,
+             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
+         )
++        if self._dsv41_prefill_chunk:
++            from vllm.utils.dsv41_prefill_overlap import register_moe
++
++            self._dsv41_prefill_name = register_moe(self, prefix)
++
++    def _dsv41_local_forward(self, hidden, input_ids):
++        return super().forward(hidden, input_ids)
++
++    def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
++        if self._dsv41_prefill_chunk:
++            return torch.ops.vllm.dsv41_prefill_moe(
++                hidden_states, input_ids, self._dsv41_prefill_name
++            )
++        return super().forward(hidden_states, input_ids, mega_gate_metadata)
+ 
+     def defer_finalize(self) -> None:
+         """Leave the routed top-k reduction to the next fused all-reduce + mHC.
+diff --git a/vllm/utils/dsv41_prefill_overlap.py b/vllm/utils/dsv41_prefill_overlap.py
+new file mode 100644
+index 0000000000..5ea9fae036
+--- /dev/null
++++ b/vllm/utils/dsv41_prefill_overlap.py
+@@ -0,0 +1,150 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in, eager prefill MoE compute / PyNCCL reduction pipeline."""
++
++import json
++import os
++import re
++import weakref
++from collections.abc import Callable
++from pathlib import Path
++
++import torch
++
++from vllm.distributed import get_tp_group
++from vllm.forward_context import get_forward_context
++from vllm.utils.torch_utils import direct_register_custom_op
++
++_layers: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
++
++
++def chunk_ranges(rows: int, maximum: int) -> list[tuple[int, int]]:
++    """Cover all rows with balanced chunks, avoiding a tiny decode-shaped tail."""
++    if rows <= 0 or maximum <= 0:
++        raise ValueError("rows and maximum must be positive")
++    count = (rows + maximum - 1) // maximum
++    size, extra = divmod(rows, count)
++    sizes = [size + (i < extra) for i in range(count)]
++    start = 0
++    result = []
++    for size in sizes:
++        result.append((start, start + size))
++        start += size
++    return result
++
++
++def pipeline_moe(
++    compute: Callable[[int, int], torch.Tensor],
++    rows: int,
++    maximum: int,
++    communicator,
++    stream: torch.cuda.Stream,
++) -> torch.Tensor:
++    """Reduce owned output chunks while the producer computes the next chunk.
++
++    Use PyNCCL directly: FlashInfer IPC workspaces are stream-bound. Cloning
++    each local result protects it from scratch reuse in the next MoE call.
++    """
++    producer = torch.cuda.current_stream()
++    output = None
++    try:
++        for lo, hi in chunk_ranges(rows, maximum):
++            local = compute(lo, hi).contiguous().clone()
++            if output is None:
++                output = local.new_empty((rows, *local.shape[1:]))
++                output.record_stream(stream)
++            ready = torch.cuda.Event()
++            ready.record(producer)
++            stream.wait_event(ready)
++            with torch.cuda.stream(stream):
++                communicator.all_reduce(
++                    local, out_tensor=output[lo:hi], stream=stream
++                )
++                local.record_stream(stream)
++    finally:
++        producer.wait_stream(stream)
++    assert output is not None
++    return output
++
++
++def register_moe(layer, prefix: str) -> str:
++    name = f"{prefix}:{id(layer)}"
++    _layers[name] = layer
++    return name
++
++
++def _prefill_moe(
++    hidden: torch.Tensor, input_ids: torch.Tensor | None, name: str
++) -> torch.Tensor:
++    layer = _layers[name]
++    group = get_tp_group()
++    context = get_forward_context()
++    metadata = context.attn_metadata
++    prefill = isinstance(metadata, dict) and any(
++        getattr(m, "num_prefills", 0) > 0 for m in metadata.values()
++    )
++    chunk = layer._dsv41_prefill_chunk
++    communicator = getattr(group.device_communicator, "pynccl_comm", None)
++    if (
++        not prefill
++        or hidden.shape[0] < 2 * chunk
++        or torch.cuda.is_current_stream_capturing()
++    ):
++        return group.all_reduce(layer._dsv41_local_forward(hidden, input_ids))
++    if communicator is None or communicator.disabled:
++        raise RuntimeError(
++            "DSV41 prefill overlap requires an enabled PyNCCL communicator"
++        )
++
++    stream = getattr(layer, "_dsv41_prefill_stream", None)
++    if stream is None:
++        stream = torch.cuda.Stream(device=hidden.device)
++        layer._dsv41_prefill_stream = stream
++
++    full_padding = context.is_padding
++
++    def compute(lo, hi):
++        context.is_padding = (
++            full_padding[lo:hi] if full_padding is not None else None
++        )
++        try:
++            ids = input_ids[lo:hi] if input_ids is not None else None
++            return layer._dsv41_local_forward(hidden[lo:hi], ids)
++        finally:
++            context.is_padding = full_padding
++
++    output = pipeline_moe(compute, hidden.shape[0], chunk, communicator, stream)
++    if os.environ.get("DSV41_PREFILL_MOE_CHECK", "0") == "1":
++        # Expensive qualification only: reject any batch/collective-order change.
++        reference = group.all_reduce(layer._dsv41_local_forward(hidden, input_ids))
++        equal = torch.equal(output, reference)
++        error = (output.float() - reference.float()).abs().max().item()
++        directory = os.environ.get("DSV41_PREFILL_MOE_CHECK_DIR")
++        if directory:
++            import torch.distributed as dist
++
++            rank = dist.get_rank()
++            root = Path(directory)
++            root.mkdir(parents=True, exist_ok=True)
++            label = re.sub(r"[^A-Za-z0-9_.-]", "_", layer.prefix)
++            receipt = root / f"moe-rank{rank}-{label}-t{hidden.shape[0]}-c{chunk}.json"
++            receipt.write_text(json.dumps({
++                "rank": rank, "layer": layer.prefix, "rows": hidden.shape[0],
++                "chunk": chunk, "bit_equal": equal, "max_abs_error": error,
++            }, indent=2) + "\n")
++        if not equal:
++            raise RuntimeError(
++                f"DSV41 MoE overlap failed exact parity at {layer.prefix}: {error}"
++            )
++    return output
++
++
++def _prefill_moe_fake(
++    hidden: torch.Tensor, input_ids: torch.Tensor | None, name: str
++) -> torch.Tensor:
++    return torch.empty_like(hidden)
++
++
++direct_register_custom_op(
++    "dsv41_prefill_moe", _prefill_moe, fake_impl=_prefill_moe_fake
++)
+-- 
+2.55.0
+

@@ -1,0 +1,16 @@
+--- a/quant/opera_coop.cu
++++ b/quant/opera_coop.cu
+@@ -165,6 +165,13 @@
+               opera_coop_ns::smem_a_bytes<3,false,1>(p.Hi)};
+         kb = {(void*) opera_coop_ns::opera_coop_b_kernel<3,2,2,false,512>,
+               opera_coop_ns::smem_b_bytes<3,false,2>()};
++    }
++    if (p.I == 640 && trim_fixed_ok(p, K_gu, K_d, cb, wide_a, geometry_b))
++    {
++        ka = {(void*) opera_coop_ns::opera_coop_a_kernel<3,2,true,false,640>,
++              opera_coop_ns::smem_a_bytes<3,false,1>(p.Hi)};
++        kb = {(void*) opera_coop_ns::opera_coop_b_kernel<3,2,1,false,640>,
++              opera_coop_ns::smem_b_bytes<3,false,1>()};
+     }
+     // TRIM_FIXED_DISPATCH: unsupported shapes retain ka/kb from the generic selectors.
+     moe_coop_smem_optin(ka.kernel, ka.smem);

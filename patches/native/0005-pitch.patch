@@ -1,0 +1,118 @@
+--- a/quant/comp_units/opera_coop_inst_k2.cu
++++ b/quant/comp_units/opera_coop_inst_k2.cu
+@@ -1,11 +1,11 @@
+ #include "opera_coop_instances.cuh"
+ #include "../opera_coop_kernel.cuh"
+-MoeCoopKernel opera_coop_kernel_a_k2(int cb,int Hi,bool wide) { using namespace opera_coop_ns; const int smem=smem_a_bytes<2>(Hi);
++MoeCoopKernel opera_coop_kernel_a_k2(int cb,int Hi,bool wide) { using namespace opera_coop_ns; const int smem=wide ? smem_a_bytes<2,false,1>(Hi) : smem_a_bytes<2,false,0>(Hi);
+ if(cb==0) return {wide ? (void*)opera_coop_a_kernel<2,0,true> : (void*)opera_coop_a_kernel<2,0,false>,smem};
+ if(cb==1) return {wide ? (void*)opera_coop_a_kernel<2,1,true> : (void*)opera_coop_a_kernel<2,1,false>,smem};
+ if(cb==2) return {wide ? (void*)opera_coop_a_kernel<2,2,true> : (void*)opera_coop_a_kernel<2,2,false>,smem};
+ TORCH_CHECK(false,"invalid codebook"); }
+-MoeCoopKernel opera_coop_kernel_b_k2(int cb,int geometry) { using namespace opera_coop_ns; const int smem=geometry==2 ? smem_b_bytes<2,false,2>() : smem_b_bytes<2,false,1>();
++MoeCoopKernel opera_coop_kernel_b_k2(int cb,int geometry) { using namespace opera_coop_ns; const int smem=geometry==2 ? smem_b_bytes<2,false,2>() : geometry==1 ? smem_b_bytes<2,false,1>() : smem_b_bytes<2,false,0>();
+ if(cb==0 && geometry==0) return {(void*)opera_coop_b_kernel<2,0,0>,smem};
+ if(cb==0 && geometry==1) return {(void*)opera_coop_b_kernel<2,0,1>,smem};
+ if(cb==0 && geometry==2) return {(void*)opera_coop_b_kernel<2,0,2>,smem};
+--- a/quant/comp_units/opera_coop_inst_k3.cu
++++ b/quant/comp_units/opera_coop_inst_k3.cu
+@@ -1,11 +1,11 @@
+ #include "opera_coop_instances.cuh"
+ #include "../opera_coop_kernel.cuh"
+-MoeCoopKernel opera_coop_kernel_a_k3(int cb,int Hi,bool wide) { using namespace opera_coop_ns; const int smem=smem_a_bytes<3>(Hi);
++MoeCoopKernel opera_coop_kernel_a_k3(int cb,int Hi,bool wide) { using namespace opera_coop_ns; const int smem=wide ? smem_a_bytes<3,false,1>(Hi) : smem_a_bytes<3,false,0>(Hi);
+ if(cb==0) return {wide ? (void*)opera_coop_a_kernel<3,0,true> : (void*)opera_coop_a_kernel<3,0,false>,smem};
+ if(cb==1) return {wide ? (void*)opera_coop_a_kernel<3,1,true> : (void*)opera_coop_a_kernel<3,1,false>,smem};
+ if(cb==2) return {wide ? (void*)opera_coop_a_kernel<3,2,true> : (void*)opera_coop_a_kernel<3,2,false>,smem};
+ TORCH_CHECK(false,"invalid codebook"); }
+-MoeCoopKernel opera_coop_kernel_b_k3(int cb,int geometry) { using namespace opera_coop_ns; const int smem=geometry==2 ? smem_b_bytes<3,false,2>() : smem_b_bytes<3,false,1>();
++MoeCoopKernel opera_coop_kernel_b_k3(int cb,int geometry) { using namespace opera_coop_ns; const int smem=geometry==2 ? smem_b_bytes<3,false,2>() : geometry==1 ? smem_b_bytes<3,false,1>() : smem_b_bytes<3,false,0>();
+ if(cb==0 && geometry==0) return {(void*)opera_coop_b_kernel<3,0,0>,smem};
+ if(cb==0 && geometry==1) return {(void*)opera_coop_b_kernel<3,0,1>,smem};
+ if(cb==0 && geometry==2) return {(void*)opera_coop_b_kernel<3,0,2>,smem};
+--- a/quant/comp_units/opera_coop_inst_k4.cu
++++ b/quant/comp_units/opera_coop_inst_k4.cu
+@@ -1,11 +1,11 @@
+ #include "opera_coop_instances.cuh"
+ #include "../opera_coop_kernel.cuh"
+-MoeCoopKernel opera_coop_kernel_a_k4(int cb,int Hi,bool wide) { using namespace opera_coop_ns; const int smem=smem_a_bytes<4>(Hi);
++MoeCoopKernel opera_coop_kernel_a_k4(int cb,int Hi,bool wide) { using namespace opera_coop_ns; const int smem=wide ? smem_a_bytes<4,false,1>(Hi) : smem_a_bytes<4,false,0>(Hi);
+ if(cb==0) return {wide ? (void*)opera_coop_a_kernel<4,0,true> : (void*)opera_coop_a_kernel<4,0,false>,smem};
+ if(cb==1) return {wide ? (void*)opera_coop_a_kernel<4,1,true> : (void*)opera_coop_a_kernel<4,1,false>,smem};
+ if(cb==2) return {wide ? (void*)opera_coop_a_kernel<4,2,true> : (void*)opera_coop_a_kernel<4,2,false>,smem};
+ TORCH_CHECK(false,"invalid codebook"); }
+-MoeCoopKernel opera_coop_kernel_b_k4(int cb,int geometry) { using namespace opera_coop_ns; const int smem=geometry==2 ? smem_b_bytes<4,false,2>() : smem_b_bytes<4,false,1>();
++MoeCoopKernel opera_coop_kernel_b_k4(int cb,int geometry) { using namespace opera_coop_ns; const int smem=geometry==2 ? smem_b_bytes<4,false,2>() : geometry==1 ? smem_b_bytes<4,false,1>() : smem_b_bytes<4,false,0>();
+ if(cb==0 && geometry==0) return {(void*)opera_coop_b_kernel<4,0,0>,smem};
+ if(cb==0 && geometry==1) return {(void*)opera_coop_b_kernel<4,0,1>,smem};
+ if(cb==0 && geometry==2) return {(void*)opera_coop_b_kernel<4,0,2>,smem};
+--- a/quant/opera_coop_kernel.cuh
++++ b/quant/opera_coop_kernel.cuh
+@@ -69,13 +69,14 @@
+ // Dynamic shared memory layout (bytes)
+ template <int bits, bool HALF = false>
+ __host__ __device__ constexpr int smem_stage_bytes() { return tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS * 4 : 0; }
+-constexpr int smem_red_bytes() { return WK * ROWS * COLS * 4; }   // same for both geometries: wk x ROWS x cols
++template <int WIDE> __host__ __device__ constexpr int red_pitch() { return tile_cols<WIDE>() + 4; }
++template <int WIDE> __host__ __device__ constexpr int smem_red_bytes() { return tile_wk<WIDE>() * ROWS * red_pitch<WIDE>() * 4; }
+ constexpr int SLOTS_EPI = 8;  // dsv41 (patch_coop_down_epilogue.py): per-slot partials, top_k <= 8
+ template <int GEOMETRY = 2> constexpr int smem_part_bytes() { return (GEOMETRY == 2 ? 4 * SLOTS_EPI * 128 : WK * 128) * 4; }
+-template <int bits, bool HALF = false>
+-__host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes() + smem_stage_bytes<bits, HALF>(); }
++template <int bits, bool HALF = false, int WIDE = 0>
++__host__ __device__ constexpr int smem_a_bytes(int Hi) { return Hi * 2 + smem_red_bytes<WIDE>() + smem_stage_bytes<bits, HALF>(); }
+ template <int bits, bool HALF = false, int GEOMETRY = 2>
+-__host__ __device__ constexpr int smem_b_bytes() { return smem_red_bytes() + smem_stage_bytes<bits, HALF>() + smem_part_bytes<GEOMETRY>(); }
++__host__ __device__ constexpr int smem_b_bytes() { return smem_red_bytes<GEOMETRY>() + smem_stage_bytes<bits, HALF>() + smem_part_bytes<GEOMETRY>(); }
+ 
+ // ---------------------------------------------------------------------------------------------
+ // Elementwise helpers (fp32 forms of activation_kernels.cuh, which can't be included twice)
+@@ -657,8 +658,8 @@
+     {
+         // rows >= nrows hold row 0's products (patch_coop_rowclamp.py) and are never read below
+         const int rr = 2 * (lane & 3);
+-        float* red0 = sh_red + (wk * ROWS + rr) * TCOLS + wn * COLS;
+-        float* red1 = red0 + TCOLS;
++        float* red0 = sh_red + (wk * ROWS + rr) * red_pitch<WIDE>() + wn * COLS;
++        float* red1 = red0 + red_pitch<WIDE>();
+         #pragma unroll
+         for (int t = 0; t < WNT; ++t)
+             #pragma unroll
+@@ -672,7 +673,7 @@
+     else if (r0_ok)
+     {
+         const int c0 = 2 * (lane & 3);
+-        float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
++        float* red = sh_red + (wk * ROWS + r0) * red_pitch<WIDE>() + wn * COLS;
+         #pragma unroll
+         for (int t = 0; t < WNT; ++t)
+             #pragma unroll
+@@ -692,7 +693,7 @@
+         float sum = 0.0f;
+         #pragma unroll
+         for (int j = 0; j < WKK; ++j)
+-            sum += sh_red[(j * ROWS + r) * TCOLS + c];
++            sum += sh_red[(j * ROWS + r) * red_pitch<WIDE>() + c];
+         const size_t idx = (size_t) rows[r] * c_stride + group * TCOLS + c;
+         if (c_f32) ((float*) C)[idx] = sum;
+         else       ((half*) C)[idx] = __float2half_rn(sum);
+@@ -840,7 +841,7 @@
+     extern __shared__ uint32_t smem_dyn[];
+     half* sh_A = (half*) smem_dyn;
+     float* sh_red = (float*) (smem_dyn + p.Hi / 2);
+-    uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
++    uint32_t* sh_stage = smem_dyn + p.Hi / 2 + smem_red_bytes<WIDE>() / 4;
+     __shared__ int sh_flag;
+     __shared__ int sh_res[4];
+     __shared__ int sh_rows[ROWS];
+@@ -976,8 +977,8 @@
+     constexpr int CPB = tile_cpb<GB>();
+     extern __shared__ uint32_t smem_dyn[];
+     float* sh_red = (float*) smem_dyn;
+-    uint32_t* sh_stage = smem_dyn + WK * ROWS * COLS;
+-    float* sh_part = (float*) (smem_dyn + WK * ROWS * COLS + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
++    uint32_t* sh_stage = smem_dyn + smem_red_bytes<GB>() / 4;
++    float* sh_part = (float*) (smem_dyn + smem_red_bytes<GB>() / 4 + (tile_may_stage<bits, HALF>() ? WK * STAGE_WORDS : 0));
+     __shared__ int sh_flag;
+     __shared__ int sh_n_active;
+     __shared__ float sh_gate;

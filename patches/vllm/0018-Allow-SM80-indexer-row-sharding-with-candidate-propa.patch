@@ -1,0 +1,73 @@
+From c20e07a8266c10eca2caf7fb06cdb107851d62aa Mon Sep 17 00:00:00 2001
+From: Adrien Brault <adrien.brault@gmail.com>
+Date: Tue, 20 Oct 2026 20:52:52 +0200
+Subject: [PATCH 18/20] Allow SM80 indexer row sharding with candidate
+ propagation
+
+Opt in to row sharding for two-level candidate writers and consumers. Exchange source candidate rows as well as final top-k indices; retain the existing sharding threshold and safety predicates.
+
+Origin: Local SM80 prefill optimization
+
+Upstream: Not submitted; operator GPU validation pending
+
+
+Signed-off-by: Adrien Brault <adrien.brault@gmail.com>
+---
+ .../layers/sparse_attn_indexer.py              | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index f478c5536c..6daff90334 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -105,6 +105,9 @@ _DSV4_LOGITS_ROW_CHUNK = int(_os.environ.get("DSV4_LOGITS_ROW_CHUNK", "64"))
+ _DSV41_INDEXER_PREDECODE = _os.environ.get("DSV41_INDEXER_PREDECODE", "0") == "1"
+ _DSV41_INDEXER_FUSED_POST = _os.environ.get("DSV41_INDEXER_FUSED_POST", "0") == "1"
+ _DSV41_INDEXER_BLOCK_N = int(_os.environ.get("DSV41_INDEXER_BLOCK_N", "128"))
++_DSV41_INDEXER_SHARD_CANDIDATES = (
++    _os.environ.get("DSV41_INDEXER_SHARD_CANDIDATES", "0") == "1"
++)
+ if _DSV4_LOGITS_ROW_CHUNK < 0:
+     raise ValueError("DSV4_LOGITS_ROW_CHUNK must be nonnegative")
+ if _DSV41_INDEXER_BLOCK_N not in (64, 128, 256):
+@@ -573,6 +576,10 @@ def sparse_attn_indexer(
+         # The dummy run returns before exchange_topk executes, so reserve its
+         # worst-case transient for the memory profile.
+         _reserve_row_shard_exchange_transient(topk_indices_buffer, hidden_states.device)
++        if _DSV41_INDEXER_SHARD_CANDIDATES and candidate_blocks is not None:
++            _reserve_row_shard_exchange_transient(
++                candidate_blocks, hidden_states.device
++            )
+ 
+         return sparse_attn_indexer_fake(
+             hidden_states,
+@@ -701,10 +708,15 @@ def sparse_attn_indexer(
+             scales_spec,
+             *gather_specs,
+         )
+-        # One row window per rank; DSV4.1 candidate rows stay replicated.
++        # Candidate writers exchange their rows before any consumer uses them.
++        shard_candidates = (
++            _DSV41_INDEXER_SHARD_CANDIDATES
++            and current_platform.is_device_capability(80)
++            and not is_deep_gemm_supported()
++        )
+         row_shard = (
+             None
+-            if candidate_blocks is not None
++            if candidate_blocks is not None and not shard_candidates
+             else PrefillRowShard.from_metadata(prefill_metadata, num_decode_tokens)
+         )
+         for chunk in prefill_metadata.chunks:
+@@ -896,6 +908,8 @@ def sparse_attn_indexer(
+         if row_shard is not None:
+             # Rows are already fully ranked, so this is a layout gather.
+             row_shard.exchange_topk(topk_indices_buffer, topk_tokens)
++            if candidate_blocks is not None and candidate_write:
++                row_shard.exchange_topk(candidate_blocks, candidate_blocks.shape[1])
+ 
+     if has_decode:
+         decode_metadata = attn_metadata_narrowed.decode
+-- 
+2.55.0
+

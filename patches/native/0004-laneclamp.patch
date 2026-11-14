@@ -1,0 +1,29 @@
+--- a/quant/opera_coop_kernel.cuh
++++ b/quant/opera_coop_kernel.cuh
+@@ -425,13 +425,15 @@
+         x_src_b = i2 % 24;
+     }
+ 
+-    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
++    // dsv41 (patch_coop_laneclamp.py): at 3 bpw lanes 24-31 read lane 23's word (never a shuffle source)
++    const int lane_b = (REG && bits == 3) ? min(lane, 23) : lane;
++    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane_b;
+     [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
+ 
+     auto ld_b = [&] (int i, int l) -> uint32_t
+     {
+         if constexpr (REG && bits == 3)
+-            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
++            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);   // dsv41 (patch_coop_laneclamp.py)
+         else if constexpr (!REG)
+             return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+         else
+@@ -510,7 +512,7 @@
+         auto ld_p = [&] (const uint32_t* src, int l) -> uint32_t
+         {
+             if constexpr (bits == 3)
+-                return lane < 24 ? __ldcs(src + l * LSTRIDE) : 0;
++                return __ldcs(src + l * LSTRIDE);   // dsv41 (patch_coop_laneclamp.py)
+             else
+                 return __ldcs(src + l * LSTRIDE);
+         };

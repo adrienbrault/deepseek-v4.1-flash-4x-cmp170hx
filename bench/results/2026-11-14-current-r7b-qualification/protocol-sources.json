@@ -1,0 +1,18 @@
+[
+  {
+    "source": "decode-probe-v2.py",
+    "sha256": "d6fc16d951db736c74fe4ddc6b95856131f6c259f9c59b35f677171c777e8340"
+  },
+  {
+    "source": "prefill-screen-v2.py",
+    "sha256": "b11a27b8c8ae7a7608b09e6e28052cee3a0be4153ec9269f37671d348930b75e"
+  },
+  {
+    "source": "prefill-screen.py",
+    "sha256": "a7cd81847a32c74f75ac3f99b6c2d18a59a3e6c29b03935624e55108d6ed59d6"
+  },
+  {
+    "source": "rounds/current-r7b-r1/qualify.py",
+    "sha256": "4c80c161524ffd2b98b738d1f0c5928706613904511ddb1e21f334e6fb5b4a49"
+  }
+]

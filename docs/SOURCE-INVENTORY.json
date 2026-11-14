@@ -1,0 +1,602 @@
+[
+  {
+    "file": "patches/native/0001-ptr.patch",
+    "origin": "rounds/moe-trim-r1/patches/0001-ptr.patch",
+    "license": "MIT",
+    "sha256": "d9479e55f0b4573aa15c3b62aa6f367fe476a8c6d469cd9bf70b9fd0a72856a8"
+  },
+  {
+    "file": "patches/native/0002-rowclamp.patch",
+    "origin": "rounds/moe-trim-r1/patches/0002-rowclamp.patch",
+    "license": "MIT",
+    "sha256": "1cc765f11f132d22559fa940b7deeb3744cbe94bff3f57b0556ee07af4c5e289"
+  },
+  {
+    "file": "patches/native/0003-noclamp.patch",
+    "origin": "rounds/moe-trim-r1/patches/0003-noclamp.patch",
+    "license": "MIT",
+    "sha256": "b6cb687570f88c6432bccc9d4834997f2dbbca19512eb5f44e0766391b829bbd"
+  },
+  {
+    "file": "patches/native/0004-laneclamp.patch",
+    "origin": "rounds/moe-trim-r1/patches/0004-laneclamp.patch",
+    "license": "MIT",
+    "sha256": "d45ff7c3cb05b0d4da36561424c0b2a70b7f7fa3be1252ba3063378ad84c26d7"
+  },
+  {
+    "file": "patches/native/0005-pitch.patch",
+    "origin": "rounds/moe-trim-r1/patches/0005-pitch.patch",
+    "license": "MIT",
+    "sha256": "63456bb2f38382f6bf823a7800a53faa8b39187b1d1512957316d2368b52650d"
+  },
+  {
+    "file": "patches/native/0006-stores.patch",
+    "origin": "rounds/moe-trim-r1/patches/0006-stores.patch",
+    "license": "MIT",
+    "sha256": "da9311671f50b31827c2118fd5557ac48e186d0173a5c63cb1cc1ca5a0ac35c8"
+  },
+  {
+    "file": "patches/native/0007-fixed512.patch",
+    "origin": "rounds/moe-trim-r1/patches/0007-fixed512.patch",
+    "license": "MIT",
+    "sha256": "bb25dc37fbbe31c274663d2053d4fc177867900d1da8cd4e8341ba3e8bd6f3b3"
+  },
+  {
+    "file": "patches/native/0008-fixed640.patch",
+    "origin": "rounds/moe-trim-r1/patches/0008-fixed640.patch",
+    "license": "MIT",
+    "sha256": "58c3daada939d588e9d89df0fe51dc01fdfade466a965144ed805bc04fe916ad"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax/__init__.py",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax/__init__.py",
+    "license": "MIT",
+    "sha256": "ba0757324c80835850a5a1c23234b9a3a05cfe35b110225bf7142e76056c6eb5"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax/argmax.py",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax/argmax.py",
+    "license": "MIT",
+    "sha256": "d3d7872f014c1d510e275841c98907b845e43ae3f380eba196bbaf42b3d63842"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax/eligibility.py",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax/eligibility.py",
+    "license": "MIT",
+    "sha256": "a59083257301b617ec982e208a63e6be9db8bfb5f277fca2854e40d257bf79b4"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax/hooks.py",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax/hooks.py",
+    "license": "MIT",
+    "sha256": "b23d1f0591356c299006015a6d32ced84b0e8c0197b1260f1bc445fcb6789a35"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax/kernels.py",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax/kernels.py",
+    "license": "MIT",
+    "sha256": "26e8ecea921bfb64c0bb1924f4dcf19aa111e611fc228fa36ecc824b024c3c90"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax-0.1.0.dist-info/METADATA",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "e04e5e344a62f12c4ffd859f5349b13cd6488593e5f680b3a829dbfb41c1bdf3"
+  },
+  {
+    "file": "docker/overlays/dsv41_lora_argmax-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/lora-argmax-r1/overlay/dsv41_lora_argmax-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "edcc03ce32c6de0a89c713fc7d3c957c4aa332c764f8ce19ece798678d70e860"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/__init__.py",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/__init__.py",
+    "license": "MIT",
+    "sha256": "b01e54b14c8cd0ed37fad5abaa4db9bbaa97b0797cda091427246a15f7ca590d"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/config.py",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/config.py",
+    "license": "MIT",
+    "sha256": "d1b33d030b76c19793de7ff62d54798c5ae958c657e4a6214e4bef1912774769"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/contracts.py",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/contracts.py",
+    "license": "MIT",
+    "sha256": "71b2363a0a3ea073feeef4dd5ca867b1bd0f15287598adeb5b555b4b88d1d652"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/integration.py",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/integration.py",
+    "license": "MIT",
+    "sha256": "513d19bd92d35528cb0d309cf1e36b69c161b0fe467da377bb457652ffbcfc3d"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/metadata-contract.json",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/metadata-contract.json",
+    "license": "MIT",
+    "sha256": "6c80950b4446bc27bf528e16940c4c9c77147bd40251088ae4ded3fc2b510225"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/swa_meta.py",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/swa_meta.py",
+    "license": "MIT",
+    "sha256": "93783ef2dd9cafd108598710c69e7e08229b3186424d3ceefcf7639c1eab8717"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port/topk_glue.py",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port/topk_glue.py",
+    "license": "MIT",
+    "sha256": "2063eeb5002124efb92263b0eba47828ff845fb01a2febd516e25c93d5e46353"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port-0.1.0.dist-info/METADATA",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "ed37f529aa134607c02698a4e0641decc16168ea8f0c5de40ebf8c649268675d"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_port-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/attn-port-r1/overlay/dsv41_attn_port-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "090d33567df427732e30c8a1d5e596b5c4871eaa044f84004bf0f509b562db3a"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_audit/__init__.py",
+    "origin": "rounds/stack-r2/overlay/dsv41_attn_audit/__init__.py",
+    "license": "MIT",
+    "sha256": "ad75c3358e2c739c6a5d473b9664b4a21cbb6c8d9429b98c4d5f7faa90849689"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_audit-0.1.0.dist-info/METADATA",
+    "origin": "rounds/stack-r2/overlay/dsv41_attn_audit-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "942231ad6d871a3082f9b43760fdbee025ebce338e964ce7136d7f9e17656624"
+  },
+  {
+    "file": "docker/overlays/dsv41_attn_audit-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/stack-r2/overlay/dsv41_attn_audit-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "99f03e9ec19f57a1196a8e4f5710604def6c496f3c001080a48ed0ff6c235ca4"
+  },
+  {
+    "file": "docker/overlays/dsv41_draft_argmax/__init__.py",
+    "origin": "rounds/comm-r1/overlay/dsv41_draft_argmax/__init__.py",
+    "license": "MIT",
+    "sha256": "a3ba518079cb8bfe6911653df50e3632aefd98294862552c827351d180f6cb5b"
+  },
+  {
+    "file": "docker/overlays/dsv41_draft_argmax/hooks.py",
+    "origin": "rounds/comm-r1/overlay/dsv41_draft_argmax/hooks.py",
+    "license": "MIT",
+    "sha256": "7718810d8fe458c8735ca29ad81f09848ec56c24dc2930c4cc41d67b731d89d5"
+  },
+  {
+    "file": "docker/overlays/dsv41_draft_argmax/kernels.py",
+    "origin": "rounds/comm-r1/overlay/dsv41_draft_argmax/kernels.py",
+    "license": "MIT",
+    "sha256": "be345207c3062bc0923a92f32c9b0496a829baff490f569a997d0e1d392f849d"
+  },
+  {
+    "file": "docker/overlays/dsv41_draft_argmax/shard.py",
+    "origin": "rounds/comm-r1/overlay/dsv41_draft_argmax/shard.py",
+    "license": "MIT",
+    "sha256": "8910b7601cf97a769bb2c2e83a14c70909a3f6cad5ab5520ac1075c1d51cf5b9"
+  },
+  {
+    "file": "docker/overlays/dsv41_draft_argmax-0.1.0.dist-info/METADATA",
+    "origin": "rounds/comm-r1/overlay/dsv41_draft_argmax-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "5a69cd5fd2455decd29e48286b61767fb2981a6cce3a7a9355d95524b2ab33d0"
+  },
+  {
+    "file": "docker/overlays/dsv41_draft_argmax-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/comm-r1/overlay/dsv41_draft_argmax-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "ce334889cfad1120984a571bbe6bc4ce1259a6f6694d9405d9644e73badef5a5"
+  },
+  {
+    "file": "docker/overlays/dsv41_rowstats/__init__.py",
+    "origin": "rounds/rowstats-r1/overlay/dsv41_rowstats/__init__.py",
+    "license": "MIT",
+    "sha256": "be698361c13421cf5b10a4166a92cf5148ff08512ff8ea45ed51e4439c91752b"
+  },
+  {
+    "file": "docker/overlays/dsv41_rowstats/equivalence.py",
+    "origin": "rounds/rowstats-r1/overlay/dsv41_rowstats/equivalence.py",
+    "license": "MIT",
+    "sha256": "817b2a8bed540187eef09758f3b5eac215444231fb21cd2fc53344633ba6baec"
+  },
+  {
+    "file": "docker/overlays/dsv41_rowstats/hooks.py",
+    "origin": "rounds/rowstats-r1/overlay/dsv41_rowstats/hooks.py",
+    "license": "MIT",
+    "sha256": "fda238444c46378311d8f255aa7f58aaa5107c48de239c9d1dfe8eb8fdcdef21"
+  },
+  {
+    "file": "docker/overlays/dsv41_rowstats/lean.py",
+    "origin": "rounds/rowstats-r1/overlay/dsv41_rowstats/lean.py",
+    "license": "MIT",
+    "sha256": "cd27c8349efc202e706ec878ae2bf3370db65d18f39ae4f1161dd8442f261fc1"
+  },
+  {
+    "file": "docker/overlays/dsv41_rowstats-0.1.0.dist-info/METADATA",
+    "origin": "rounds/rowstats-r1/overlay/dsv41_rowstats-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "2f7a8a728961e72f17692ceb826424d8edf7a2a29ce791ccfecfbefdb31cde65"
+  },
+  {
+    "file": "docker/overlays/dsv41_rowstats-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/rowstats-r1/overlay/dsv41_rowstats-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "3324e073c5f9dd32a80c7adfb5bfbb8a00f1f7175ceb039a97c1d4827917e540"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica/__init__.py",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica/__init__.py",
+    "license": "MIT",
+    "sha256": "df1edee0ac6343110ea64f9e4f75b6d15c7649d324189b3669eff9bab5f76cac"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica/config.py",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica/config.py",
+    "license": "MIT",
+    "sha256": "a6f43049874d9198997b34fd74a4c78ee5f4bf2f63a523c8baa0e7c736b459a5"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica/hooks.py",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica/hooks.py",
+    "license": "MIT",
+    "sha256": "c1e72aea531d3321d09a78a5a63114ebdcea8edc759186700b9e31a5c6e28379"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica/replica.py",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica/replica.py",
+    "license": "MIT",
+    "sha256": "9a19c587c9c059f8132d910272ed052e3fa781143cf893bdec810daae025614e"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica/reviewed.py",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica/reviewed.py",
+    "license": "MIT",
+    "sha256": "1e5b62de40d29e2f985af9394150779f5b7c9460fb7a7c31b226ab3136b2ecad"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica-0.1.0.dist-info/METADATA",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "9341762a9e899fa97996a71c9ab249892c9f9c8925573b183ea444a48fcd5169"
+  },
+  {
+    "file": "docker/overlays/dsv41_wkv_replica-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "65df06f1b395c9c8fddcb90c9be1473d4a87541c6cffbb9a14dc264926f93523"
+  },
+  {
+    "file": "docker/overlays/dsv41_dispatch_fuse/__init__.py",
+    "origin": "rounds/dispatch-fuse-r1/overlay/dsv41_dispatch_fuse/__init__.py",
+    "license": "MIT",
+    "sha256": "b579d8bc743d968e94b01513f74c4282dc36407bbe553bdb3d1ae1400efba79e"
+  },
+  {
+    "file": "docker/overlays/dsv41_dispatch_fuse/hooks.py",
+    "origin": "rounds/dispatch-fuse-r1/overlay/dsv41_dispatch_fuse/hooks.py",
+    "license": "MIT",
+    "sha256": "a64fba7e737ae266fd7e1126c99e996970da476d7e5674352ee9ec4ebdb22d4d"
+  },
+  {
+    "file": "docker/overlays/dsv41_dispatch_fuse/kernel.py",
+    "origin": "rounds/dispatch-fuse-r1/overlay/dsv41_dispatch_fuse/kernel.py",
+    "license": "MIT",
+    "sha256": "04999fb24c0e0ea76f123feaed90ebe7df5f0b0b8f2ca015fcd58f7c1710dc6c"
+  },
+  {
+    "file": "docker/overlays/dsv41_dispatch_fuse/prep.py",
+    "origin": "rounds/dispatch-fuse-r1/overlay/dsv41_dispatch_fuse/prep.py",
+    "license": "MIT",
+    "sha256": "2cf99ce189817f3a053ec9dabbb8aee9f5ec24b7b21eb274d7fe76dfa548dc50"
+  },
+  {
+    "file": "docker/overlays/dsv41_dispatch_fuse-0.1.0.dist-info/METADATA",
+    "origin": "rounds/dispatch-fuse-r1/overlay/dsv41_dispatch_fuse-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "3a9d8a097fd56a73f5402075470b64febffdfa1be23a6ecbca12b493ec215f5a"
+  },
+  {
+    "file": "docker/overlays/dsv41_dispatch_fuse-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/dispatch-fuse-r1/overlay/dsv41_dispatch_fuse-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "f8733ae45eaa1c595b1061872b92f16bff5513e7804cac36cde17517a128403c"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7/__init__.py",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7/__init__.py",
+    "license": "MIT",
+    "sha256": "2bd74c7617333491d0cc90ece5b8c463b2af28f3f39f5f26225cf85c92e25154"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7/dense.py",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7/dense.py",
+    "license": "MIT",
+    "sha256": "97c442c74864272002e96ea6c2f82f9f09d1cb84f3e17ff7d5ef8e08947fe35a"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7/draft.py",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7/draft.py",
+    "license": "MIT",
+    "sha256": "afea7dbd04870c883be5ed6a566caaef631bfe1f5afa54b182425809dcfd1904"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7/fused_rank1.py",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7/fused_rank1.py",
+    "license": "MIT",
+    "sha256": "5e4188e153b177faf85dfbb386a5d7e3ac5844b834eae467a2b8f192ddc0bce5"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7/graphs.py",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7/graphs.py",
+    "license": "MIT",
+    "sha256": "14462e8fdf163492d229e227e307aa3970def28841cf147835d95814ed541ec9"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7/hooks.py",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7/hooks.py",
+    "license": "MIT",
+    "sha256": "8d5052dd2cf79616625ad2d8cd75548918e3f1ff445fe33d82850f102956014a"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7-0.1.0.dist-info/METADATA",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "sha256": "3d2e274978731349010b92e0ccafb64ce9a7d655b30970847fc599f45c23c08d"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "sha256": "6d20280d8145dbcfe56404d318571df49017bace26d881b4a8db84421ba71279"
+  },
+  {
+    "file": "docker/overlays/dsv41_ablit_r7-0.1.0.dist-info/top_level.txt",
+    "origin": "rounds/ablit-r7-r1/overlay/dsv41_ablit_r7-0.1.0.dist-info/top_level.txt",
+    "license": "MIT",
+    "sha256": "6982eea5bc58845537a0554f3e0d2bbd62e4168aaaf530dfdf6b0974caf21e9f"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/__init__.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/__init__.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "f2398a243040493136aa46e44d8c04c1612da22e0af275f163aa0ea2779c77f7"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/ats_alias.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/ats_alias.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "15fa59d065a7a5bfd704c678ee050b775e69e861c87865196d072391d068d571"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/bf16_madv_compat.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/bf16_madv_compat.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "cf6420fe402ae020cce8127aa4695c59078bccb333b5adaaaac9ba85fb9f6fe1"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/coop_kernel.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/coop_kernel.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "e039ba5cccfe8ea889d54264dd8215cbeef7a253707bd66c34117ffb38331f20"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/cpu_offload.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/cpu_offload.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "f1765f3c877fd547b1340eb1663e1cc4fd728eeefb99a46d2ca15fa25b50a2c4"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/deepseek_v41.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/deepseek_v41.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "79ba8eb474dbfcacfe6211bf041affd575a62261045aaf20fc637804195f6343"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/dequant.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/dequant.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "c0b24b26129eb2281d0de14aaf484abbe947be01fb80b7f3e7de0ed9974aa671"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/exl3.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/exl3.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "ea590cbcccb30f9b51b87cc2b5653d928b0b3bac4397d82f2dd2a9c3a8562dde"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/k78_compat.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/k78_compat.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "cc0df4be698905423402cff59c1defc326e4aa1d89bbc1c05d0a35c55c091a98"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/mixed_k_guard.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/mixed_k_guard.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "305802356c3ea695150d7a256f71552d1caabdf2c0889139d63006c4c905f4e5"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/physical_k_compat.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/physical_k_compat.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "8f37cf7413c41b4cff134cb00013cfaca2620a329f728bb6093d02db8fe65676"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/prefill_policy.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/prefill_policy.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "0504f737127e639cc7751b9880b325915b3a6cbaac9d9f6bcbffe8a35fe2a637"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/route_stats.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/route_stats.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "93384c7cebb22dfc5fcd7c44ee064b2579a80f3530743a7348c08a917189e5c5"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/runtime_policy.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/runtime_policy.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "4092c56f5f873d36f8ec07a8e054ed2e5f95c414b3bca384f7f694f4a9004137"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/tc_moe_hook.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/tc_moe_hook.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "41f5894553591457b200499f923c5b9bfb824caf1a6955fa6cdf6c76831f63ff"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/tensor_metadata.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/tensor_metadata.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "96a8c1b70e6fb32aa467eb0ecb6741f6ef58ba4c507a9cd4a0204a60eae7481a"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/tensor_mixed_k.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/tensor_mixed_k.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "b0f93f3e7ab35602da6dc86644d119d60b9a68cb6f2de96b19f9f12bf2f26353"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/tp_geometry_compat.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/tp_geometry_compat.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "352f75fc402d52e509a6f9d1ddfa6d5eaddf8fb4cd2da3aab1500118d095dfb9"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/uva_offload.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/uva_offload.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "f8ea7047a1a3e80b2b3e5acb76d05475946f788641caf480f30ee23104b9bbf1"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/v41_context.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/v41_context.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "f0b0ad2390caa729aa49b72211e899c696d055d558de13c4856ba8a936bd4add"
+  },
+  {
+    "file": "docker/overlays/vllm_exl3/worker_parity.py",
+    "origin": "rounds/fastloop-r1/in/f760-capture-sources/files/vllm_exl3/worker_parity.py",
+    "license": "AGPL-3.0-only",
+    "sha256": "19691588c435ba149e719060ed04aca099d78178774531ba5cd7f9e66e4986f0"
+  },
+  {
+    "file": "patches/splitk/0001-splitk-numerics-variants.patch",
+    "origin": "rounds/splitk-numerics-r1/0001-splitk-numerics-variants.patch",
+    "license": "Apache-2.0",
+    "sha256": "279522c240b9d08ddc99836c98c401e0461b1f177284d531cdf9dd78fba623ca"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/__init__.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/__init__.py",
+    "license": "Apache-2.0",
+    "sha256": "6c6ec57de9f82ef42d82760f144a4571cb16b3cd6de33aaa7aa9fd65e8ab1fa1"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/confidence.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/confidence.py",
+    "license": "Apache-2.0",
+    "sha256": "fa2dd1c3763d24087caf64242b09466f1890e124fb3192a82d5a70a4a7c8e647"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/config.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/config.py",
+    "license": "Apache-2.0",
+    "sha256": "aaed4da1c771b23ecc4d0d6fd205004ca10f35add8fa3318f1768e7792f2e10f"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/decision.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/decision.py",
+    "license": "Apache-2.0",
+    "sha256": "fc4c8c4fa261123b15741373c35632ca6e7a00f9065dded35137fe4a7f6cfa72"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/host_rule.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/host_rule.py",
+    "license": "Apache-2.0",
+    "sha256": "477b46dabf70c2e0fb81bd2610402fa717a86a98720066b487600da3f5dc2fd7"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/policy.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/policy.py",
+    "license": "Apache-2.0",
+    "sha256": "decdf7bc2a059823571503a8b6edf358dd19c14db5d01174c8bf2e73760fe4e3"
+  },
+  {
+    "file": "docker/overlays/dsv41_depth/scheduler.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_depth/scheduler.py",
+    "license": "Apache-2.0",
+    "sha256": "82c0a5ac5dc766a20b459699326e04bf2091183c281126a162e26e66e26ab843"
+  },
+  {
+    "file": "docker/overlays/vllm/utils/dsv41_row_mask.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_row_mask.py",
+    "license": "Apache-2.0",
+    "sha256": "50abe80da1499f61cbc43388564a709897180ffb6f6a951b34e952dabe861e2c"
+  },
+  {
+    "file": "docker/overlays/vllm/utils/dsv41_row_mask_kernels.py",
+    "origin": "rounds/moe-gap-r2/src/dsv41_row_mask_kernels.py",
+    "license": "Apache-2.0",
+    "sha256": "5e3b00541d8e9dbab5cafca7fff1d2bca9326a5f44e92d5111e66ca54a787f7b"
+  },
+  {
+    "file": "config/calibrated-depth.json",
+    "origin": "rounds/moe-gap-r2/policy/morrowmake-v1.0.2.json",
+    "license": "Apache-2.0",
+    "sha256": "ca870638c4d333e1d6350e3a5b9f06aa1c0427c47feed020728f7faa9e5197ab"
+  },
+  {
+    "file": "licenses/Apache-2.0.txt",
+    "origin": "r17/kit/vendor/VLLM-LICENSE",
+    "license": "upstream notice",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  {
+    "file": "licenses/vllm-exl3-AGPL-3.0-only.txt",
+    "origin": "r17/kit/vendor/vllm-exl3/LICENSE",
+    "license": "upstream notice",
+    "sha256": "cf0b6664ce73f379c829d162e2c738dcd867448fbc2ee3962ef2b000297a6083"
+  },
+  {
+    "file": "licenses/vllm-exl3-historical-Apache-2.0.txt",
+    "origin": "r17/kit/vendor/vllm-exl3/LICENSE.APACHE-2.0",
+    "license": "upstream notice",
+    "sha256": "230a88fc02af8381245b5d611f2bfe553975da6dfd64d61c15428cf4d9e9e6c5"
+  },
+  {
+    "file": "licenses/vllm-exl3-NOTICE.txt",
+    "origin": "r17/kit/vendor/vllm-exl3/NOTICE",
+    "license": "upstream notice",
+    "sha256": "2a30702aef1ca3af34bc324c160cb0908841dad92dc7871b005cd177e4fa695b"
+  },
+  {
+    "file": "licenses/vllm-exl3-THIRD_PARTY_NOTICES.md",
+    "origin": "r17/kit/vendor/vllm-exl3/THIRD_PARTY_NOTICES.md",
+    "license": "upstream notice",
+    "sha256": "3c23458d09b0874676be2936ac1520232b02c94006ecd2818f5647b6cf3e6aaa"
+  },
+  {
+    "file": "licenses/ExLlamaV3-MIT.txt",
+    "origin": "r17/kit/vendor/exllamav3/LICENSE",
+    "license": "upstream notice",
+    "sha256": "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff"
+  },
+  {
+    "file": "licenses/SM80-overlay-Apache-2.0.txt",
+    "origin": "r17/kit/vendor/OVERLAY-LICENSE",
+    "license": "upstream notice",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  }
+]

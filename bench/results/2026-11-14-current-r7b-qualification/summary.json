@@ -1,0 +1,131 @@
+{
+  "date_utc": "2026-11-14",
+  "configuration": "current-r7b",
+  "source": "rounds/current-r7b-r1/out/20261114T052150Z-2097332-qualify",
+  "interval_utc": [
+    "05:21",
+    "07:02"
+  ],
+  "suite": "loaded-v2",
+  "decode": {
+    "workload": "decode-prompts-v2, chat completions, reasoning before code",
+    "temperature": 0,
+    "seed": 15,
+    "ignore_eos": true,
+    "output_tokens_per_request": 400,
+    "metric": "sum of measured per-request decode rates within a concurrent batch; mean of scored batches per boot, then mean of two boot means",
+    "boots": [
+      "boot-2-on",
+      "boot-3-on"
+    ],
+    "cells": [
+      {
+        "concurrency": 4,
+        "boot_rates": [
+          334.66,
+          325.98
+        ],
+        "mean_tok_s": 330.3,
+        "step_ms": [
+          34.19,
+          34.61
+        ],
+        "accepted_per_step": [
+          1.861,
+          1.83
+        ]
+      },
+      {
+        "concurrency": 8,
+        "boot_rates": [
+          415.56,
+          408.43
+        ],
+        "mean_tok_s": 412.0,
+        "step_ms": [
+          49.67,
+          49.75
+        ],
+        "accepted_per_step": [
+          1.588,
+          1.544
+        ]
+      },
+      {
+        "concurrency": 1,
+        "boot_rates": [
+          154.35,
+          153.2
+        ],
+        "mean_tok_s": 153.8,
+        "step_ms": [
+          20.38,
+          20.53
+        ],
+        "accepted_per_step": [
+          2.158,
+          2.158
+        ]
+      }
+    ],
+    "per_request_rate": "(completion_tokens - 1) / (stream_end - first_content_event)",
+    "scored_batches_per_boot": {
+      "1": 8,
+      "4": 3,
+      "8": 3
+    },
+    "warmup_batches_per_cell": 1
+  },
+  "prefill": {
+    "workload": "cold prompts",
+    "aggregation": "median scored batches b0-b2 per boot, arithmetic mean of two boot statistics",
+    "cells": [
+      {
+        "prompt_tokens": 2048,
+        "concurrency": 1,
+        "ttft_s": 0.749,
+        "input_tok_s": 2738
+      },
+      {
+        "prompt_tokens": 2048,
+        "concurrency": 4,
+        "ttft_s": 2.187,
+        "input_tok_s": 3113
+      },
+      {
+        "prompt_tokens": 2048,
+        "concurrency": 8,
+        "ttft_s": 3.297,
+        "input_tok_s": 3352
+      },
+      {
+        "prompt_tokens": 8192,
+        "concurrency": 1,
+        "ttft_s": 2.355,
+        "input_tok_s": 3480
+      },
+      {
+        "prompt_tokens": 8192,
+        "concurrency": 4,
+        "ttft_s": 6.103,
+        "input_tok_s": 3629
+      },
+      {
+        "prompt_tokens": 8192,
+        "concurrency": 8,
+        "ttft_s": 10.476,
+        "input_tok_s": 3686
+      }
+    ],
+    "temperature": 0,
+    "thinking": false,
+    "ignore_eos": true,
+    "max_output_tokens": 1,
+    "page_cache_policy": "warm-steady, no host cache drop",
+    "prompt_cache": "zero cached tokens required in every batch",
+    "warmup_batches_per_point": 1,
+    "scored_batches_per_point": 3,
+    "input_rate": "sum of reported prompt tokens / (last first-output event - earliest submit), median scored batches per boot then mean of boots"
+  },
+  "extraction": "Owner-supplied speed table; original qualification files unavailable in this local checkout. No raw outputs copied."
+}

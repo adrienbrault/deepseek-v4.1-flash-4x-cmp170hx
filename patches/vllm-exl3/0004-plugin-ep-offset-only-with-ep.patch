@@ -1,0 +1,25 @@
+# 0011: EXL3 create_weights sets the EP expert offset only for expert-parallel layers (PP4 without EP gave PP stages 1-3 offsets 384/768/1152, so the arena prescan found no keys).
+--- a/src/vllm_exl3/exl3.py	2026-10-20 17:19:47
++++ b/src/vllm_exl3/exl3.py	2026-10-20 17:19:48
+@@ -3681,11 +3681,20 @@
+         layer._exl3_n_experts = int(num_experts)
+         # Linear EP placement offset for checkpoint prescan (local->global).
+         if not hasattr(layer, "starting_expert_offset"):
++            # Only an expert-parallel layer owns a shifted expert block. Without EP the
++            # EP group can still have world size > 1 (e.g. one rank per PP stage), and
++            # ep.rank * num_experts would point PP stages 1..n at experts that do not exist.
++            pc = getattr(layer, "moe_parallel_config", None) or getattr(
++                getattr(layer, "moe_config", None), "moe_parallel_config", None
++            )
++            use_ep = bool(getattr(layer, "use_ep", False) or getattr(pc, "use_ep", False))
+             try:
+                 from vllm.distributed.parallel_state import get_ep_group
+ 
+                 ep = get_ep_group()
+-                layer.starting_expert_offset = int(ep.rank) * int(num_experts)
++                layer.starting_expert_offset = (
++                    int(ep.rank) * int(num_experts) if use_ep else 0
++                )
+             except Exception:
+                 layer.starting_expert_offset = 0
+         # Header-only shape scan (no allocation yet). Arenas are created on the

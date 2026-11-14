@@ -1,0 +1,13 @@
+DeepSeek-V4.1-Flash on four CMP 170HX cards
+
+Original recipe documentation and scripts: MIT; see LICENSE.
+vLLM and the SM80 overlay modifications: Apache-2.0.
+vllm-exl3, including the modified installed loader: AGPL-3.0-only.
+The historical Apache text in that plugin is retained for attribution and
+does not replace the plugin's AGPL-3.0-only licence. Network deployment and
+redistribution of modified versions retain the applicable AGPL obligations.
+ExLlamaV3, its vcruz305 fork, and the GNmac cooperative native code: MIT.
+Curtis White / CurtisAccelerate supplied the DeepSeek tensor-core shape port;
+its kernels derive from Morrowmake (Apache-2.0) and the EXL3 codec (MIT).
+Original copyright headers remain in source. See licenses/ and THIRD_PARTY.md.
+Model weights, adapters, prompts, generated text and captured tensors are absent.
