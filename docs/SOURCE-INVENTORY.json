@@ -255,7 +255,7 @@
     "file": "docker/overlays/dsv41_wkv_replica/replica.py",
     "origin": "rounds/wkv-replica-r1/overlay/dsv41_wkv_replica/replica.py",
     "license": "MIT",
-    "sha256": "9a19c587c9c059f8132d910272ed052e3fa781143cf893bdec810daae025614e"
+    "sha256": "953330a809574dfca18f25b2358673268c80ffcc42173bee5dcfaad1b4e3e96d"
   },
   {
     "file": "docker/overlays/dsv41_wkv_replica/reviewed.py",
