@@ -1,13 +1,43 @@
 # Serving history
 
+The table records changes of the daily definition. A selected definition can remain stopped. The numeric history figure uses only the dated summaries available in this repository; earlier entries without November suite summaries are omitted.
+
+![Daily promotion history: c1, c4 and c8 decode aggregates from the r7b and r7c qualifications, measured 2026-11-14 and 2026-11-15](img/history.svg)
+
 | UTC date | definition | change and evidence |
 | --- | --- | --- |
-| 2026-10-21 | initial preparation | Historical measurements retained under `bench/results/2026-10-21*`; the original README had no serving definition. Those rates do not describe the November stack. |
-| 2026-11-10 | current-r6 | Attention, draft argmax, row statistics, replicated wkv, fused dispatch and extended true-ring rows; the hardware links returned to four Gen2 x16 links. |
-| 2026-11-13 | current-r7 | Expanded true-ring row list; source `rounds/stack-r2/out/20261112T192726Z-3009517-r7-equiv-speed`. Fair prefill was removed from this daily composition. |
-| 2026-11-13 | current-r7a | Per-request rank-one abliterated adapter, fused dense update and GPU-local worker CPU affinity. |
-| 2026-11-14 09:40 | current-r7b | Cumulative fixed640 cooperative native MoE module; source `rounds/current-r7b-r1/out/20261114T052150Z-2097332-qualify` and actual-launcher acceptance `20261114T092653Z-4010770-actual-acceptance`. |
+| 2026-10-21 | initial preparation | [Historical measurements](../bench/results/); the original README had no serving definition. Those rates do not describe the November stack. |
+| 2026-11-10 | current-r6 | Attention, draft argmax, row statistics, replicated wkv, fused dispatch and extended true-ring rows; hardware links returned to four Gen2 x16 links. No numeric summary exported for this promotion. |
+| 2026-11-13 | current-r7 | Expanded true-ring row list; source `rounds/stack-r2/out/20261112T192726Z-3009517-r7-equiv-speed`. Fair prefill removed. No numeric summary exported for this promotion. |
+| 2026-11-13 | current-r7a | Per-request rank-one abliterated adapter, fused dense update and GPU-local worker CPU affinity. No numeric summary exported for this promotion. |
+| 2026-11-14 09:45 | current-r7b | [Fixed640 native series](../patches/native/); [qualification](../bench/results/2026-11-14-current-r7b-qualification/), source `20261114T052150Z-2097332-qualify`; acceptance `20261114T092653Z-4010770-actual-acceptance`. Promotion minute follows the retained current operating record. |
+| 2026-11-15 19:45 | current-r7c | Exact bounded indexer top-k on r7b, read-only k1b library; [confirmation and acceptance](../bench/results/2026-11-15-current-r7c-qualification/). Serving absent after acceptance teardown. |
 
-The former PCIe Gen2 x4 README statement belongs to older hardware state. The current serving record states four x16 links at 5 GT/s and 175 W per card. Correctable PCIe replays remain a recorded hardware caveat. Earlier x8 or x4 results are not relabelled as current x16 measurements.
+## Current-r7b qualification, 2026-11-14
 
-This export was prepared locally without contacting a serving host. The measurement summary is transcribed from the owner's qualification note; the full source report is absent from the local checkout. Historical ledger decisions were read for context, and no queued or experimental candidate was added to the current recipe.
+The [qualification notes](../bench/results/2026-11-14-current-r7b-qualification/NOTES.md) and [summary](../bench/results/2026-11-14-current-r7b-qualification/summary.json) retain the two ON boots measured on 2026-11-14 05:21–07:02 UTC, results directory `rounds/current-r7b-r1/out/20261114T052150Z-2097332-qualify`. The configuration used TP4, four Gen2 x16 links, 175 W per card, DSpark K5 and the fixed640 cooperative kernel. Decode used frozen `decode-prompts-v2` chat prompts, mostly reasoning prose before code, temperature zero, seed 15, EOS suppression and 400 output tokens per request. Each batch summed measured request decode rates, each boot averaged its scored batches, then the published row averaged the two boot means.
+
+| concurrency | decode aggregate mean, tok/s | ON boot rates, tok/s |
+| ---: | ---: | --- |
+| 1 | 153.8 | 154.35 / 153.20 |
+| 4 | 330.3 | 334.66 / 325.98 |
+| 8 | 412.0 | 415.56 / 408.43 |
+
+| nominal cold input tokens per request | concurrency | TTFT, s | aggregate input rate, tok/s |
+| --- | ---: | ---: | ---: |
+| 2,048 | 1 | 0.749 | 2,738 |
+| 2,048 | 4 | 2.187 | 3,113 |
+| 2,048 | 8 | 3.297 | 3,352 |
+| 8,192 | 1 | 2.355 | 3,480 |
+| 8,192 | 4 | 6.103 | 3,629 |
+| 8,192 | 8 | 10.476 | 3,686 |
+
+Prefill used the same qualification and r7b configuration: temperature zero, thinking off, EOS suppression, one output token, zero prompt-cache hits, warm-steady host page cache, one unscored warm batch and three scored batches per point. Each boot took the median of b0–b2, then the row averaged the two ON boot statistics. Input rate and TTFT were transcribed separately; nominal text lengths precede the chat template. Full qualification records are absent locally. [Conditions](../bench/results/2026-11-14-current-r7b-qualification/NOTES.md).
+
+Actual-launcher acceptance passed on 2026-11-14 09:26–09:37 UTC. It checked both served names and token identity against the four qualification boots. The operating record reports matching logprob bits and shapes for this acceptance; the gate itself checked token identity because raw c8 has an incumbent bimodal case. The [partial per-operation profile](../bench/results/2026-11-14-current-r7b-profile/NOTES.md), measured separately on 2026-11-14 at forced c4 K3 / c8 K2 / c1 K5 shapes, remains diagnostic evidence from another boot.
+
+## Current-r7c confirmation, 2026-11-15
+
+The [confirmation notes](../bench/results/2026-11-15-current-r7c-qualification/NOTES.md) retain the same-chain r7b OFF controls, the single r7c ON boot and the separate acceptance receipt. The [summary](../bench/results/2026-11-15-current-r7c-qualification/summary.json) is the figure source. The r7b OFF rates on 2026-11-15 differ from its earlier qualification; only the same-chain OFF/ON/OFF comparison supports attribution to the bounded indexer. The two-day promotion chart is a record of dated qualifications, not a controlled causal comparison.
+
+The former PCIe Gen2 x4 README statement belongs to older hardware state. The current definition records four x16 links at 5 GT/s and 175 W per card. Correctable PCIe errors and replays remain a hardware caveat. Earlier x8 or x4 results retain their original labels. No r7c memory-category summary is available for a memory chart.

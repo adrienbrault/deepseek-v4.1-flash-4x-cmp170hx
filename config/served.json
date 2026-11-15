@@ -1,7 +1,7 @@
 {
   "schema": "deepseek-serving-export/1",
-  "definition": "current-r7b",
-  "promoted_utc": "2026-11-14T09:40:00Z",
+  "definition": "current-r7c",
+  "promoted_utc": "2026-11-15T19:45:00Z",
   "image": "sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27",
   "reproduction_complete": false,
   "plan_scope": "Documented engine options and folded selectors; full authenticated Docker argv, inherited environment, mount map and lifecycle remain unresolved",
@@ -14,7 +14,7 @@
     "host_ram_gb": 46
   },
   "environment": {
-    "VLLM_PLUGINS": "vllm_exl3,dsv41_lora_argmax,dsv41_attn_port,dsv41_attn_audit,dsv41_rowstats,dsv41_wkv_replica,dsv41_dispatch_fuse,dsv41_ablit_r7",
+    "VLLM_PLUGINS": "vllm_exl3,dsv41_lora_argmax,dsv41_attn_port,dsv41_attn_audit,dsv41_rowstats,dsv41_wkv_replica,dsv41_dispatch_fuse,dsv41_ablit_r7,dsv41_indexer_bounded",
     "VLLM_USE_V2_MODEL_RUNNER": "1",
     "VLLM_EXL3_COOP": "1",
     "VLLM_EXL3_COOP_KERNEL": "1",
@@ -45,7 +45,8 @@
     "OMP_NUM_THREADS": "2",
     "DSV41_ENGRAM_STORAGE": "ssd",
     "DSV41_ENGRAM_MODEL_DIR": "/official",
-    "VLLM_EXL3_MODEL_DIR": "/model-view"
+    "VLLM_EXL3_MODEL_DIR": "/model-view",
+    "DSV41_INDEXER_BOUNDED": "1"
   },
   "command": [
     "/model-view",
@@ -128,6 +129,7 @@
     "fixed640-native-assets",
     "f760-complete-build-chain",
     "official-model-revision-and-adapter-receipt",
-    "authenticated-final-argv-and-lifecycle"
+    "authenticated-final-argv-and-lifecycle",
+    "bounded-indexer-plugin-and-k1b-native-assets"
   ]
 }

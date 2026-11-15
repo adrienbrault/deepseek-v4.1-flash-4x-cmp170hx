@@ -54,7 +54,7 @@ Apply each component group in its listed order to its stated base. `patches/seri
 
 ## Runtime layers after the base image
 
-These layers are mounted after the image patches. Their order follows the serving composition, with r7a replacing the older draft/audit registration and r7b replacing only the native directory.
+These layers are mounted after the image patches. Their order follows the serving composition, with r7a replacing the older draft/audit registration and r7b replacing only the native directory and r7c enabling the exact bounded indexer.
 
 | order | layer | one-line purpose | source and base |
 | ---: | --- | --- | --- |
@@ -69,6 +69,7 @@ These layers are mounted after the image patches. Their order follows the servin
 | 56 | r7 true ring | Extend the measured row list while retaining earlier geometry | ring source, generated row geometry and native extras remain unresolved; f760; Apache-2.0 / MIT |
 | 57 | r7a rank-one adapter | Serve the fused wo_b adapter on request while preserving raw dispatch | `docker/overlays/dsv41_ablit_r7`; current-r7; MIT, upstream model terms unresolved |
 | 58 | r7b fixed640 | Replace only the cooperative native asset directory with the cumulative native series | `patches/native/0001` through `0008`; current-r7a; MIT |
+| 59 | r7c bounded indexer | Select exact bounded indexer top-k with `DSV41_INDEXER_BOUNDED=1` | current-r7b; plugin and k1b native assets remain an explicit [reproduction gap](REPRODUCING.md) |
 
 The native patches apply to the qualified EXL3/GNmac header at SHA256 `0a8a74294e07243e25471d09ba0eaada0e6bd72515227ba54d7d8b8e46478219`. They are cumulative, including both the 512 and 640 guarded specializations. The independent follow-up variants are not the served r7b series. Its source manifest names ExLlamaV3 `d968d96dbe56072317329d573bd06e1403eb949b` and GNmac `bbaf3672914eb1bbbca11de685be5f0c150f577a`; loop trims credit GNmac `2ad5741ab1a278d64f33b842706a41717dfbf181`.
 
