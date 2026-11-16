@@ -184,4 +184,4 @@ Original recipe work uses [MIT][license]; third-party components retain the noti
 [plot]: bench/plot.py
 [moe-stack]: docker/overlays/dsv41_moe_stack/
 [prefill-code]: docker/overlays/prefill-code/
-[card]: docs/img/recipe-card-43b6da23.png
+[card]: docs/img/recipe-card-010a921e.png
