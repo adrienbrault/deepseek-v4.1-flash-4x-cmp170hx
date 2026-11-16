@@ -1,0 +1,13 @@
+# Headline measurements, 2026-11-16 UTC
+
+Configuration: current-r7f. Source: headline-pack-r1, headline-report/2, SHA256 `bd46c7b8f61b47e4853d640e8c64f5d881e691c7af9de6a26c144fd38ee626ba`. Publication ready: true. Boot starts (UTC): 2026-11-16T22:16:23Z, 2026-11-16T22:40:08Z, 2026-11-16T23:05:17Z.
+
+Spec-Bench uses 120 stratified prompts (20 in each of six categories), 256 forced tokens, temperature zero, request-rate infinity, and reset cache per cell. Wall output tok/s includes prefill and request turnover. Per-stream tok/s is 1000 / TPOT p50. Acceptance source is retained per cell. The 120/480 calibration pairs share a boot at each concurrency; first calibration splits c1 and c4/c8 into two boots, followed by one code boot. Ratios outside 0.98–1.02 are descriptive. Routine results require a matching first-run calibration.
+
+Code uses shared cached contexts of 1024, 32768 and 65536 tokens with 2048, 2048 and 8192-token appends respectively, 400 forced output tokens, temperature zero, seed 15 and ignore_eos. Decode uses the common interval max(first token) to min(last generated token/finish evidence), continuous token accounting, and no interleaved prefill. Each cell has one scored batch at c1/c4/c8. Per-stream rate is the mean of measured stream rates in that window. Prefix residency must be confirmed on every request. One-batch TTFT p99 is descriptive. Optional step/acceptance counters may be n/a; they use snapshots wholly inside the window and can be affected by metric publication lag.
+
+TP4, four CMP 170HX cards, four Gen2 x16 links, 175 W configured per card, 52 GiB container cap, DSpark K5, adaptive verification off, FULL_DECODE_ONLY, capture sizes 1–48. Only the base served name is timed. Both-name identity is a correctness gate; abliterated and fast names have no headline performance claim. Serving remains absent after measurement.
+
+Cold prefill carries the dated 2026-11-16 current-r7e suite-v2 reference at nominal 2K/8K, c1/c4/c8, one output token, T=0 and thinking off, with zero prompt-cache hits and warm-steady host page cache. R7f has the same kernels. The summary retains all six cells, the reference file hash and its chain-window limitation. The card plots c1 and labels its maximum c8 input rate as a dated peak; Spec-Bench TTFT and cached-append TTFT never become cold-prefill rates.
+
+The summary is a numeric allowlist export. It excludes prompts, token IDs, raw client records, lifetime identifiers, arbitrary report prose and private paths. Hashes retain input/source provenance. This local exporter does not authenticate the original sealed boot evidence; report.py performs that operator-side check before export. No GPU run is performed here.

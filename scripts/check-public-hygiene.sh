@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fails when the staged diff (default) or the whole checkout (--tree) contains something that must not reach the
+# Fails when the staged diff (default), modified/new files (--worktree), or whole checkout (--tree) contains something that must not reach the
 # public repo: private or Tailscale addresses, local machine paths, assistant scratchpad paths, session identifiers,
 # credential-shaped strings. CLAUDE.md lists the rules. Run before every commit; nothing can be unpublished afterwards.
 set -uo pipefail
@@ -34,11 +34,16 @@ RE=$(IFS='|'; echo "${PATS[*]}")
 # patch quotes Django's documentation example address 192.168.2.1 (django__django-16145; R586 preds.jsonl, verbatim).
 EXEMPT='172\.17\.0\.1|hygiene-ok|"instance_id": *"django__django-16145"'
 hits=0
-if [ "${1:-}" = "--tree" ]; then
+if [ "${1:-}" = "--tree" ] || [ "${1:-}" = "--worktree" ]; then
   while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
     [ "$f" = "$SELF" ] || [ "$f" = "CLAUDE.md" ] && continue
     grep -aInE "$RE" -- "$f" | grep -avE "$EXEMPT" | sed "s|^|$f:|" | grep -a . && hits=1
-  done < <(git ls-files -z)
+  done < <(if [ "${1:-}" = "--worktree" ]; then
+    git ls-files --modified --others --exclude-standard -z
+  else
+    git ls-files -z
+  fi)
 else
   # added lines of the staged diff, tagged with their file
   out=$(git diff --cached -U0 --diff-filter=AM -- . ":!$SELF" ":!CLAUDE.md" \
@@ -48,6 +53,13 @@ else
 fi
 if [ "$hits" = 1 ]; then echo "check-public-hygiene: FAIL (see lines above)"; exit 1; fi
 # Prose rules (CLAUDE.md "Prose"): the staged Markdown files must pass scripts/check-prose.sh.
-md=$(git diff --cached --name-only --diff-filter=AM -- "*.md" ":!CLAUDE.md" | grep -avE "^bench/results/" || true)
-if [ -n "$md" ]; then bash scripts/check-prose.sh $md || exit 1; fi
+if [ "${1:-}" = "--worktree" ]; then
+  while IFS= read -r -d '' f; do
+    [ "$f" = "CLAUDE.md" ] && continue
+    case "$f" in *.md) bash scripts/check-prose.sh "$f" || exit 1;; esac
+  done < <(git ls-files --modified --others --exclude-standard -z)
+else
+  md=$(git diff --cached --name-only --diff-filter=AM -- "*.md" ":!CLAUDE.md" | grep -avE "^bench/results/" || true)
+  if [ -n "$md" ]; then bash scripts/check-prose.sh $md || exit 1; fi
+fi
 echo "check-public-hygiene: OK"

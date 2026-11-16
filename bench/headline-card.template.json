@@ -1,0 +1,323 @@
+{
+  "id": "deepseek-v4.1-flash",
+  "brand": "170HX",
+  "logo": {
+    "file": "deepseek",
+    "alt": "DeepSeek"
+  },
+  "model": "DeepSeek-V4.1-Flash",
+  "short": "DeepSeek",
+  "engine": "vLLM · EXL3",
+  "ctx": "262k",
+  "sub": "4 × CMP 170HX · EXL3 EAQ 2.9 bpw experts · NVMe Engram",
+  "repo": "github.com/adrienbrault/deepseek-v4.1-flash-4x-cmp170hx",
+  "source": "Pending headline · cold 2026-11-16",
+  "method": "T=0 · Spec-Bench 120×256 · cached code 400 tokens · dated cold prefill",
+  "pool": null,
+  "contextTokens": 262144,
+  "poolNote": "262,144-token configured request limit<br>8 sequence slots · measured KV capacity unavailable",
+  "one": {
+    "agents": 1,
+    "precision": 1,
+    "metric": "tok/s per stream · T=0",
+    "kinds": [
+      [
+        "Spec-Bench",
+        null,
+        "120 prompts"
+      ],
+      [
+        "code peak",
+        null,
+        "cached code"
+      ]
+    ],
+    "rate": null,
+    "ttft": "Pending ms",
+    "kindsNote": "Spec-Bench 256 tokens · cached code 400 tokens"
+  },
+  "many": {
+    "agents": 8,
+    "sum": null,
+    "each": null,
+    "ttft": "Pending ms",
+    "metric": "Spec-Bench · output tok/s",
+    "eachLabel": "tok/s per stream · Spec-Bench"
+  },
+  "conc": {
+    "x": [
+      1,
+      4,
+      8
+    ],
+    "sum": [
+      null,
+      null,
+      null
+    ],
+    "each": [
+      null,
+      null,
+      null
+    ]
+  },
+  "depth": {
+    "src": "2026-11-16 · suite v2 · cold c1",
+    "prefillLabel": "cold prefill, tok/s",
+    "prefill": [
+      [
+        2048,
+        2946
+      ],
+      [
+        8192,
+        3680
+      ]
+    ],
+    "decode": [],
+    "decodeNote": [
+      "Pending tok/s each",
+      "64K+8K · 8 agents · 400 tokens"
+    ]
+  },
+  "mem": {
+    "src": "capacity only · use unmeasured",
+    "vram": {
+      "total": 256,
+      "label": "4 × 64 GB HBM2e",
+      "note": "Use not measured",
+      "rest": "untracked",
+      "segs": []
+    },
+    "dram": {
+      "total": 52,
+      "label": "52 GiB container cap",
+      "note": "Use / host capacity unmeasured",
+      "rest": "untracked",
+      "segs": []
+    },
+    "disk": [
+      "Engram",
+      "NVMe-backed row reads"
+    ]
+  },
+  "energy": {
+    "at": "none",
+    "basis": "GPU draw and energy unmeasured · configured limits only"
+  },
+  "setup": [
+    [
+      "64K+8K · 4 agents",
+      "Pending each · Pending sum · Pending first token"
+    ],
+    [
+      "64K+8K · 8 agents",
+      "Pending each · Pending sum · Pending first token"
+    ]
+  ],
+  "evals": {
+    "kind": "peaks",
+    "note": "",
+    "items": [
+      [
+        "Pending",
+        "code tok/s · 8 agents"
+      ],
+      [
+        "Pending",
+        "code tok/s · 1 agent"
+      ],
+      [
+        "3,961",
+        "cold prefill tok/s · c8",
+        "2026-11-16"
+      ]
+    ]
+  },
+  "power": {
+    "g0": 175,
+    "g1": 175,
+    "perGpu": [
+      175,
+      175,
+      175,
+      175
+    ],
+    "cap": 175,
+    "approx": false,
+    "mark": "",
+    "hideEnergy": true,
+    "label": "Configured GPU caps, all four cards",
+    "note": "175 W per card · draw not measured",
+    "at": {
+      "one": [
+        "≤",
+        700
+      ],
+      "many": [
+        "≤",
+        700
+      ]
+    }
+  },
+  "cpuRole": "host + Engram",
+  "facts": [
+    [
+      "Pending",
+      "Spec-Bench tok/s · 8 agents"
+    ],
+    [
+      "Pending",
+      "peak code tok/s · 1 agent"
+    ],
+    [
+      "Pending",
+      "peak code tok/s · 8 agents"
+    ],
+    [
+      "3,961",
+      "peak cold prefill tok/s · c8"
+    ]
+  ],
+  "stack": [
+    "vLLM df3bd094 · TP4",
+    "EXL3 EAQ 2.9 bpw",
+    "DSpark K5",
+    "Exact bounded indexer",
+    "Decode + eager prefill MoE",
+    "NVMe Engram"
+  ],
+  "patches": 0,
+  "provenance": {
+    "sourceRun": "headline-pack-r1; current-r7f",
+    "recipeResults": "https://github.com/adrienbrault/deepseek-v4.1-flash-4x-cmp170hx/tree/main/PENDING-headline-calibration",
+    "inputsSha256": "",
+    "cachedCode": "PENDING-headline-calibration/summary.json",
+    "qualityBasis": "Performance only; no accuracy score. Base name only.",
+    "protocols": "Spec-Bench 120 stratified prompts, 256 forced tokens, T=0; per stream = 1000 / TPOT p50; wall = completion tokens / benchmark duration. Code: shared cached 1K+2K / 32K+2K / 64K+8K, 400 forced tokens, T=0, seed15; common-window per-stream mean and measured sum.",
+    "prefill": "bench/results/2026-11-16-current-r7e-suite/summary.json; 2026-11-16 UTC; current-r7e suite v2, r7f same kernels; nominal 2K/8K at c1/c4/c8; one output token, T=0, thinking off, zero prompt-cache hits, host cache warm-steady. Chart c1; peak c8 at 8K. Chain same-hour-window check failed; retained per-boot summaries.",
+    "hardware": "config/served.json; four CMP 170HX, TP4, EAQ 2.9 bpw; 175 W/card configured caps, draw unmeasured",
+    "logo": "@lobehub/icons 6.15.1, es/DeepSeek/components/Color.mjs; MIT, deepseek.LICENSE"
+  },
+  "hardware": {
+    "goal": "DeepSeek-V4.1-Flash on four CMP 170HX cards",
+    "gpus": [
+      {
+        "name": "CMP 170HX",
+        "vram": "64 GB HBM2e",
+        "limit": 175,
+        "maker": "NVIDIA"
+      },
+      {
+        "name": "CMP 170HX",
+        "vram": "64 GB HBM2e",
+        "limit": 175,
+        "maker": "NVIDIA"
+      },
+      {
+        "name": "CMP 170HX",
+        "vram": "64 GB HBM2e",
+        "limit": 175,
+        "maker": "NVIDIA"
+      },
+      {
+        "name": "CMP 170HX",
+        "vram": "64 GB HBM2e",
+        "limit": 175,
+        "maker": "NVIDIA"
+      }
+    ],
+    "cpu": "AMD EPYC 7401P",
+    "cores": "",
+    "ram": "Host capacity not verified",
+    "link": "PCIe Gen2 x16 per GPU",
+    "memclk": "not recorded",
+    "driver": "not recorded",
+    "disk": "NVMe",
+    "nvme": {
+      "name": "Host NVMe",
+      "size": "",
+      "read": "not measured",
+      "readNote": "read throughput"
+    }
+  },
+  "kpis": [
+    [
+      "Pending",
+      "Spec-Bench tok/s · 8 agents"
+    ],
+    [
+      "Pending",
+      "Spec-Bench per stream · 1 agent"
+    ],
+    [
+      "Pending ms",
+      "first token p50 · 8 agents"
+    ],
+    [
+      "Pending",
+      "peak code tok/s · 1 agent"
+    ],
+    [
+      "Pending",
+      "peak code tok/s · 8 agents"
+    ],
+    [
+      "3,961",
+      "peak cold prefill tok/s · c8"
+    ]
+  ],
+  "publication_status": "PENDING_HEADLINE_CALIBRATION",
+  "headline": {
+    "results": "PENDING-headline-calibration",
+    "configuration": "current-r7f",
+    "cells": {},
+    "ratios": {},
+    "subset": {},
+    "cold_prefill": {
+      "date_utc": "2026-11-16",
+      "configuration": "current-r7e",
+      "results": "bench/results/2026-11-16-current-r7e-suite",
+      "summary_sha256": "91d1cb7b597750ea719dc0e566d5ad250c7ac6d239d7fc39bc44601dd94f6779",
+      "output_tokens_per_request": 1,
+      "temperature": 0,
+      "thinking": false,
+      "cache": "zero prompt-cache hits; host cache warm-steady",
+      "cells": [
+        {
+          "prompt_tokens": 2048,
+          "concurrency": 1,
+          "input_tok_s": 2946
+        },
+        {
+          "prompt_tokens": 2048,
+          "concurrency": 4,
+          "input_tok_s": 3340
+        },
+        {
+          "prompt_tokens": 2048,
+          "concurrency": 8,
+          "input_tok_s": 3648
+        },
+        {
+          "prompt_tokens": 8192,
+          "concurrency": 1,
+          "input_tok_s": 3680
+        },
+        {
+          "prompt_tokens": 8192,
+          "concurrency": 4,
+          "input_tok_s": 3915
+        },
+        {
+          "prompt_tokens": 8192,
+          "concurrency": 8,
+          "input_tok_s": 3961
+        }
+      ],
+      "report_status": "Both boots rc=0, identity/KV PASS; chain report rejected same-hour-window check; transcribed retained per-boot summary table"
+    },
+    "report_sha256": "",
+    "source_key": ""
+  }
+}

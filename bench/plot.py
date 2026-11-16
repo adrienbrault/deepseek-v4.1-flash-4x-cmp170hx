@@ -10,6 +10,7 @@ Style, palette and SVG text follow the GLM-5.3-Flash and Flash-Next recipes.
 Historical qualifications stay dated; only same-chain controls support a causal
 comparison. Missing stream metrics and memory categories are never inferred.
 """
+import argparse
 import json
 from pathlib import Path
 
@@ -139,7 +140,51 @@ def history(current, previous, earlier):
     save(fig, "history.svg", "Daily promotion history with dated c1/c4/c8 suite decode aggregates")
 
 
+def headline(summary):
+    """Only allowlisted headline summaries; incomplete cells remain gaps."""
+    assert summary["schema"] == "headline-summary/1"
+    cells = summary["cells"]
+    xs = [1, 4, 8]
+    title = f'{summary["configuration"]} · {summary["date_utc"]} UTC · base name · TP4, four Gen2 x16, 175 W/GPU'
+    if not summary["publication_ready"]:
+        title += " · INCOMPLETE DRAFT"
+    def values(keys, field):
+        return [cells.get(k, {}).get(field, float("nan")) for k in keys]
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4.3))
+    keys = [f"specbench-subset-c{c}" for c in xs]
+    for ax, field, label, color in zip(axes[:2], ("output_tok_s", "per_stream_tok_s"),
+            ("Wall output tok/s", "Per-stream tok/s (1000 / TPOT p50)"), (AGG, DECODE)):
+        ys = values(keys, field)
+        ax.plot(xs, ys, marker="o", color=color); annotate(ax, xs, ys, color)
+        ax.set(title=label, xlabel="concurrent agents", ylim=(0, None)); ax.set_xticks(xs); style(ax)
+    for field, label, color in (("ttft_p50_ms", "p50", DECODE), ("ttft_p99_ms", "p99", PREFILL)):
+        axes[2].plot(xs, values(keys, field), marker="o", color=color, label=label)
+    axes[2].set(title="TTFT, ms", xlabel="concurrent agents", ylim=(0, None))
+    axes[2].set_xticks(xs); axes[2].legend(frameon=False); style(axes[2])
+    fig.suptitle(title + "\nSpec-Bench · stratified 120 prompts · 256 forced tokens · T=0 · client wall includes prefill", fontsize=10)
+    save(fig, "headline-agent.svg", title + "; Spec-Bench wall output, per-stream rate and TTFT")
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4.3))
+    for p, a, color in ((1024, 2048, DECODE), (32768, 2048, AGG), (65536, 8192, PREFILL)):
+        keys = [f"code-shared-t{p}-a{a}-c{c}" for c in xs]
+        for ax, field in zip(axes, ("aggregate_tok_s", "per_stream_tok_s", "ttft_p50_ms")):
+            ax.plot(xs, values(keys, field), marker="o", color=color, label=f"{p//1024}K + {a//1024}K")
+    for ax, label in zip(axes, ("Common-window aggregate tok/s", "Mean stream decode tok/s", "Append TTFT p50, ms")):
+        ax.set(title=label, xlabel="concurrent agents", ylim=(0, None)); ax.set_xticks(xs)
+        ax.legend(frameon=False, fontsize=8); style(ax)
+    fig.suptitle(title + "\nCached code · 400 forced tokens · T=0, seed15 · shared context · one batch/cell", fontsize=10)
+    save(fig, "headline-code.svg", title + "; cached-code peak and long-context decode and append TTFT")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headline", type=Path, help="sanitized headline summary; otherwise draw dated suite history")
+    parser.add_argument("--output-dir", type=Path, help="stage generated figures in a local directory")
+    args = parser.parse_args()
+    if args.output_dir:
+        OUT = args.output_dir
+    if args.headline:
+        headline(json.loads(args.headline.read_text()))
+        raise SystemExit(0)
     current, previous, earlier = read(CURRENT), read(PREVIOUS), read(EARLIER)
     decode(current, previous)
     # Retain the explicitly dated r7c historical figure; no absolute r7d prefill.
