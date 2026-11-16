@@ -1,10 +1,10 @@
 # Reproducing the recorded serving definition
 
-The package mirrors the current-r7d configuration and the source files that can be exported from the local source tree. It does not yet contain every input needed for a standalone build. Source gaps below are blocking, not optional fallbacks. No generated-output directory, captured tensor, model weight, token record or private log was copied.
+The package mirrors the current-r7f configuration and the source files that can be exported from the local source tree. It does not yet contain every input needed for a standalone build. Source gaps below are blocking, not optional fallbacks. No generated-output directory, captured tensor, model weight, token record or private log was copied.
 
 ## Inputs
 
-Use an x86_64 Linux host with four memory-unlocked CMP 170HX cards, each at PCIe Gen2 x16 and a 175 W cap, with the recorded EPYC 7401P and 46 GB RAM when comparing the published numbers. Address GPUs by their locally discovered UUID or serial; this repository contains no machine identifiers. Engram tables remain on NVMe. Store the hybrid checkpoint, official Engram files, derived rank-one adapter and compiler cache outside this repository.
+Use an x86_64 Linux host with four memory-unlocked CMP 170HX cards, each at PCIe Gen2 x16 and a 175 W cap, with the recorded EPYC 7401P and the dated host conditions when comparing measurements. Address GPUs by their locally discovered UUID or serial; this repository contains no machine identifiers. Engram tables remain on NVMe. Store the hybrid checkpoint, official Engram files, derived rank-one adapter and compiler cache outside this repository.
 
 The engine is pinned by installed image ID in `config/served.json`. This is a local image content ID, not a pullable registry digest. The original nightly base is `vllm/vllm-openai:nightly-df3bd094aeea829f27baa0a5282830464f601d9f@sha256:17845138a26f2b67ae78985ad4804518060dc6aa253ef76c8bb52e4fcc898d44`; applying the r17 patches to it alone does not recreate f760. No script pulls an image or selects a newer revision.
 
@@ -40,3 +40,9 @@ Resolve these from source-controlled inputs or a separately reviewed export befo
 ## Current-r7d additive plan
 
 `config/served.json` preserves the r7c engine command and bounded indexer, appends `dsv41_moe_stack` to `VLLM_PLUGINS`, sets `DSV41_MOE_STACK=1` and parameterizes `DSV41_STACK_NATIVE_SEAL`. Its seven read-only `runtime_bind_inputs` entries mirror the final r7d transform: plugin and metadata under site-packages, the exact native bundle at `/opt/stack-native`, the binding at `/opt/stack-code/stack_runtime.py`, and three semantic selector helpers under `/stack-rounds`. `RECIPE_ROOT` denotes this checkout; `RUNTIME_ASSETS_ROOT` denotes externally supplied assets. The native seal is SHA256 of that bundle's `seal.json`, not an arbitrary generated replacement. The launcher prints these settings without resolving private host paths or starting a service. No authenticated seal value is fabricated, and execution remains blocked by the existing source gaps.
+
+## Current-r7e/current-r7f additive plan
+
+The r7f plan retains all r7d engine arguments and STACK binds, appends `dsv41_prefill_7b` to plugin discovery and fixes `DSV41_PREFILL_7B_R7D=1`. Thirteen added read-only binds expose the serving plugin/metadata, six unchanged worker helpers under `/opt/qv`, four helpers under `/opt/prefill-bitwise`, and the measured `_dsv41_mm_try.abi3.so`. Sources are pinned in the inventory. The native library must match the original qualified build receipt; neither that library nor its private receipt is fabricated here. Its generated source baseline remains external, in addition to the older source gaps above.
+
+The container creation options record exactly `--memory 55834574848 --memory-swap 55834574848`. No kernel, model, sequence count or graph descriptor changes at r7f. Host capacity is unverified locally; the old 46 GB measurement label and the r7f packet's 60 GiB budget are not treated as a new inventory. The export still has no authenticated lifecycle executor. `scripts/serve.py` renders the complete documented plan and refuses execution as before.

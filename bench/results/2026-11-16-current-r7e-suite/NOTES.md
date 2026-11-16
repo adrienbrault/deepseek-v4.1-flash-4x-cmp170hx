@@ -1,0 +1,9 @@
+# Same-hour loaded suite v2, 2026-11-16 UTC
+
+Source: `rounds/suite-r7e-r1/RESULTS.md`, run `20261116T110411Z-1955810-suite-r7e`. One r7d boot at 11:04–11:19 UTC, then one r7e boot at 11:19–11:35 UTC. Both boot exits were zero with identity and KV checks passing. The chain report stopped on its same-hour-window check despite a recorded 31-minute chain; this export transcribes the retained per-boot summary table, without claiming a repaired sealed chain report. No raw logs or host paths are copied.
+
+Configuration: TP4, four Gen2 x16 CMP 170HX cards, 175 W per card, DSpark K5, adaptive verification off, FULL_DECODE_ONLY, capture sizes 1–48, max eight sequences and 2,048 batched tokens. R7e is r7d plus the bitwise eager prefill schedule. R7f subsequently changed only the container memory cap to 52 GiB. These measurements remain labelled r7e.
+
+Decode uses frozen decode-prompts-v2 chat prompts, mostly reasoning before code, 400 output tokens per request, temperature zero, seed 15 and EOS suppression. C1/c4 use ordered sends, c8 burst. Each batch sums measured request decode rates, `(completion_tokens - 1) / (stream_end - first_content_event)`, then the boot averages scored batches. Per-stream statistics are unavailable. Burst rate and ordered step timing are separate observations. This is the fixed-work A/B reference, distinct from the common-window code headline.
+
+Prefill uses nominal 2K/8K prompts at c1/c4/c8, one output token, temperature zero, thinking off, zero prompt-cache hits and warm-steady host cache. The summary retains the input-rate table; absolute TTFT was not transcribed because it is absent from that retained table. R7e prefill gains 5–7% against same-hour r7d; small decode differences fall within suite boot noise. The earlier drifted prefill reference is superseded by this same-hour comparison.

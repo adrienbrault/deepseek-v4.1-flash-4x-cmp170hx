@@ -45,3 +45,5 @@ engram/0001-fused-dequant.patch
 engram/0002-row-prefetch.patch
 engram/0003-bounded-row-cache.patch
 splitk/0001-splitk-numerics-variants.patch
+serving/0001-r7e-eager-prefill.patch
+serving/0002-r7f-memory-cap.patch

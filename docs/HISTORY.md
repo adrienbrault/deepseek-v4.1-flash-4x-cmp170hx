@@ -13,6 +13,8 @@ The table records changes of the daily definition. A selected definition can rem
 | 2026-11-14 09:45 | current-r7b | [Fixed640 native series](../patches/native/); [qualification](../bench/results/2026-11-14-current-r7b-qualification/), source `20261114T052150Z-2097332-qualify`; acceptance `20261114T092653Z-4010770-actual-acceptance`. Promotion minute follows the retained current operating record. |
 | 2026-11-15 19:45 | current-r7c | Exact bounded indexer top-k on r7b, read-only k1b library; [confirmation and acceptance](../bench/results/2026-11-15-current-r7c-qualification/). Serving absent after acceptance teardown. |
 | 2026-11-16 00:00 | current-r7d | Rows-family kernels for 24 row counts plus K2 fixed16, single-bank capture-only MoE plugin; [confirmation and acceptance](../bench/results/2026-11-15-current-r7d-qualification/). Serving remains stopped. |
+| 2026-11-16 09:08 | current-r7e | Bitwise eager prefill MoE schedule at 128–2,048 rows, borrowed workspace; acceptance `20261116T083315Z-760421-actual-acceptance` PASS, serving stopped. [Same-hour suite](../bench/results/2026-11-16-current-r7e-suite/). |
+| 2026-11-16 18:25 | current-r7f | Container memory and memory-swap 36 -> 52 GiB, same kernels/model; acceptance `20261116T180842Z-1157942-actual-acceptance` PASS at 18:08–18:22 UTC, identity before/after, KV and client contracts PASS; report-only suite SKIPPED. Selected, serving stopped. |
 
 ## Current-r7b qualification, 2026-11-14
 
@@ -48,3 +50,9 @@ The former PCIe Gen2 x4 README statement belongs to older hardware state. The cu
 The [confirmation notes](../bench/results/2026-11-15-current-r7d-qualification/NOTES.md) and [summary](../bench/results/2026-11-15-current-r7d-qualification/summary.json) record the one-ON run `20261115T214428Z-3587331-moe-stack-confirm` on 2026-11-15 21:44–22:02 UTC, against the stored same-day r7c reference. Loaded suite v2, frozen chat, 400 output tokens per request, temperature zero, seed 15, EOS suppression, TP4 and four Gen2 x16 cards at 175 W each: c1 168.2 and c4 369.9 tok/s ordered, c8 457.5 tok/s burst, with ordered c8 419.7 tok/s. The final plugin keeps STACK inside eligible target capture forwards and restores incumbent eager entrypoints. BITWISE_PASS and actual-launcher acceptance are retained records, not tests repeated by this mirror.
 
 Absolute r7d prefill is omitted because host drift invalidates a clean same-config comparison. The 2026-11-16 same-hour prefill control reported +2 to +6 % against r7c; the linked notes identify the 2K/8K c1/c4/c8 workload, sampler and two diagnostic runs. R7c absolute prefill and its dated [figure](img/prefill.svg) remain historical. The history chart includes all three dated qualification summaries; protocols and cross-boot differences limit causal interpretation.
+
+## Current-r7e and current-r7f, 2026-11-16
+
+R7e folds the measured eager-only 7b schedule into r7d. The workspace-borrowing adapter retains the incumbent decode bank and arithmetic, authenticates native output bytes during profile, and fences graph capture/replay and eager execution. The [same-hour suite notes](../bench/results/2026-11-16-current-r7e-suite/NOTES.md) retain the dated r7d/r7e comparison and report-window failure. The new agent/peak/long-context headline calibration remains pending.
+
+R7f changes the two container creation limits to 55,834,574,848 bytes, with memory-swap equal to memory. It adds no kernel or model change. The acceptance skipped its report-only suite because the remaining window was too short; no new speed number is attributed to that acceptance. Selection was recorded at 19:25 Paris (18:25 UTC), without restoring serving. Host RAM is not inferred from the container cap.

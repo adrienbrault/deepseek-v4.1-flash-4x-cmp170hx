@@ -80,3 +80,13 @@ The native baseline payload, full f760 build chain, original tuned sparse table,
 Layer 60 mirrors `moe-stack-confirm-r1/overlay/dsv41_moe_stack` after the eager-path repair at source commit `8a44b36ee5fd81ae0ae2f0fa9f50cbb4908a56be`, and the unchanged `moe-stack-live-r1/stack_runtime.py`. File-level source commits and hashes are pinned in [SOURCE-INVENTORY.json](SOURCE-INVENTORY.json). The target APIs are vLLM `GPUModelRunner.load_model`/`capture_model`, `CudaGraphManager.capture`, the argmax patch hook, and vllm-exl3 `coop_kernel.execute`/`apply_exl3_fused_moe`; the existing AGPL-3.0-only integration notice remains applicable.
 
 The MIT source generators under `docker/overlays/stack-rounds/` create two independent native branches from the cumulative fixed640 source, not two patches to apply in sequence. Rows-family changes only the row-membership guard; K2 adds exact K2 guard/instantiations while retaining K3 and arithmetic bodies. Runtime selection excludes row 1 and row 16 from the 24-row family, and restricts K2 fixed16 to layers 18–22. The measured DSOs and authenticated seal remain external and must be reused byte-for-byte for the recorded configuration. These generators document derivation; their shared baseline builder remains a reproduction gap. The plugin defaults off, preserves one graph bank and the incumbent dispatch/descriptor set, and restores exact incumbent eager functions on every capture exit.
+
+
+## Serving layers 61 and 62, 2026-11-16
+
+| order | layer | purpose | target and base |
+| ---: | --- | --- | --- |
+| 61 | [0001-r7e-eager-prefill](../patches/serving/0001-r7e-eager-prefill.patch) | Add the measured bitwise eager prefill schedule, fixed switch and read-only binds | `config/served.json` on the recorded r7d export; MIT; runtime helpers under `docker/overlays/prefill-code` and `prefill-bitwise` |
+| 62 | [0002-r7f-memory-cap](../patches/serving/0002-r7f-memory-cap.patch) | Raise the exact memory and memory-swap pair from 36 to 52 GiB | `config/served.json` after layer 61; MIT; no kernel change |
+
+These last two patches record configuration derivation and are already reflected in the exported config. They are not upstream engine patches. Their exact base file hashes are in the manifest. The source inventory pins every added runtime helper. The 7b native library and its original build receipt remain external; no generated output or replacement native binary is exported. The GNmac/Morrowmake schedule lineage and AGPL integration notice remain in [THIRD_PARTY.md](../THIRD_PARTY.md).

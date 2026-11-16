@@ -1,0 +1,86 @@
+{
+  "date_utc": "2026-11-16",
+  "configuration": "current-r7e",
+  "reference_configuration": "current-r7d",
+  "source": "rounds/suite-r7e-r1/out/20261116T110411Z-1955810-suite-r7e",
+  "interval_utc": [
+    "11:04",
+    "11:35"
+  ],
+  "decode": {
+    "output_tokens_per_request": 400,
+    "temperature": 0,
+    "seed": 15,
+    "ignore_eos": true,
+    "workload": "decode-prompts-v2 frozen chat",
+    "metric": "sum of measured request decode rates, then boot mean",
+    "cells": [
+      {
+        "concurrency": 1,
+        "mean_tok_s": 166.9,
+        "reference_tok_s": 168.0,
+        "step_ms": 18.82,
+        "protocol": "ordered"
+      },
+      {
+        "concurrency": 4,
+        "mean_tok_s": 370.1,
+        "reference_tok_s": 370.5,
+        "step_ms": 32.16,
+        "protocol": "ordered"
+      },
+      {
+        "concurrency": 8,
+        "mean_tok_s": 456.7,
+        "reference_tok_s": 454.3,
+        "step_ms": 44.69,
+        "protocol": "burst"
+      }
+    ]
+  },
+  "prefill": {
+    "output_tokens_per_request": 1,
+    "temperature": 0,
+    "thinking": false,
+    "cache": "zero prompt-cache hits; host cache warm-steady",
+    "cells": [
+      {
+        "prompt_tokens": 2048,
+        "concurrency": 1,
+        "input_tok_s": 2946,
+        "reference_input_tok_s": 2800
+      },
+      {
+        "prompt_tokens": 2048,
+        "concurrency": 4,
+        "input_tok_s": 3340,
+        "reference_input_tok_s": 3176
+      },
+      {
+        "prompt_tokens": 2048,
+        "concurrency": 8,
+        "input_tok_s": 3648,
+        "reference_input_tok_s": 3413
+      },
+      {
+        "prompt_tokens": 8192,
+        "concurrency": 1,
+        "input_tok_s": 3680,
+        "reference_input_tok_s": 3485
+      },
+      {
+        "prompt_tokens": 8192,
+        "concurrency": 4,
+        "input_tok_s": 3915,
+        "reference_input_tok_s": 3676
+      },
+      {
+        "prompt_tokens": 8192,
+        "concurrency": 8,
+        "input_tok_s": 3961,
+        "reference_input_tok_s": 3698
+      }
+    ]
+  },
+  "report_status": "Both boots rc=0, identity/KV PASS; chain report rejected same-hour-window check; transcribed retained per-boot summary table"
+}

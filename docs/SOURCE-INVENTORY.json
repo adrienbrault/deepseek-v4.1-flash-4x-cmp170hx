@@ -675,5 +675,96 @@
     "license": "MIT",
     "source_commit": "ce698941f79a46fdf558cd6dd0ddade2c3e92d7a",
     "sha256": "9b634eecf20ff747222ea17d57ee1e9dc0e0464b938713a00eae855156c67ee2"
+  },
+  {
+    "file": "docker/overlays/dsv41_prefill_7b/__init__.py",
+    "origin": "rounds/current-r7e-r1/overlay/dsv41_prefill_7b/__init__.py",
+    "license": "MIT",
+    "source_commit": "9aff522d77f8df5f70dea111c22d00d3380c10af",
+    "sha256": "33c7065b10aa12b6a2bfd8cc8deb5c028a9af692d6758acb64d004276aae92da"
+  },
+  {
+    "file": "docker/overlays/dsv41_prefill_7b-0.1.0.dist-info/METADATA",
+    "origin": "rounds/current-r7e-r1/overlay/dsv41_prefill_7b-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "source_commit": "9aff522d77f8df5f70dea111c22d00d3380c10af",
+    "sha256": "984b4a711cdc633a184cc3aeab79e50dd5160ff3a5983bb53ec9a6b601771289"
+  },
+  {
+    "file": "docker/overlays/dsv41_prefill_7b-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/current-r7e-r1/overlay/dsv41_prefill_7b-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "source_commit": "9aff522d77f8df5f70dea111c22d00d3380c10af",
+    "sha256": "b9f563bf4ca6bed8338e6a62215df8e6e015751096b9b94eabdfd925870f8b5d"
+  },
+  {
+    "file": "docker/overlays/prefill-code/prefill_7b_candidate.py",
+    "origin": "rounds/prefill-7b-r7d-r1/qv_candidate.py",
+    "license": "MIT",
+    "source_commit": "ce7916785b71b9890072ce5bf39c864d3110905e",
+    "sha256": "60078ba873360e513820fcafc68b561ed3e908c63e6ddb3539ad5ca7535eb1e0"
+  },
+  {
+    "file": "docker/overlays/prefill-code/borrowed_workspace.py",
+    "origin": "rounds/prefill-7b-r7d-r1/borrowed_workspace.py",
+    "license": "MIT",
+    "source_commit": "ce7916785b71b9890072ce5bf39c864d3110905e",
+    "sha256": "9a20b1413fdc1c0cf940cb36bdc5c56da743c22cfbd4ef42ac5a035ab26ded18"
+  },
+  {
+    "file": "docker/overlays/prefill-code/prefill_7b_owner.py",
+    "origin": "rounds/prefill-qv-r1/qv_candidate.py",
+    "license": "MIT",
+    "source_commit": "c21f02811cb6534ed6ab56b3918a6f618efa968b",
+    "sha256": "7705bab977a1573d16fef5823907e06afdc510b3b4bc024a0e968483d4347c45"
+  },
+  {
+    "file": "docker/overlays/prefill-code/graph_policy.py",
+    "origin": "rounds/prefill-qv-r1/graph_policy.py",
+    "license": "MIT",
+    "source_commit": "c21f02811cb6534ed6ab56b3918a6f618efa968b",
+    "sha256": "e91eae5481c9788e197f759cfe3ba4496270deca480f0b13c291d1584c91e031"
+  },
+  {
+    "file": "docker/overlays/prefill-code/stack_identity_owner.py",
+    "origin": "rounds/indexer-bounded-confirm3/qv_candidate.py",
+    "license": "MIT",
+    "source_commit": "9cb7bd36605051bb6adaf4bfea8a6cb719e9286c",
+    "sha256": "2806c25bfd3d80c73c9a9e19171dc0a41a0e36a7ef6aeb3b7c708784beb2005a"
+  },
+  {
+    "file": "docker/overlays/prefill-code/r7b_identity.py",
+    "origin": "rounds/current-r7b-r1/qv_candidate.py",
+    "license": "MIT",
+    "source_commit": "84c0593374d66a454a8677288fa5e067969dec59",
+    "sha256": "a30f3ee23b48011b7fb4a56f7969305432d6b758630d42208a11450ebb6633e7"
+  },
+  {
+    "file": "docker/overlays/prefill-bitwise/runtime.py",
+    "origin": "rounds/bitwise-prefill-r1/runtime.py",
+    "license": "MIT",
+    "source_commit": "a221d3f4fe2eeca99aa57a7e79eecc1a461fc02a",
+    "sha256": "bfd06542ddfadecf80f7560cfa17d4a4ec18cfbfc3f5abc2a0549de253e281e7"
+  },
+  {
+    "file": "docker/overlays/prefill-bitwise/layers.py",
+    "origin": "rounds/bitwise-prefill-r1/layers.py",
+    "license": "Apache-2.0",
+    "source_commit": "6e12df5406a1a6c05183e50e49a92adfaf610d03",
+    "sha256": "728c820ebe4f7cdcfa2a8f43fb2deeeb225fd71a3c8f1bc7c81259c327d822d9"
+  },
+  {
+    "file": "docker/overlays/prefill-bitwise/common.py",
+    "origin": "rounds/bitwise-prefill-r1/common.py",
+    "license": "MIT",
+    "source_commit": "4fd0e397de2dc64fdaa2c2d7921af003380a06df",
+    "sha256": "eb296627bf6790003d4303d89cef9227fb685725ad60f6d40bf784a1df1d71d7"
+  },
+  {
+    "file": "docker/overlays/prefill-bitwise/prefetch.py",
+    "origin": "rounds/bitwise-prefill-r1/prefetch.py",
+    "license": "MIT",
+    "source_commit": "ce32dde419f88dad330a89f94fa470f685db53a8",
+    "sha256": "51f9111f534f6f5554aa23178d0d667ee351785c74bf5c82f0892b9ab540c7ce"
   }
 ]

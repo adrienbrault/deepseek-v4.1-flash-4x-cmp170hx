@@ -557,5 +557,25 @@
     "license": "Apache-2.0",
     "base": "sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27",
     "sha256": "279522c240b9d08ddc99836c98c401e0461b1f177284d531cdf9dd78fba623ca"
+  },
+  {
+    "file": "patches/serving/0001-r7e-eager-prefill.patch",
+    "purpose": "Add the bitwise eager prefill schedule and its read-only runtime binds",
+    "targets": [
+      "config/served.json"
+    ],
+    "license": "MIT",
+    "base": "config/served.json SHA256 f0794bd13a836aa10528c333a1cca58adf831284b75c0164d0fe5c1d73caff7d",
+    "sha256": "916a8c34c70d23ddc2977348015efd797a3424a42dcf5beeef0f53e4fe169869"
+  },
+  {
+    "file": "patches/serving/0002-r7f-memory-cap.patch",
+    "purpose": "Raise the exact container memory and memory-swap pair to 52 GiB",
+    "targets": [
+      "config/served.json"
+    ],
+    "license": "MIT",
+    "base": "config/served.json SHA256 14f1520dbe963224b5b3fe2a788350cc7445c806697d03f8945ded2556af05b7",
+    "sha256": "d3ec20d1f55c7653b4db41e2dea2ad0f8693f37bc8a07155422d8722b877294f"
   }
 ]

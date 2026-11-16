@@ -11,6 +11,17 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def validate_plan(plan):
+    """Keep the exported daily's two additive policies joined to its launcher."""
+    if plan['definition'] not in {'current-r7f', 'current-r7g'}:
+        raise ValueError('unsupported serving export definition')
+    if plan.get('docker_options') != ['--memory', '55834574848', '--memory-swap', '55834574848']:
+        raise ValueError('selected definition requires the exact 52 GiB memory pair')
+    env = plan['environment']
+    if env.get('DSV41_PREFILL_7B_R7D') != '1' or env['VLLM_PLUGINS'].split(',').count('dsv41_prefill_7b') != 1:
+        raise ValueError('selected definition requires the bitwise eager prefill serving bootstrap')
+
+
 def local_inputs():
     values = {}
     file = ROOT / 'scripts/host.env'
@@ -37,6 +48,7 @@ def main():
     mode.add_argument('--run', action='store_true', help='refused while the export is incomplete')
     args = parser.parse_args()
     plan = json.loads((ROOT / 'config/served.json').read_text())
+    validate_plan(plan)
     if not args.check and not args.run:
         print(json.dumps(plan, indent=2))
         return 0

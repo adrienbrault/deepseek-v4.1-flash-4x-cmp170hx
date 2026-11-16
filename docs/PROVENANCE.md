@@ -19,3 +19,10 @@ README upstream links use the repository URLs and pins already recorded in [THIR
 The [r7d summary](../bench/results/2026-11-15-current-r7d-qualification/summary.json) takes every new absolute number solely from the current-r7d section of `NUMBERS.md`, dated 2026-11-15 and naming `20261115T214428Z-3587331-moe-stack-confirm`. No r7c prefill cell is relabelled as served r7d prefill. The same-hour relative prefill observation is dated 2026-11-16. Confirmation and acceptance context comes from the retained source results and operating record; no host was contacted.
 
 Layer 60 exports exact non-output source bytes for the single-bank plugin, shared binding, three selector helpers and three native source generators. Their source-relative locations, commits, MIT licences and SHA256 values are in [SOURCE-INVENTORY.json](SOURCE-INVENTORY.json). The serving plan preserves r7c engine arguments and adds precisely the plugin, two environment values and seven read-only binds from the r7d transform. Host bind roots and the unavailable authenticated native-seal digest are parameters. The inherited full argv and lifecycle gaps remain; this is a static mirror, not a newly qualified serving executor.
+
+
+## Current-r7e/current-r7f mirror, 2026-11-16
+
+The retained promotion/acceptance records establish r7e selected at 09:08 UTC and r7f at 18:25 UTC on 2026-11-16; neither selection restored serving. The local mirror copies only non-output runtime source, records its last source commit and exact content hash, and preserves file-level MIT/Apache notices. Layers 61/62 derive the configuration in order. The exact 7b native library/build receipt remains an explicit source gap. No network access, image build, native compile or GPU validation was repeated.
+
+The r7e suite summary transcribes the 2026-11-16 retained per-boot table from `suite-r7e-r1/RESULTS.md`, including its failed report-window check. New headline results will be allowlist exports from headline-report/2; prompts, token IDs, source paths and report prose are excluded. Synthetic tests write only temporary output and do not become measured results.
