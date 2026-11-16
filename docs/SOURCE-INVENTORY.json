@@ -598,5 +598,82 @@
     "origin": "r17/kit/vendor/OVERLAY-LICENSE",
     "license": "upstream notice",
     "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  {
+    "file": "docker/overlays/dsv41_moe_stack/__init__.py",
+    "origin": "rounds/moe-stack-confirm-r1/overlay/dsv41_moe_stack/__init__.py",
+    "license": "MIT",
+    "source_commit": "e9452f33ce9b82447c1a05eda77fff353b202f61",
+    "sha256": "d9486da63c4f9dadc14e2030c286be1edc5f4f12b97ae04f7159abbbd04b8732"
+  },
+  {
+    "file": "docker/overlays/dsv41_moe_stack/stack_plugin.py",
+    "origin": "rounds/moe-stack-confirm-r1/overlay/dsv41_moe_stack/stack_plugin.py",
+    "license": "MIT",
+    "source_commit": "8a44b36ee5fd81ae0ae2f0fa9f50cbb4908a56be",
+    "sha256": "9d690095d00d06ba80ddc7cf90ab3fbad2c662af9e13395e0d4298424d7dc894"
+  },
+  {
+    "file": "docker/overlays/dsv41_moe_stack-0.1.0.dist-info/entry_points.txt",
+    "origin": "rounds/moe-stack-confirm-r1/overlay/dsv41_moe_stack-0.1.0.dist-info/entry_points.txt",
+    "license": "MIT",
+    "source_commit": "1602c2d8af605f0baed4de263e7cbff29e288402",
+    "sha256": "86926f395a05ab98607ffe78c190f62f4646db8be6bd4270e6f201367075d824"
+  },
+  {
+    "file": "docker/overlays/dsv41_moe_stack-0.1.0.dist-info/METADATA",
+    "origin": "rounds/moe-stack-confirm-r1/overlay/dsv41_moe_stack-0.1.0.dist-info/METADATA",
+    "license": "MIT",
+    "source_commit": "1602c2d8af605f0baed4de263e7cbff29e288402",
+    "sha256": "62dfc81b47bbbc76f0147446e4c1a3f7c8ec3c008bfcc22006c99974166b04d4"
+  },
+  {
+    "file": "docker/overlays/stack-code/stack_runtime.py",
+    "origin": "rounds/moe-stack-live-r1/stack_runtime.py",
+    "license": "MIT",
+    "source_commit": "fcca55da2810d1311c52a4b39182ca5a2d1eef50",
+    "sha256": "5afaeceb489c76739b4f33e8993a4cfafc62b37e6910564253627bb9b106afec"
+  },
+  {
+    "file": "docker/overlays/stack-rounds/moe-rows-family-r1/common.py",
+    "origin": "rounds/moe-rows-family-r1/common.py",
+    "license": "MIT",
+    "source_commit": "bfb423532b113e57a29bea069e36b60bb1b3e901",
+    "sha256": "85e339361c4e25ffc207eb93f751515dc1278530524c12ce86831fc8b2c2ab37"
+  },
+  {
+    "file": "docker/overlays/stack-rounds/moe-rows-family-r1/build.py",
+    "origin": "rounds/moe-rows-family-r1/build.py",
+    "license": "MIT",
+    "source_commit": "3b0db24d48cc9cbf3ca7254e372409baf907faae",
+    "sha256": "b04ab9fe49b5577b5c107c24bad41831f2c86f4024c0d20625d827166661c271"
+  },
+  {
+    "file": "docker/overlays/stack-rounds/moe-k2-fixed16-r1/common.py",
+    "origin": "rounds/moe-k2-fixed16-r1/common.py",
+    "license": "MIT",
+    "source_commit": "2a6749008e6d0c7f1ec792b3e913471f6ea26632",
+    "sha256": "0440f90a2259fc6991a6c14461cf72403c4dc3bb9a570e892cb8af6dca9a7b5c"
+  },
+  {
+    "file": "docker/overlays/stack-rounds/moe-k2-fixed16-r1/build.py",
+    "origin": "rounds/moe-k2-fixed16-r1/build.py",
+    "license": "MIT",
+    "source_commit": "2a6749008e6d0c7f1ec792b3e913471f6ea26632",
+    "sha256": "0db254856d3d1dbae58e583d7fa94ab74ece77e46f32c4b94c7922bb6fb8d550"
+  },
+  {
+    "file": "docker/overlays/stack-rounds/c8-moe24-r1/common.py",
+    "origin": "rounds/c8-moe24-r1/common.py",
+    "license": "MIT",
+    "source_commit": "ce698941f79a46fdf558cd6dd0ddade2c3e92d7a",
+    "sha256": "131c501155904b1fc8be42dfa7a7362148776dcc305cab9257a97b59c0a3ac10"
+  },
+  {
+    "file": "docker/overlays/stack-rounds/c8-moe24-r1/build.py",
+    "origin": "rounds/c8-moe24-r1/build.py",
+    "license": "MIT",
+    "source_commit": "ce698941f79a46fdf558cd6dd0ddade2c3e92d7a",
+    "sha256": "9b634eecf20ff747222ea17d57ee1e9dc0e0464b938713a00eae855156c67ee2"
   }
 ]

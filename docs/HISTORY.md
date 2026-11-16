@@ -2,7 +2,7 @@
 
 The table records changes of the daily definition. A selected definition can remain stopped. The numeric history figure uses only the dated summaries available in this repository; earlier entries without November suite summaries are omitted.
 
-![Daily promotion history: c1, c4 and c8 decode aggregates from the r7b and r7c qualifications, measured 2026-11-14 and 2026-11-15](img/history.svg)
+![Daily promotion history: c1, c4 and c8 decode aggregates from the r7b, r7c and r7d qualifications, measured 2026-11-14 and 2026-11-15](img/history.svg)
 
 | UTC date | definition | change and evidence |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ The table records changes of the daily definition. A selected definition can rem
 | 2026-11-13 | current-r7a | Per-request rank-one abliterated adapter, fused dense update and GPU-local worker CPU affinity. No numeric summary exported for this promotion. |
 | 2026-11-14 09:45 | current-r7b | [Fixed640 native series](../patches/native/); [qualification](../bench/results/2026-11-14-current-r7b-qualification/), source `20261114T052150Z-2097332-qualify`; acceptance `20261114T092653Z-4010770-actual-acceptance`. Promotion minute follows the retained current operating record. |
 | 2026-11-15 19:45 | current-r7c | Exact bounded indexer top-k on r7b, read-only k1b library; [confirmation and acceptance](../bench/results/2026-11-15-current-r7c-qualification/). Serving absent after acceptance teardown. |
+| 2026-11-16 00:00 | current-r7d | Rows-family kernels for 24 row counts plus K2 fixed16, single-bank capture-only MoE plugin; [confirmation and acceptance](../bench/results/2026-11-15-current-r7d-qualification/). Serving remains stopped. |
 
 ## Current-r7b qualification, 2026-11-14
 
@@ -41,3 +42,9 @@ Actual-launcher acceptance passed on 2026-11-14 09:26–09:37 UTC. It checked bo
 The [confirmation notes](../bench/results/2026-11-15-current-r7c-qualification/NOTES.md) retain the same-chain r7b OFF controls, the single r7c ON boot and the separate acceptance receipt. The [summary](../bench/results/2026-11-15-current-r7c-qualification/summary.json) is the figure source. The r7b OFF rates on 2026-11-15 differ from its earlier qualification; only the same-chain OFF/ON/OFF comparison supports attribution to the bounded indexer. The two-day promotion chart is a record of dated qualifications, not a controlled causal comparison.
 
 The former PCIe Gen2 x4 README statement belongs to older hardware state. The current definition records four x16 links at 5 GT/s and 175 W per card. Correctable PCIe errors and replays remain a hardware caveat. Earlier x8 or x4 results retain their original labels. No r7c memory-category summary is available for a memory chart.
+
+## Current-r7d confirmation, 2026-11-15
+
+The [confirmation notes](../bench/results/2026-11-15-current-r7d-qualification/NOTES.md) and [summary](../bench/results/2026-11-15-current-r7d-qualification/summary.json) record the one-ON run `20261115T214428Z-3587331-moe-stack-confirm` on 2026-11-15 21:44–22:02 UTC, against the stored same-day r7c reference. Loaded suite v2, frozen chat, 400 output tokens per request, temperature zero, seed 15, EOS suppression, TP4 and four Gen2 x16 cards at 175 W each: c1 168.2 and c4 369.9 tok/s ordered, c8 457.5 tok/s burst, with ordered c8 419.7 tok/s. The final plugin keeps STACK inside eligible target capture forwards and restores incumbent eager entrypoints. BITWISE_PASS and actual-launcher acceptance are retained records, not tests repeated by this mirror.
+
+Absolute r7d prefill is omitted because host drift invalidates a clean same-config comparison. The 2026-11-16 same-hour prefill control reported +2 to +6 % against r7c; the linked notes identify the 2K/8K c1/c4/c8 workload, sampler and two diagnostic runs. R7c absolute prefill and its dated [figure](img/prefill.svg) remain historical. The history chart includes all three dated qualification summaries; protocols and cross-boot differences limit causal interpretation.

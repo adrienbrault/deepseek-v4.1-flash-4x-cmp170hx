@@ -1,0 +1,78 @@
+{
+  "date_utc": "2026-11-15",
+  "configuration": "current-r7d",
+  "source": "rounds/moe-stack-confirm-r1/out/20261115T214428Z-3587331-moe-stack-confirm",
+  "interval_utc": [
+    "21:44",
+    "22:02"
+  ],
+  "suite": "loaded suite v2; ordered c1/c4, burst c8",
+  "promoted_utc": "2026-11-16T00:00:00Z",
+  "decode": {
+    "workload": "decode-prompts-v2, frozen chat, mostly reasoning prose before code",
+    "temperature": 0,
+    "seed": 15,
+    "ignore_eos": true,
+    "output_tokens_per_request": 400,
+    "per_request_rate": "(completion_tokens - 1) / (stream_end - first_content_event)",
+    "metric": "sum of measured per-request decode rates; boot mean of scored batches",
+    "cells": [
+      {
+        "concurrency": 1,
+        "mean_tok_s": 168.2,
+        "step_ms": 18.67,
+        "protocol": "ordered",
+        "reference_tok_s": 158.6
+      },
+      {
+        "concurrency": 4,
+        "mean_tok_s": 369.9,
+        "step_ms": 32.18,
+        "protocol": "ordered",
+        "reference_tok_s": 360.5
+      },
+      {
+        "concurrency": 8,
+        "mean_tok_s": 457.5,
+        "step_ms": 44.7,
+        "protocol": "burst",
+        "reference_tok_s": 431.5
+      }
+    ],
+    "ordered_c8": {
+      "tok_s": 419.7,
+      "reference_tok_s": 401.5,
+      "deciding": false
+    }
+  },
+  "prefill": {
+    "cells": [],
+    "status": "No clean same-config absolute prefill measurement; host drift requires a new full suite.",
+    "same_hour_comparison": {
+      "date": "2026-11-16",
+      "relative_percent": [
+        2,
+        6
+      ],
+      "reference": "same-hour current-r7c",
+      "source": "rounds/moe-stack-confirm-r1/RESULTS.md"
+    }
+  },
+  "acceptance": {
+    "date_utc": "2026-11-15",
+    "interval_utc": [
+      "23:43",
+      "23:56"
+    ],
+    "run": "20261115T234323Z-320896-actual-acceptance",
+    "result": "PASS",
+    "serving_after_teardown": false
+  },
+  "extraction": "Absolute new measurements transcribed only from NUMBERS.md current-r7d section. No sealed reports, raw traffic, new benchmark or inferred stream statistics. Capture-only eager repair retained from the confirmation source; acceptance adds no speed measurement.",
+  "fixed_work": {
+    "instrument": "agent_fixed_work.py",
+    "tok_s": 133.8,
+    "reference_tok_s": 134.2,
+    "metadata": "Full workload, output length and sampler metadata absent from the headline table; contextual only."
+  }
+}

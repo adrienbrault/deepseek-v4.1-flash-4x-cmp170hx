@@ -1,6 +1,6 @@
 # Reproducing the recorded serving definition
 
-The package mirrors the current-r7c configuration and the source files that can be exported from the local source tree. It does not yet contain every input needed for a standalone build. Source gaps below are blocking, not optional fallbacks. No generated-output directory, captured tensor, model weight, token record or private log was copied.
+The package mirrors the current-r7d configuration and the source files that can be exported from the local source tree. It does not yet contain every input needed for a standalone build. Source gaps below are blocking, not optional fallbacks. No generated-output directory, captured tensor, model weight, token record or private log was copied.
 
 ## Inputs
 
@@ -32,6 +32,11 @@ bash scripts/check-prose.sh
 | fixed640 native build | `rounds/coop-native-eaq-r1/out/payload` plus the eight cumulative patches | patch series is included; qualified baseline source payload, builder and native library are excluded |
 | model-view and adapter reproducibility | EAQ v1.1, official model and Heretic direction receipts | EAQ and direction revisions are known; full official revision, direction licence and derived adapter receipt remain unresolved |
 | bounded indexer plugin and k1b native library | exact bounded indexer top-k, read-only native mount | selector and plugin name recorded; plugin source, native build and authenticated mount mapping are not exported |
+| measured MoE STACK native bundle and seal | rows-family and K2 fixed16 source generators and selectors, capture-only plugin | source included; exact measured DSOs, authenticated seal digest and shared native baseline builder remain external; no replacement build is authenticated |
 | complete benchmark derivation | qualification `report.json`, per-boot prefill logs and acceptance seal | supplied summary is included; full qualification and acceptance files are absent locally |
 
 Resolve these from source-controlled inputs or a separately reviewed export before changing `reproduction_complete`. Then verify patch application on the stated bases, build offline on Linux, inspect the final image and full argv, compile native code for SM80, verify original source/hash receipts and run the serving lifecycle and both-name acceptance gates. Preserve `/health`, model-list and plugin activation checks, GPU-local worker affinity and confirmed container teardown. No run, promotion, network reachability or new performance validation has been performed for this export.
+
+## Current-r7d additive plan
+
+`config/served.json` preserves the r7c engine command and bounded indexer, appends `dsv41_moe_stack` to `VLLM_PLUGINS`, sets `DSV41_MOE_STACK=1` and parameterizes `DSV41_STACK_NATIVE_SEAL`. Its seven read-only `runtime_bind_inputs` entries mirror the final r7d transform: plugin and metadata under site-packages, the exact native bundle at `/opt/stack-native`, the binding at `/opt/stack-code/stack_runtime.py`, and three semantic selector helpers under `/stack-rounds`. `RECIPE_ROOT` denotes this checkout; `RUNTIME_ASSETS_ROOT` denotes externally supplied assets. The native seal is SHA256 of that bundle's `seal.json`, not an arbitrary generated replacement. The launcher prints these settings without resolving private host paths or starting a service. No authenticated seal value is fabricated, and execution remains blocked by the existing source gaps.
