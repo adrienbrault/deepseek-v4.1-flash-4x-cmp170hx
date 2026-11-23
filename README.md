@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash on four CMP 170HX cards
 
-![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-016c6e57.png)
+![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-d5fc7cc7.png)
 
 Serving configuration, image sources, launch settings and benchmarks for DeepSeek-V4.1-Flash-1017 on four NVIDIA CMP 170HX cards.
 
@@ -24,6 +24,10 @@ The 2026-11-24 UTC headline covers the base model name on `current-r18b`, on one
 
 - **Cached code.** With a 1K cached prefix and a 2K append, one agent decodes at 250.5 tok/s and eight reach a measured sum of 477.1 tok/s. The highest one-agent decode rate is 260.6 tok/s with a 64K prefix and an 8K append. [Cached-code results][headline]
 - **Eight agents at 64K.** With an 8K append per agent, decode runs at 57.0 tok/s per stream and 456.3 tok/s summed. The median first token arrives in 14.00 s. [Cached-code results][headline]
+
+![Cold prefill rate and time to first token from 2K to 240K prompt tokens](docs/img/prefill-curve.svg)
+
+- **Cold prefill.** A fresh prompt sent alone prefills at 3,894 tok/s at 8K tokens, 3,738 at 60K and 3,226 at 240K, where the first token arrives after 74.4 s. At 2K the first token arrives after 0.64 s (3,159 tok/s). Measured 2026-11-23 UTC on the served boot, median of three requests per length, one output token, temperature zero, no cache hits. [Prefill results](bench/results/2026-11-23-current-r18b-prefill/NOTES.md)
 
 ## Quick start
 
@@ -103,7 +107,7 @@ The two Engram lookup tables occupy about 203 GB and their rows are read from NV
 
 ## Other configurations
 
-The [serving history](docs/HISTORY.md) records promotion decisions and links to the previous benchmark sets. Cold prefill changed with the scheduler, so the table below is a historical reference.
+The [serving history](docs/HISTORY.md) records promotion decisions and links to the previous benchmark sets. The table below is the earlier r7e cold-prefill reference at 1, 4 and 8 streams; the r18b curve above is measured one request at a time.
 
 | UTC date and source | Configuration and workload | Input tok/s at 1 / 4 / 8 streams |
 | --- | --- | --- |
