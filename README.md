@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash on four CMP 170HX cards
 
-![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-fb0f268e.png)
+![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-016c6e57.png)
 
 Serving configuration, image sources, launch settings and benchmarks for DeepSeek-V4.1-Flash-1017 on four NVIDIA CMP 170HX cards.
 
