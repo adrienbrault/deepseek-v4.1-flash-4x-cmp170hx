@@ -1,0 +1,633 @@
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -27,6 +27,7 @@
+ 
+ import numpy as np
+ import torch
++from vllm.utils import dsv41_row_mask as _dsv41_row_mask
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+@@ -293,6 +294,8 @@
+             and self.speculative_config.speculator_config.prefer_dense_token_history
+         )
+ 
++        _dsv41_row_mask.init_worker(self)
++
+         # General request states.
+         self.req_states = RequestState(
+             max_num_reqs=self.max_num_reqs,
+@@ -1197,6 +1200,7 @@
+                         # Release the profiling runs' activations, or the
+                         # allocator cache is counted as graph memory below.
+                         torch.accelerator.empty_cache()
++                    _dsv41_row_mask.check_off_above_cap(self, profile_only)
+                     self.kv_connector.reset_capture_state()
+ 
+             # Warmup activations stay cached on the capture streams, which
+@@ -1300,6 +1304,7 @@
+                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+             )
+             req_index = self.req_states.req_id_to_index[req_id]
++            _dsv41_row_mask.reset_slot(req_index)
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.add_request(req_index)
+             if self.speculator is not None:
+@@ -2149,6 +2154,8 @@
+         )
+         self.step_timing.forward_start()
+ 
++        _dsv41_row_mask.begin_target(input_batch, dummy_run)
++
+         # Run model.
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # Use explicit cudagraph replay for FULL mode.
+@@ -2440,6 +2447,7 @@
+                 self.pcp_manager.sync_drafts(
+                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
+                 )
++            _dsv41_row_mask.after_propose(input_batch, num_spec_tokens)
+             if num_spec_tokens < self.num_speculative_steps:
+                 draft_tokens[:, num_spec_tokens:] = -1
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -30,6 +30,7 @@
+ from typing import Any
+ 
+ import torch
++from vllm.utils import dsv41_row_mask as _dsv41_row_mask
+ 
+ import vllm.envs as envs
+ from vllm.config import VllmConfig
+@@ -217,6 +218,7 @@
+                 dtype=self.draft_logits.values.dtype,
+                 device=self.device,
+             )
++        _dsv41_row_mask.configure_drafter(self, model)
+         return model
+ 
+     def supports_batch_sharded_draft_logits(self) -> bool:
+@@ -241,6 +243,8 @@
+     ) -> torch.Tensor:
+         """Sample draft ids from the logits. If `bias` is provided, the Gumbel
+         kernel adds it."""
++        if _dsv41_row_mask.features_enabled(logits.shape[0]):
++            _dsv41_row_mask.record_top1(self, logits, step)
+         self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
+         if self.draft_logits is None:
+             draft_ids = (
+@@ -361,12 +365,15 @@
+ 
+         """
+         markov_embeds = []
++        use_confidence = self.use_confidence_head and _dsv41_row_mask.confidence_enabled(
++            out_tokens.shape[0]
++        )
+         hidden_by_step = hidden.view(*out_tokens.shape, -1)
+         state: torch.Tensor | None = None
+         for i in range(self.num_speculative_steps):
+             # Sequential stage: Markov bias from the previously sampled token.
+             markov_embed, state = self._markov_step(prev, hidden_by_step[:, i], state)
+-            if self.use_confidence_head:
++            if use_confidence:
+                 markov_embeds.append(markov_embed)
+             bias = self.model.markov_bias(markov_embed)
+             if self.distributed_draft:
+@@ -422,7 +429,7 @@
+             prev = draft_sampled_i
+ 
+         confidence = None
+-        if self.use_confidence_head:
++        if use_confidence:
+             confidence = self.model.compute_confidence(
+                 hidden, torch.stack(markov_embeds, dim=1).flatten(0, 1)
+             ).view(out_tokens.shape)
+@@ -525,13 +532,16 @@
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         confidence_markov_embeds = []
++        use_confidence = self.use_confidence_head and _dsv41_row_mask.confidence_enabled(
++            num_reqs
++        )
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+         hidden_by_step = sample_hidden.view(num_reqs, n_spec, -1)
+         state: torch.Tensor | None = None
+ 
+         for i in range(n_spec):
+             markov_embed, state = self._markov_step(prev, hidden_by_step[:, i], state)
+-            if self.use_confidence_head:
++            if use_confidence:
+                 confidence_markov_embeds.append(markov_embed)
+             logits_i = self.model.apply_markov_bias_gathered(
+                 markov_embed,
+@@ -545,7 +555,7 @@
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
+-        if self.use_confidence_head:
++        if use_confidence:
+             confidence = self.model.compute_confidence(
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+@@ -577,3 +587,5 @@
+             self._sample_sequential_sharded(num_reqs, head_hidden)
+         else:
+             self._sample_sequential(num_reqs, head_hidden)
++        if _dsv41_row_mask.draft_features(num_reqs):
++            _dsv41_row_mask.publish(self, num_reqs)
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -5,6 +5,7 @@
+ 
+ import numpy as np
+ import torch
++from vllm.utils import dsv41_row_mask as _dsv41_row_mask
+ 
+ from vllm.config import SpeculativeConfig
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES
+@@ -269,6 +270,7 @@
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
+         seq_lens_upper_bound_np: np.ndarray,
++        verify_draft_sampled: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+@@ -283,7 +285,7 @@
+         sampled, num_sampled = rejection_sample(
+             processed_logits,
+             draft_logits,
+-            draft_sampled,
++            verify_draft_sampled,
+             cu_num_logits,
+             pos,
+             idx_mapping,
+@@ -322,6 +324,7 @@
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         logprobs_dims: tuple[int, int] | None,
++        verify_draft_sampled: torch.Tensor,
+     ) -> tuple[
+         torch.Tensor,
+         torch.Tensor,
+@@ -371,6 +374,7 @@
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
+                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
++                verify_draft_sampled[lo:hi],
+             )
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+@@ -447,6 +451,13 @@
+             self.sampler.req_states.prefill_len.gpu,
+         )
+ 
++        # Cap verification using a separate copy of the draft IDs. Sampling
++        # processors, watermarking and trace replay still see the original IDs.
++        invalid_drafts = _dsv41_row_mask.cap_drafts(input_batch.logits_indices, None)
++        verify_draft_sampled = draft_sampled
++        if invalid_drafts is not None:
++            verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)
++
+         logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
+         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+         (
+@@ -462,6 +473,7 @@
+             pos,
+             chunk_logit_limit,
+             logprobs_dims,
++            verify_draft_sampled,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -8,6 +8,7 @@
+ 
+ import regex as re
+ import torch
++from vllm.utils import dsv41_row_mask as _dsv41_row_mask
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+@@ -210,6 +211,10 @@
+             and not self._dsv41_prefill_chunk
+             and not self._dsv41_overlap,
+             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
++        )
++        # Only target MoEs; DSpark reuses this class at layer >= num_hidden_layers.
++        _dsv41_row_mask.mark_target(
++            self.experts, extract_layer_index(prefix) < config.num_hidden_layers
+         )
+         if self._dsv41_prefill_chunk:
+             from vllm.utils.dsv41_prefill_overlap import register_moe
+diff --git a/vllm_exl3/exl3.py b/vllm_exl3/exl3.py
+--- a/vllm_exl3/exl3.py
++++ b/vllm_exl3/exl3.py
+@@ -2927,6 +2927,10 @@
+     fused: bool | None = None,
+ ) -> torch.Tensor:
+     """Shipped routed-expert apply. `fused=None` honors EXL3_FUSED_MOE."""
++    if os.environ.get("VLLM_DSV41_MOE_ROW_MASK"):
++        from vllm.utils import dsv41_row_mask as _dsv41_row_mask
++        if _dsv41_row_mask.target_enabled(layer):
++            topk_ids, topk_weights = _dsv41_row_mask.mask_routes(topk_ids, topk_weights, layer)
+     # Routing-frequency counter (VLLM_EXL3_ROUTE_STATS=1).  Three tiny kernels
+     # on fixed-address buffers, no host sync, no allocation -- safe to capture
+     # in a CUDA graph and correct across replays.  No-op otherwise.
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -10,6 +10,7 @@
+ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+ 
+ import torch
++from vllm.utils import dsv41_row_mask as _dsv41_row_mask
+ import torch.nn as nn
+ from tqdm import tqdm
+ 
+@@ -128,7 +129,8 @@
+     # caller that does not track max_query_len must not match one that does
+     # A graph captured for N microbatches can only serve a batch split N ways.
+     return (
+-        (
++        _dsv41_row_mask.graph_compatible(desc, num_reqs)
++        and (
+             desc.uniform_token_count is None
+             or desc.uniform_token_count == uniform_token_count
+         )
+@@ -520,6 +522,7 @@
+                 for desc in descs:
+                     # Prepare inputs and get forward function
+                     forward_fn = create_forward_fn(desc, warmup=True)
++                    forward_fn = _dsv41_row_mask.capture_forward(self, desc, forward_fn)
+ 
+                     # Warmup
+                     forward_fn(CUDAGraphMode.NONE)
+@@ -538,6 +541,9 @@
+                     else:
+                         # Capture with fresh attention state.
+                         forward_fn = create_forward_fn(desc, warmup=False)
++                        forward_fn = _dsv41_row_mask.capture_forward(
++                            self, desc, forward_fn
++                        )
+                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                             forward_fn(CUDAGraphMode.PIECEWISE)
+                             continue
+diff --git a/vllm/v1/core/sched/dsv41_adaptive_verify.py b/vllm/v1/core/sched/dsv41_adaptive_verify.py
+--- a/vllm/v1/core/sched/dsv41_adaptive_verify.py
++++ b/vllm/v1/core/sched/dsv41_adaptive_verify.py
+@@ -271,11 +271,14 @@
+     off, and None for a manager whose query length is not a verify step's
+     (``decode_query_len <= num_spec_tokens``: the DSpark/DFlash drafter's
+     query-block manager drafts its full block whatever the verify width)."""
++    sampled = decode_query_len - num_spec_tokens
++    if sampled < 1:
++        return None
++    if os.environ.get("DSV41_DEPTH_HOST", "0") == "1":
++        from dsv41_depth.host_rule import configured
++        return [k + sampled for k in configured().k_choices]
+     path = policy_path()
+     if not path:
+-        return None
+-    sampled = decode_query_len - num_spec_tokens
+-    if sampled < 1:
+         return None
+     raw = _policy_json(path)
+     choices = raw.get("k_choices") if isinstance(raw, dict) else None
+diff --git a/vllm/utils/dsv41_row_mask.py b/vllm/utils/dsv41_row_mask.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/utils/dsv41_row_mask.py
+@@ -0,0 +1,291 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Calibrated row-mask bridge for our K5 engine; see NOTICE and RESULTS.md."""
++import os
++from contextlib import contextmanager
++import torch
++
++SWITCH = "VLLM_DSV41_MOE_ROW_MASK"
++_STATE = None
++_TARGET_ENABLED = True
++_CAPTURE_KEY = None
++_GRAPH_AUDIT = {}
++
++
++def features_enabled(num_reqs):
++    """Scalar shape decision; capture uses the descriptor's padded requests."""
++    state = _STATE
++    return state is not None and (not state.row_max_batch or num_reqs <= state.row_max_batch)
++
++
++def confidence_enabled(num_reqs):
++    # Preserve native confidence use when this entire experimental policy is off.
++    return _STATE is None or features_enabled(num_reqs)
++
++
++def graph_compatible(desc, num_reqs):
++    """Never pad a live masked batch into an unmasked capture, or vice versa."""
++    if _STATE is None or not _STATE.row_max_batch:
++        return True
++    return desc.num_reqs is not None and features_enabled(desc.num_reqs) == features_enabled(num_reqs)
++
++
++def target_enabled(layer):
++    # This Python decision executes at capture time, never at FULL replay.
++    return _TARGET_ENABLED and getattr(layer, "_dsv41_mask_target", False)
++
++
++@contextmanager
++def capture_scope(manager, desc):
++    global _TARGET_ENABLED, _CAPTURE_KEY
++    previous = _TARGET_ENABLED, _CAPTURE_KEY
++    if _STATE is not None and _STATE.row_max_batch:
++        if desc.num_reqs is None or desc.cg_mode.name != "FULL" or desc.num_ubatches != 1:
++            raise ValueError("off-above-cap requires FULL request-keyed graphs without ubatching")
++        _TARGET_ENABLED = features_enabled(desc.num_reqs)
++        _CAPTURE_KEY = (id(manager), desc)
++        _GRAPH_AUDIT[_CAPTURE_KEY] = {"routes": 0, "draft": None}
++    try:
++        yield
++    finally:
++        _TARGET_ENABLED, _CAPTURE_KEY = previous
++
++
++def capture_forward(manager, desc, forward):
++    """Scope both warmup and real capture to an immutable graph descriptor."""
++    def run(mode):
++        with capture_scope(manager, desc):
++            return forward(mode)
++    return run
++
++
++def draft_features(num_reqs):
++    enabled = features_enabled(num_reqs)
++    if _CAPTURE_KEY is not None:
++        desc = _CAPTURE_KEY[1]
++        if desc.num_reqs != num_reqs:
++            raise ValueError("drafter request count differs from capture descriptor")
++        _GRAPH_AUDIT[_CAPTURE_KEY]["draft"] = enabled
++    return enabled
++
++
++def check_off_above_cap(runner, profile_only=False):
++    """Fail before readiness if target/draft captures do not prove exclusion.
++
++    Inspect actual captures, not just planned shapes. Profiling intentionally
++    captures only a sample and must not emit a qualification banner.
++    """
++    state = _STATE
++    if state is None or not state.row_max_batch or profile_only:
++        return
++    from vllm.config.compilation import CUDAGraphMode
++    target = runner.cudagraph_manager
++    draft = runner.speculator
++    managers = [value for value in vars(draft).values()
++                if hasattr(value, "graphs") and hasattr(value, "dispatch")]
++    if not target.graphs or not managers:
++        raise ValueError("off-above-cap needs actual target and draft FULL captures")
++    for manager, role in [(target, "target")] + [(m, "draft") for m in managers]:
++        if not manager.graphs:
++            raise ValueError("off-above-cap found an uncaptured draft manager")
++        for desc in manager.graphs:
++            record = _GRAPH_AUDIT.get((id(manager), desc))
++            if record is None:
++                raise ValueError("off-above-cap capture audit missing")
++            admitted = features_enabled(desc.num_reqs)
++            if role == "target" and bool(record["routes"]) != admitted:
++                raise ValueError("off-above-cap target routes differ from descriptor")
++            if role == "draft" and record["draft"] != admitted:
++                raise ValueError("off-above-cap draft features differ from descriptor")
++        widths = (2, 3, 4, 6) if role == "target" else (draft.num_query_per_req,)
++        for n in range(1, min(8, state.max_num_reqs) + 1):
++            for width in widths:
++                # DFlash variants use uniform or varlen dispatch. Check both;
++                # every selected FULL graph must have the same cap decision.
++                found = False
++                for uniform in (width, None):
++                    desc = manager.dispatch(
++                        n, n * width, uniform, 0, max_query_len=width
++                    )
++                    if desc.cg_mode == CUDAGraphMode.FULL:
++                        found = True
++                        if desc not in manager.graphs or not graph_compatible(desc, n):
++                            raise ValueError("off-above-cap dispatch selects wrong graph")
++                if not found:
++                    raise ValueError("off-above-cap graph coverage missing")
++    from vllm.logger import init_logger
++    from vllm.distributed import get_tp_group
++    init_logger("vllm.utils.dsv41_row_mask").info(
++        "DSV41 off above cap verified: row_max_batch=%d rank=%d target=excluded draft=excluded reset=excluded",
++        state.row_max_batch, get_tp_group().rank_in_group)
++
++
++def get_state():
++    return _STATE
++
++
++def mark_target(moe_runner, is_target):
++    if _STATE is None:
++        return
++    if getattr(getattr(moe_runner, "moe_config", None), "is_sequence_parallel", False):
++        raise ValueError("row-mask does not support sequence-parallel token rows")
++    # FusedMoEFactory returns a runner; quant_method.apply receives its
++    # RoutedExperts child, not that runner. Mark exactly the apply owner.
++    routed = getattr(moe_runner, "routed_experts", None)
++    if routed is None:
++        raise ValueError("row-mask requires the RoutedExperts MoE runner contract")
++    routed._dsv41_mask_target = is_target
++
++
++def init_worker(runner):
++    global _STATE
++    path = os.environ.get(SWITCH, "")
++    if not path:
++        return
++    if _STATE is not None:
++        raise ValueError("row-mask worker initialized twice")
++    c = runner.vllm_config
++    p, spec = c.parallel_config, c.speculative_config
++    if (spec is None or not spec.use_dspark() or spec.draft_sample_method != "greedy"
++            or getattr(spec, "rejection_sample_method", "standard") != "standard"
++            or p.tensor_parallel_size != 4 or p.pipeline_parallel_size != 1
++            or p.data_parallel_size != 1 or p.enable_expert_parallel or p.use_ubatching
++            or getattr(p, "decode_context_parallel_size", 1) != 1
++            or getattr(p, "prefill_context_parallel_size", 1) != 1
++            or getattr(p, "enable_batch_sharded_sampling", False)
++            or c.quant_config is None or c.quant_config.get_name() != "exl3"
++            or c.model_config.hf_config.hidden_size != 5120):
++        raise ValueError("row-mask requires DSpark greedy drafts/standard rejection, EXL3 TP4/PP1/DP1, no EP/CP/ubatching/batch-sharded sampling")
++    if os.environ.get("VLLM_DSV41_PREFILL_OVERLAP", "0") != "0" or os.environ.get("DSV41_PREFILL_OVERLAP", "0") != "0":
++        raise ValueError("row-mask prefill overlap is not qualified")
++    if os.environ.get("VLLM_BATCH_INVARIANT", "0") != "0":
++        raise ValueError("row-mask batch-invariant mode is not qualified")
++    if runner.num_speculative_steps != 5:
++        raise ValueError("calibrated port is qualified only for our K5 drafter")
++    from dsv41_depth import policy as calibrated
++
++    _STATE = calibrated.init_row_mask_state(
++        max_num_reqs=runner.max_num_reqs, max_num_tokens=runner.max_num_tokens,
++        max_draft=runner.num_speculative_steps, device=runner.device,
++        verify_drafts=[0] + [runner.num_speculative_steps] * runner.max_num_reqs)
++    from vllm.logger import init_logger
++    init_logger(__name__).info("DSV41 calibrated row mask on: K5 confidence+top1 host=%s row_max_batch=%d",
++                               os.environ.get("DSV41_DEPTH_HOST", "0"), _STATE.row_max_batch)
++
++
++def reset_slot(slot):
++    if _STATE is not None:
++        # A previous over-cap draft invalidated all features. Defer the device
++        # writes to re-entry, keeping request admission above the cap free too.
++        if _STATE.row_max_batch:
++            _STATE.pending_slots.add(slot)
++            return
++        _STATE.conf_by_slot[slot].fill_(1.)
++        _STATE.stats_by_slot[slot].zero_()
++
++
++def configure_drafter(speculator, model):
++    if _STATE is None:
++        return
++    if speculator._draft_topk is not None or speculator.distributed_draft:
++        raise ValueError("calibrated features require full-vocabulary greedy DSpark logits")
++    if speculator.enable_adaptive_verification:
++        raise ValueError("device adaptive verification is not supported; host AV is separate")
++    if model.model.confidence_head is None:
++        raise ValueError("checkpoint confidence head is required")
++    # The custom sampler can bypass _sample_logits and leave top1 unwritten.
++    if (
++        getattr(model, "sample_sequential", None) is not None
++        or getattr(model, "has_recurrent_markov_head", False)
++        or hasattr(model, "apply_output_logit_transform")
++        or model.draft_id_to_target_id is not None
++    ):
++        raise ValueError(
++            "calibrated features require full-vocabulary, unfused Markov sampling"
++        )
++    speculator.use_confidence_head = True
++    speculator._dsv41_row_stats = torch.zeros(
++        speculator.max_num_reqs, 2, _STATE.max_draft,
++        dtype=torch.float32, device=speculator.device)
++
++
++def record_top1(speculator, logits, step):
++    if not features_enabled(logits.shape[0]):
++        return
++    # Exactly the upstream statistics: full logits, Markov bias included,
++    # before temperature. Entropy is carried even though its shipped weight is 0.
++    x = logits.float()
++    n = x.shape[0]
++    out = speculator._dsv41_row_stats
++    out[:n, 0, step] = torch.exp(x.amax(dim=-1) - torch.logsumexp(x, dim=-1))
++    probs = torch.softmax(x, dim=-1)
++    out[:n, 1, step] = -torch.special.xlogy(probs, probs).sum(dim=-1)
++
++
++def publish(speculator, num_reqs):
++    state = _STATE
++    if not features_enabled(num_reqs):
++        return
++    conf = speculator.draft_token_confidence_probs
++    stats = speculator._dsv41_row_stats
++    width = speculator.num_speculative_steps
++    if conf.is_cuda:
++        from dsv41_depth.confidence import publish_confidences
++        publish_confidences(conf, speculator.sample_idx_mapping, num_reqs, width,
++                            state.conf_by_slot, stats, state.stats_by_slot)
++    else:
++        for r in range(num_reqs):
++            slot = int(speculator.sample_idx_mapping[r * width])
++            if 0 <= slot < state.max_num_reqs:
++                state.conf_by_slot[slot].zero_()
++                state.stats_by_slot[slot].zero_()
++                state.conf_by_slot[slot, :width] = conf[r, :width]
++                state.stats_by_slot[slot, :, :width] = stats[r, :, :width]
++
++
++def begin_target(batch, dummy_run):
++    global _TARGET_ENABLED
++    if _STATE is None:
++        return
++    # Eager path only. FULL captures set this independently from their desc.
++    _TARGET_ENABLED = features_enabled(batch.num_reqs)
++    from dsv41_depth.decision import begin_step
++    begin_step(_STATE, batch, dummy_run)
++
++
++def mask_routes(ids, weights, layer):
++    state = _STATE
++    if state is None or not target_enabled(layer):
++        return ids, weights
++    if _CAPTURE_KEY is not None:
++        _GRAPH_AUDIT[_CAPTURE_KEY]["routes"] += 1
++    rows = ids.shape[0]
++    if rows > state.max_num_tokens:
++        raise ValueError("row-mask buffer too small")
++    # Do not branch on state.active here: captured graphs must always read
++    # the fixed row_live address, even when captured with every row live.
++    # Capture-time selection has already excluded over-cap descriptors.
++    if ids.is_cuda:
++        from vllm.utils.dsv41_row_mask_kernels import mask_routes_cuda
++        return mask_routes_cuda(state, ids, weights)
++    dead = state.row_live[:rows, None] == 0
++    return ids.masked_fill(dead, -1), weights.masked_fill(dead, 0)
++
++
++def cap_drafts(logits_indices, invalid_drafts):
++    if _STATE is None or not _STATE.active:
++        return invalid_drafts
++    masked = _STATE.row_live.index_select(0, logits_indices).eq(0)
++    return masked if invalid_drafts is None else masked.logical_or_(invalid_drafts)
++
++
++def after_propose(batch, num_drafts):
++    # A zero-draft proposal does not publish a new row. Clear its slots so a
++    # later verify cannot read a feature vector from an older round.
++    if _STATE is not None and not features_enabled(batch.num_reqs):
++        _STATE.features_stale = True
++        return
++    if _STATE is not None and num_drafts == 0:
++        slots = batch.idx_mapping[:batch.num_reqs].long()
++        _STATE.conf_by_slot.index_fill_(0, slots, 1.)
++        _STATE.stats_by_slot.index_fill_(0, slots, 0.)
+diff --git a/vllm/utils/dsv41_row_mask_kernels.py b/vllm/utils/dsv41_row_mask_kernels.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/utils/dsv41_row_mask_kernels.py
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Device kernels adapted from Morrowmake's DSpark row-mask port; see NOTICE."""
++import torch
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _routes(IDS, W, LIVE, OI, OW, ROWS: tl.constexpr, TOP: tl.constexpr,
++            IS: tl.constexpr, WS: tl.constexpr, IC: tl.constexpr,
++            WC: tl.constexpr, B: tl.constexpr):
++    flat = tl.program_id(0) * B + tl.arange(0, B)
++    r, c = flat // TOP, flat % TOP
++    ok = r < ROWS
++    live = tl.load(LIVE + r, mask=ok, other=1) != 0
++    ids = tl.load(IDS + r * IS + c * IC, mask=ok, other=-1)
++    w = tl.load(W + r * WS + c * WC, mask=ok, other=0.)
++    tl.store(OI + flat, tl.where(live, ids, -1), mask=ok)
++    tl.store(OW + flat, tl.where(live, w, 0.), mask=ok)
++
++
++def mask_routes_cuda(state, ids, weights):
++    oi = torch.empty(ids.shape, dtype=ids.dtype, device=ids.device)
++    ow = torch.empty(weights.shape, dtype=weights.dtype, device=weights.device)
++    n, k = ids.shape
++    _routes[(triton.cdiv(n * k, 128),)](
++        ids, weights, state.row_live, oi, ow, n, k,
++        ids.stride(0), weights.stride(0), ids.stride(1), weights.stride(1), 128,
++        num_warps=4)
++    return oi, ow

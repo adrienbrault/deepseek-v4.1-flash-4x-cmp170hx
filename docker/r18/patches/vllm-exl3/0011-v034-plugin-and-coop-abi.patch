@@ -1,0 +1,54 @@
+Subject: Use the v0.34 custom op import and verify the rebuilt coop ABI
+
+Origin: opera/dsv41/r18
+License: AGPL-3.0-only
+
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -4969,10 +4969,7 @@
+     if _EXL3_OPS_READY:
+         return True
+     try:
+-        try:
+-            from vllm.utils.torch_utils import direct_register_custom_op
+-        except ImportError:
+-            from vllm.utils import direct_register_custom_op
++        from vllm.utils.torch_utils import direct_register_custom_op
+     except ImportError:
+         return False
+     try:
+diff --git a/src/vllm_exl3/coop_kernel.py b/src/vllm_exl3/coop_kernel.py
+--- a/src/vllm_exl3/coop_kernel.py
++++ b/src/vllm_exl3/coop_kernel.py
+@@ -4,10 +4,10 @@
+ import importlib.util
+ import json
+ import os
++import sysconfig
+ from pathlib import Path
+ 
+ ASSETS=Path('/opt/dsv41-coop-kernel')
+-STOCK_SHA='cc7d6d1b53dd48fc6714147d913b4a8a06cb071ce50aac525a3a79769e205fcc'
+ _NATIVE=None
+ 
+ def eligible(args):
+@@ -30,11 +30,14 @@
+     from vllm.logger import init_logger
+     if torch.cuda.is_current_stream_capturing():raise RuntimeError('Opera coop must initialize during warmup before graph capture')
+     if torch.cuda.get_device_capability()!=(8,0):raise RuntimeError('Opera coop requires gated SM80')
++    receipt=json.loads((ASSETS/'build-manifest.json').read_text())
++    library=ASSETS/'opera_coop_ext.so'
+     stock=importlib.util.find_spec('exllamav3_ext')
+-    if stock is None or hashlib.sha256(Path(stock.origin).read_bytes()).hexdigest()!=STOCK_SHA:
+-        raise RuntimeError('Opera coop stock native extension differs from qualified base')
+-    receipt=json.loads((ASSETS/'build-manifest.json').read_text());library=ASSETS/'opera_coop_ext.so'
+-    if str(torch.__version__)!=receipt['torch_version'] or receipt['stock_native_sha256']!=STOCK_SHA:
++    if stock is None or hashlib.sha256(Path(stock.origin).read_bytes()).hexdigest()!=receipt['stock_native_sha256']:
++        raise RuntimeError('Opera coop stock native extension differs from this image build')
++    abi = (str(torch.__version__), torch.version.cuda, sysconfig.get_config_var('SOABI'),
++           bool(torch._C._GLIBCXX_USE_CXX11_ABI))
++    if abi != tuple(receipt[key] for key in ('torch_version', 'cuda_version', 'python_soabi', 'cxx11_abi')):
+         raise RuntimeError('Opera coop Torch/native ABI does not match build receipt')
+     if hashlib.sha256(library.read_bytes()).hexdigest()!=receipt['library_sha256']:
+         raise RuntimeError('Opera coop private binary fingerprint changed')

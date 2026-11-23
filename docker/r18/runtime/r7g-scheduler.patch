@@ -1,0 +1,164 @@
+--- image-scheduler.py
++++ current-r7g-scheduler.py
+@@ -84,6 +84,58 @@
+ logger = init_logger(__name__)
+ 
+ 
++# Fair accounting adapted from Morrowmake/vLLM scheduler.py and step.py.
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++class _FairStep:
++    """One allowance, shared across both scheduling loops, discarded after this step.
++
++    The donor supplies the contended total and even split. This port removes
++    bypass, snapshots actual charges, and makes M an admission bound as well.
++    Decode/speculation retains the parent's token and input-row accounting.
++    """
++    def __init__(self, scheduler):
++        self.charges = {}
++        self.limit = scheduler.fair_split
++        total = scheduler.max_num_scheduled_tokens
++        if any(not r.is_prefill_chunk for r in scheduler.running):
++            total = min(total, scheduler.fair_cap)
++        # Count before lookup: cache hits can conservatively reserve a share.
++        # Actual work is classified later, after cache lookup and SWA replay.
++        running = sum(r.is_prefill_chunk for r in scheduler.running)
++        slots = max(0, scheduler.max_num_active_reqs - len(scheduler.running)
++                    - scheduler.num_waiting_for_streaming_input)
++        waiting = len(scheduler.kv_holding_waiting)
++        if scheduler._pause_state == PauseState.UNPAUSED:
++            waiting += len(scheduler.waiting)
++        shares = min(self.limit, running + min(waiting, slots)) if self.limit else 1
++        # Init rejects a cap/split combination that cannot cross the MTP
++        # lookahead window; never enlarge the requested contended allowance.
++        self.left = total
++        self.share = total // max(1, shares)
++
++    def cap(self, request, computed, tokens):
++        if not (request.is_prefill_chunk if computed is None else computed < request.num_tokens - 1):
++            return tokens
++        # Even tiny final chunks consume a prompt share. There is no bypass.
++        if self.limit and len(self.charges) >= self.limit:
++            return 0
++        return min(tokens, self.share, self.left)
++
++    def charge(self, request, computed, tokens):
++        # Call only after successful KV allocation, before request state moves.
++        # None means the running-loop prefill flag; waiting uses actual work.
++        if request.is_prefill_chunk if computed is None else computed < request.num_tokens - 1:
++            self.charges[request.request_id] = tokens
++            self.left -= tokens
++            assert self.left >= 0
++
++    def refund(self, request_id):
++        # Never reclassify from a victim's possibly changed computed counter.
++        # pop makes an uncharged victim (or repeated refund) a precise no-op.
++        self.left += self.charges.pop(request_id, 0)
++
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -316,6 +368,7 @@
+         )
+         self.prefix_replay_tokens = replay_windows.pop() if replay_windows else 0
+         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
++        self._fair_init()
+         # The model runner skips drafting in steps where no scheduled request
+         # can use the drafts. Only drafters with their own forward pass reserve
+         # lookahead slots.
+@@ -353,6 +406,8 @@
+             self.dynamic_sd_lookup is not None,
+         )
+         # This step's verify width (num_spec_tokens unless dsv41_av chose less).
++        from dsv41_depth.scheduler import compose
++        self.dsv41_av = compose(self, self.dsv41_av)
+         self.dsv41_av_k = self.num_spec_tokens
+ 
+         self.num_hash_lookahead_tokens = vllm_config.num_hash_lookahead_tokens
+@@ -728,6 +783,19 @@
+         if 0 < remaining < self.num_prefill_lookahead:
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
++
++    def _fair_init(self):
++        import os
++        try:
++            self.fair_cap = int(os.environ.get("VLLM_DSV41_FAIR_PREFILL", "0"))
++            self.fair_split = int(os.environ.get("VLLM_DSV41_FAIR_PREFILL_SPLIT", "0"))
++            assert self.fair_cap >= 0 and self.fair_split >= 0
++            if self.fair_cap:
++                assert self.scheduler_config.enable_chunked_prefill
++                assert self.fair_cap <= self.max_num_scheduled_tokens
++                assert self.fair_cap // max(1, self.fair_split) > self.num_prefill_lookahead
++        except (ValueError, AssertionError):
++            raise ValueError("invalid fair prefill settings") from None
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
+@@ -752,6 +820,7 @@
+         spec = self.vllm_config.speculative_config
+         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+         input_budget = self.scheduler_config.max_num_batched_tokens
++        fair = _FairStep(self) if self.fair_cap else None
+         if self._pause_state == PauseState.PAUSED_ALL:
+             # Do not schedule any requests when paused.
+             token_budget = 0
+@@ -885,6 +954,9 @@
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
++
++            if fair is not None:
++                num_new_tokens = fair.cap(request, None, num_new_tokens)
+ 
+             # Make sure the input position does not exceed the max model len.
+             # This is necessary when using spec decoding.
+@@ -991,6 +1063,8 @@
+                             scheduled_running_reqs.remove(preempted_req)
+                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                             token_budget += restored
++                            if fair is not None:
++                                fair.refund(preempted_req_id)
+                             input_budget += restored + draft_slots
+                             req_to_new_blocks.pop(preempted_req_id)
+                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+@@ -1038,6 +1112,8 @@
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
++            if fair is not None:
++                fair.charge(request, None, num_new_tokens)
+             token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
+             req_index += 1
+@@ -1418,6 +1494,11 @@
+                         break
+ 
+                     num_new_tokens = min(num_new_tokens, request_token_budget)
++                    if fair is not None:
++                        num_new_tokens = fair.cap(request, num_computed_tokens, num_new_tokens)
++                        if num_new_tokens == 0:
++                            skip_request(request_queue)
++                            continue
+                     assert num_new_tokens > 0
+ 
+                     # Apply Mamba alignment before encoder caps.
+@@ -1655,6 +1736,8 @@
+                     request_id
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
++                if fair is not None:
++                    fair.charge(request, num_computed_tokens, num_new_tokens)
+                 token_budget -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+@@ -2333,6 +2416,8 @@
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        from dsv41_depth.scheduler import observed
++        observed(self.dsv41_av, scheduler_output, model_runner_output)
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

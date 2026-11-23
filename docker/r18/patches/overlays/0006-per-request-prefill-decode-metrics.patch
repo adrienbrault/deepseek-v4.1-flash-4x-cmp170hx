@@ -1,0 +1,120 @@
+diff --git a/vllm/entrypoints/generate/base/protocol.py b/vllm/entrypoints/generate/base/protocol.py
+--- a/vllm/entrypoints/generate/base/protocol.py
++++ b/vllm/entrypoints/generate/base/protocol.py
+@@ -123,10 +123,13 @@
+     time_to_first_token_ms: float | None = None
+     generation_time_ms: float | None = None
+     queue_time_ms: float | None = None
+     mean_itl_ms: float | None = None
+     tokens_per_second: float | None = None
++    prefill_tokens: int | None = None
++    prefill_tokens_per_second: float | None = None
++    decode_tokens_per_second: float | None = None
+     # Experimental, subject to change.
+     speculative_decoding: SpeculativeDecodingMetrics | None = None
+ 
+ 
+ class RequestResponseMetadata(BaseModel):
+diff --git a/vllm/entrypoints/generate/base/serving.py b/vllm/entrypoints/generate/base/serving.py
+--- a/vllm/entrypoints/generate/base/serving.py
++++ b/vllm/entrypoints/generate/base/serving.py
+@@ -44,12 +44,17 @@
+     ``generation_time_ms`` is the decode interval only (first output token to
+     last output token); it excludes both queue wait and prefill/TTFT.
+     ``tokens_per_second`` is overall output throughput: all generated tokens
+     over the inference interval (scheduling to last output token), so it counts
+     the prefill/TTFT phase and is not simply the reciprocal of ``mean_itl_ms``.
+-    Each field is left ``None`` when the timestamps it depends on are
+-    unavailable.
++
++    ``prefill_tokens_per_second`` divides uncached prompt tokens by the
++    scheduling-to-first-token interval used by ``time_to_first_token_ms``.
++    This includes time spent sharing or interleaving chunked prefill with
++    other requests. ``decode_tokens_per_second`` divides the number of
++    tokens after the first by the first-to-last-token interval.
++    Fields are left ``None`` when their required inputs are unavailable.
+     """
+     if metrics is None:
+         return PerRequestMetrics()
+ 
+     queued_ts = metrics.queued_ts
+@@ -60,23 +65,31 @@
+     time_to_first_token_ms: float | None = None
+     generation_time_ms: float | None = None
+     queue_time_ms: float | None = None
+     mean_itl_ms: float | None = None
+     tokens_per_second: float | None = None
++    prefill_tokens = metrics.num_prefill_tokens
++    prefill_tokens_per_second: float | None = None
++    decode_tokens_per_second: float | None = None
+ 
+     if scheduled_ts > 0 and first_token_ts > 0:
+-        time_to_first_token_ms = (first_token_ts - scheduled_ts) * 1000
++        prefill_time = first_token_ts - scheduled_ts
++        time_to_first_token_ms = prefill_time * 1000
++        if prefill_tokens is not None and prefill_time > 0:
++            prefill_tokens_per_second = prefill_tokens / prefill_time
+ 
+     if first_token_ts > 0 and last_token_ts > 0:
+         generation_time_ms = (last_token_ts - first_token_ts) * 1000
+ 
+     if queued_ts > 0 and scheduled_ts > 0:
+         queue_time_ms = (scheduled_ts - queued_ts) * 1000
+ 
+     if first_token_ts > 0 and last_token_ts > 0 and num_generation_tokens > 1:
+         decode_time = last_token_ts - first_token_ts
+         mean_itl_ms = decode_time / (num_generation_tokens - 1) * 1000
++        if decode_time > 0:
++            decode_tokens_per_second = (num_generation_tokens - 1) / decode_time
+ 
+     if scheduled_ts > 0 and last_token_ts > 0:
+         inference_time_ms = (last_token_ts - scheduled_ts) * 1000
+         if inference_time_ms > 0:
+             tokens_per_second = num_generation_tokens / inference_time_ms * 1000
+@@ -85,10 +98,13 @@
+         time_to_first_token_ms=time_to_first_token_ms,
+         generation_time_ms=generation_time_ms,
+         queue_time_ms=queue_time_ms,
+         mean_itl_ms=mean_itl_ms,
+         tokens_per_second=tokens_per_second,
++        prefill_tokens=prefill_tokens,
++        prefill_tokens_per_second=prefill_tokens_per_second,
++        decode_tokens_per_second=decode_tokens_per_second,
+     )
+ 
+ 
+ def build_spec_decoding_metrics(
+     final_res: "RequestOutput | None",
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -281,10 +281,13 @@
+     is_watermarked: bool = False
+ 
+     # Track if this request asked for the watermark but could not use it
+     is_watermark_skipped: bool = False
+ 
++    # Prompt tokens that missed the prefix cache at first prefill.
++    num_prefill_tokens: int | None = None
++
+ 
+ @dataclass
+ class FinishedRequestStats:
+     """Stats associated with a finished request."""
+ 
+@@ -519,10 +522,15 @@
+ 
+         self.num_generation_tokens += num_new_generation_tokens
+         if is_prefilling:
+             if output.prefill_stats is not None:
+                 self.prompt_token_stats.update_from_output(output.prefill_stats)
++                # Carry the scheduler's prompt-minus-cached count on
++                # RequestOutput.metrics through the final output.
++                req_stats.num_prefill_tokens = (
++                    output.prefill_stats.num_computed_tokens
++                )
+ 
+             first_token_latency = self._time_since(req_stats.arrival_time)
+             self.time_to_first_tokens_iter.append(first_token_latency)
+             req_stats.first_token_latency = first_token_latency
+ 

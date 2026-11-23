@@ -1,0 +1,186 @@
+[
+  {
+    "packet": "engram-gap-r1",
+    "purpose": "Keep fused SSD Engram dequantization and rows-only prefetch.",
+    "patch": "0001-engram-gap-r1.patch",
+    "files": {
+      "vllm/models/deepseek_v41/ssd/engram_ssd.py": {
+        "mount": 11,
+        "before": "024f89e20a5724f43f62f3c10f4da450f9c9d6ce204b3ff83c1e05ac4199f035",
+        "after": "7e74dacda5f8ab579d93959b6d89903d1681dbb6b9df618e6ed658a1dc1c0f92"
+      },
+      "vllm/models/deepseek_v41/common/engram.py": {
+        "mount": 12,
+        "before": "7a977b31e1f32c7fc000fbacd51ac283d109986926d948bf170db6fd631775b2",
+        "after": "106c19cdd3029049bf00cac0285ad4fdccc4a5e328086fd1da10c774551c71d4"
+      }
+    }
+  },
+  {
+    "packet": "splitk-numerics-r1",
+    "purpose": "Restore SM80 probability precision and inverse-RoPE rounding options.",
+    "patch": "0002-splitk-numerics-r1.patch",
+    "files": {
+      "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py": {
+        "mount": 17,
+        "before": "15e38b2c234e6ff39cf4fb36e33c3c9a6301f1014383dc30a8b863358be37586",
+        "after": "7a9efbb9053b2c304ca6af4b584b9390fc4c69b50ba7ddd9d48a878d0ee7b6b6"
+      },
+      "vllm/v1/attention/ops/sm80_sparse_config.py": {
+        "mount": 18,
+        "before": "c3f7a9c3e1483f1a3ac148bec7fcc26b0a9cba7cefa899ae1d1d64075dfe1eb9",
+        "after": "0f06c263a4afca1c9cf4724d0fe1413381b195a9d498aad011ccda4e251d2dc0"
+      }
+    }
+  },
+  {
+    "packet": "moe-gap-r2",
+    "purpose": "Carry calibrated row masking, draft features and capture admission into v0.34.",
+    "patch": "0003-moe-gap-r2.patch",
+    "files": {
+      "vllm/v1/worker/gpu/model_runner.py": {
+        "mount": 20,
+        "before": "c91df5fb06589d27c38d3d869a594a9bdc0c1e573073fdcff8f4d8d48df8d8a5",
+        "after": "db5f35d56d45156f2663fc291ad1f1e7d1ee8dfc40cea5971a7ec8e12c9a1193"
+      },
+      "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py": {
+        "mount": 21,
+        "before": "1645f44b9dc4caaf60c2e62a1813385f219449c80833e7950a5fe3016edfcb58",
+        "after": "6e885f3a3964b758eca529bc7c123bb8d2983e5c04639158cd8a861a1aac7704"
+      },
+      "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py": {
+        "mount": 22,
+        "before": "a59b13a412a39285189a57a383d41e87b2f8f2bd74b1b0c01c86bab2f234dea3",
+        "after": "d17c467a0433635b37a8abe37f11d8c42b9715ef2910bf78f50caf679a8a550e"
+      },
+      "vllm/models/deepseek_v41/nvidia/model.py": {
+        "mount": 23,
+        "before": "70caddebb82f321cd098bc1d5c2afb9c6879884ca2bbbec34f7a46059fc3fd4b",
+        "after": "85df53ec91e012bff19fcb89c731b08d7a856bc6e070eb1e3aa43aad510dc12d"
+      },
+      "vllm_exl3/exl3.py": {
+        "mount": 24,
+        "before": "a8987f6e6c5ca92fed2b0d86c2ab7ed632cc84d357605b51bfad2ba6b6760303",
+        "after": "0266eb56cdfc78c4e529332000157ddbf060d4853d94124abd565f56f2a617cf"
+      },
+      "vllm/v1/worker/gpu/cudagraph_utils.py": {
+        "mount": 26,
+        "before": "c1e76be4243865c6ca5689789bd7fc418bc5f022543eddadef572a4d5f29b25e",
+        "after": "dc0ba39a6be898a979890cb3e0c0327b6bf4a054d27e1e7de0c68f855e38ba44"
+      },
+      "vllm/v1/core/sched/dsv41_adaptive_verify.py": {
+        "mount": 27,
+        "before": "04c6e849440765999df370e8af7269d11c3028e08850b3f2f126e0fc134e4640",
+        "after": "e11cb65bccbe4a45097892b0bbe55203cb576fbfc4733c88ab9570b17deaddbc"
+      },
+      "vllm/utils/dsv41_row_mask.py": {
+        "mount": 35,
+        "before": null,
+        "after": "5aeff5f199cfc8c6036c18ef4db3d583b7761d33b2d5918dea62d02b432c374c"
+      },
+      "vllm/utils/dsv41_row_mask_kernels.py": {
+        "mount": 36,
+        "before": null,
+        "after": "5e3b00541d8e9dbab5cafca7fff1d2bca9326a5f44e92d5111e66ca54a787f7b"
+      }
+    }
+  },
+  {
+    "purpose": "Restore decoder SWA replay for base-only prefill on the served LoRA configuration.",
+    "patch": "0004-restore-base-decoder-replay.patch",
+    "files": {
+      "vllm/models/deepseek_v41/nvidia/model.py": {
+        "before": "85df53ec91e012bff19fcb89c731b08d7a856bc6e070eb1e3aa43aad510dc12d",
+        "after": "05cc5ae461a8f39cd0c759581f7e86caf96fac3fbfbacff557b62b8e8828b27f"
+      },
+      "vllm/models/deepseek_v41/nvidia/model_state.py": {
+        "before": "47dd9355a3e9b5d70015cc25d55a064e0068b63b00a30f4916c0e3dfa2af8d94",
+        "after": "e3be27d00a7ac16ae5be92dbe338da05ce0c0b37c9f3347077e45bf5fc39169f"
+      }
+    }
+  },
+  {
+    "purpose": "Remap wo_b adapter token metadata for eager decoder SWA replay.",
+    "patch": "0005-remap-decoder-replay-lora-rows.patch",
+    "files": {
+      "vllm/lora/punica_wrapper/punica_gpu.py": {
+        "before": "fcef19b14e9f7cfc430998d74b91193d1398e4f9b6a4b96136b6b719b33c3294",
+        "after": "95c23bde95bc0fa9e315177acff8c81446b4e6700223631551892819c6b4c7db"
+      },
+      "vllm/models/deepseek_v41/decoder_replay_layers.py": {
+        "before": "c8f1216a012afd620cfbd4e7501eee840eadb071730f715e2566df9647171b43",
+        "after": "9f86429ff404840a06296898a8a07917fa57eb04ad6d20a5721759b02d9f4d83"
+      },
+      "vllm/models/deepseek_v41/nvidia/model.py": {
+        "before": "05cc5ae461a8f39cd0c759581f7e86caf96fac3fbfbacff557b62b8e8828b27f",
+        "after": "adf2a6486d320ee0ada4bf5bbb08bd3ab1acf577611a9f43ed3c3f1bc8ad159c"
+      },
+      "vllm/models/deepseek_v41/nvidia/model_state.py": {
+        "before": "e3be27d00a7ac16ae5be92dbe338da05ce0c0b37c9f3347077e45bf5fc39169f",
+        "after": "924a4c17640eec6e7a078373be2553d9a0657d16f9da8abcf6b040138269b309"
+      }
+    }
+  },
+  {
+    "purpose": "Expose uncached prompt tokens and prefill and decode throughput on API responses.",
+    "patch": "0006-per-request-prefill-decode-metrics.patch",
+    "files": {
+      "vllm/entrypoints/generate/base/protocol.py": {
+        "before": "0c07e689fdbbb59929fc8599f714b8041eec0dcd7fb16d87bb59bc80c5874803",
+        "after": "5d8c3161681beac23e74b0c7e77125220784f2f43c86dd240a74424b2fb13549"
+      },
+      "vllm/entrypoints/generate/base/serving.py": {
+        "before": "2f6e144a56e737ff71df778a4182d8489328eb52ec57c6e96b686da9257ebbbc",
+        "after": "1133cd41b555aff17eb423b058ba088ad6750e0619656bf5bba073333ec78fa2"
+      },
+      "vllm/v1/metrics/stats.py": {
+        "before": "0357ab7a4c3259119b2abc5755d3b65e29a204087eacc367b4c85a966b849506",
+        "after": "9236832200a6f6069e508c187e23eeb1f4b60e5214612b28c3569f42f8591ef6"
+      }
+    }
+  },
+  {
+    "purpose": "Expose the finished single-turn speculative decoding summary on Responses API output.",
+    "patch": "0007-responses-speculative-decoding-metrics.patch",
+    "files": {
+      "vllm/entrypoints/openai/responses/context.py": {
+        "before": "0f32465fd0192c637f863cc21964c17cf6698529b2e043aa75094bd504ec99d2",
+        "after": "5cdf8b777f33cd75eabec71b9825dbc20eb26ebcb5d4d6fa34848971fd9d437b"
+      },
+      "vllm/entrypoints/openai/responses/serving.py": {
+        "before": "53869457dcc1767f9848fd1b8bdd257dca12982b7eebcc8568c2043e3e501945",
+        "after": "71c9fbee7845456f760b3814738003f533aed639fa50833c5d82a9babc911580"
+      }
+    }
+  },
+  {
+    "purpose": "Expose TabbyAPI-compatible timing and throughput fields in OpenAI usage.",
+    "patch": "0008-tabbyapi-usage-timing.patch",
+    "files": {
+      "vllm/entrypoints/generate/base/serving.py": {
+        "before": "1133cd41b555aff17eb423b058ba088ad6750e0619656bf5bba073333ec78fa2",
+        "after": "923b20f3a450ce507c483af5f5c7a6be9997e058a47d0ee0e592cff6693a85c2"
+      },
+      "vllm/entrypoints/openai/chat_completion/serving.py": {
+        "before": "e1963254a29c630dfc558a1b8e7d0e3f2e3c6843f34984f96207032102d166bf",
+        "after": "41a3eb6c55109043e6109af6b911555fa1fd3fa37cfe4b746d712c839a49c486"
+      },
+      "vllm/entrypoints/openai/completion/serving.py": {
+        "before": "3463559f3c5ec227be1a006539782f916db45968fcb4e69b0394ce051014b9f3",
+        "after": "41c72d2621aee33743c39a5206db3a7a135a6db939ad2ca76356052ee856dc4d"
+      },
+      "vllm/entrypoints/openai/responses/protocol.py": {
+        "before": "27c1885cfadb99a60137a99ad1bcd5d28667b1f209616c02584530a248a2ee22",
+        "after": "df1c0015831d413caa56605afb26a4c5b426bccb9188e2419bf1dfa639318a8b"
+      },
+      "vllm/entrypoints/openai/responses/serving.py": {
+        "before": "71c9fbee7845456f760b3814738003f533aed639fa50833c5d82a9babc911580",
+        "after": "325d3eede6e15677b54d0c94a6ce8f941f3bdb6258407f5ff60576d008164abf"
+      },
+      "vllm/entrypoints/serve/engine/protocol.py": {
+        "before": "1939afd36c9544535ad1e592e32ae376c4e9b980b0d78f7d75ce70bc22d5d7b2",
+        "after": "87fff7b31f1725b3b31a145753d494626f809b9a63d8d3c6e5baf3f37531d326"
+      }
+    }
+  }
+]

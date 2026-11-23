@@ -1,0 +1,13 @@
+Subject: Read vocabulary width from the v0.34 draft cache.
+
+diff --git a/dsv41_lora_argmax/dsv41_lora_argmax/eligibility.py b/dsv41_lora_argmax/dsv41_lora_argmax/eligibility.py
+--- a/dsv41_lora_argmax/dsv41_lora_argmax/eligibility.py
++++ b/dsv41_lora_argmax/dsv41_lora_argmax/eligibility.py
+@@ -51,6 +51,6 @@
+         if r.speculative_config is None or not r.speculative_config.use_dspark():
+             return False
+         draft_logits = getattr(spec, 'draft_logits', None)
+-        if draft_logits is not None and draft_logits.shape[-1] < processor.org_vocab_size:
++        if draft_logits is not None and draft_logits.values.shape[-1] < processor.org_vocab_size:
+             return False
+     return True

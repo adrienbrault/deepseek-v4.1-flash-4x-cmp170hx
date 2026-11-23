@@ -1,0 +1,71 @@
+diff --git a/vllm/models/deepseek_v41/ssd/engram_ssd.py b/vllm/models/deepseek_v41/ssd/engram_ssd.py
+--- a/vllm/models/deepseek_v41/ssd/engram_ssd.py
++++ b/vllm/models/deepseek_v41/ssd/engram_ssd.py
+@@ -217,6 +217,10 @@
+             raise RuntimeError(f"cudaLaunchHostFunc failed: {err}")
+         dw[:count].copy_(w[:count], non_blocking=True)
+         ds[:count].copy_(s[:count], non_blocking=True)
++        if os.environ.get("DSV41_EG_DEQUANT", "0") == "1":
++            from dsv41_engram_gap.dequant import dequant
++            dequant(dw[:count], ds[:count], out.view(-1, self.dim)[:count])
++            return
+         # Dequant on the device: fp8 e4m3 * 2^(e8m0 - 127), per 32 columns.
+         vals = dw[:count].view(torch.float8_e4m3fn).to(torch.float32)
+         scale = (ds[:count].to(torch.int32) << self._exp_shift).view(torch.float32)
+diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -1561,6 +1561,8 @@
+ 
+     _prefetch_stream: torch.cuda.Stream | None = None
+     _prefetch_done: torch.cuda.Event | None = None
++    _gap_stream: torch.cuda.Stream | None = None
++    _gap_done: torch.cuda.Event | None = None
+     _batch: EngramBatch | None = None
+ 
+     def __init__(
+@@ -1655,6 +1657,22 @@
+             head_dim,
+             dtype=torch.bfloat16,
+         )
++        if os.environ.get("DSV41_EG_PREFETCH", "0") != "0":
++            from types import SimpleNamespace
++
++            from dsv41_engram_gap.prefetch import initialize
++
++            vllm_config = get_current_vllm_config()
++            # v0.34's Worker always constructs the V2 GPUModelRunner. Supply
++            # the compatibility flag expected by the external prefetch helper.
++            initialize(
++                self,
++                SimpleNamespace(
++                    parallel_config=vllm_config.parallel_config,
++                    compilation_config=vllm_config.compilation_config,
++                    use_v2_model_runner=True,
++                ),
++            )
+         if not self.embed_tokens.cpu_offload:
+             self._prefetch_stream = None
+             return
+@@ -1668,7 +1686,10 @@
+         offset = dbo_current_ubatch_token_offset()
+         rows = self.staged_rows[offset : offset + hash_ids.shape[0]]
+         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+-        if self._prefetch_stream is None:
++        if self._gap_stream is not None:
++            from dsv41_engram_gap.prefetch import prepare
++            prepare(self, hash_ids, rows)
++        elif self._prefetch_stream is None:
+             self.embed_tokens.lookup(hash_ids, rows)
+         else:
+             self._start_prefetch(hash_ids, rows)
+@@ -1703,6 +1724,9 @@
+         torch.cuda.current_stream().wait_event(event)
+ 
+     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
++        if self._gap_done is not None:
++            from dsv41_engram_gap.prefetch import join
++            join(self)
+         if self._prefetch_done is not None:
+             self._finish_prefetch(self._prefetch_done)
+         if self.embed_tokens.dp_size > 1:

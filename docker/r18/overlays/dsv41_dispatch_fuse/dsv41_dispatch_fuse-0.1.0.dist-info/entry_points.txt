@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_dispatch_fuse = dsv41_dispatch_fuse:register

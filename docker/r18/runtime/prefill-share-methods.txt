@@ -1,0 +1,152 @@
+    # Small-prefill policy adapted from prefill-vs-prefill-r3 (MIT).
+    def _install_prefill_share(self):
+        import os
+
+        mode = os.environ.get("@MODE_ENV@", "off")
+        if mode == "off":
+            return
+        if mode != "half" or type(self).schedule is not Scheduler.schedule:
+            self._small_prefill_log("WARN_ONLY invalid or unsupported prefill share; using off")
+            return
+        self.schedule = self._schedule_with_prefill_share
+        self._small_clipped_steps = self._small_mixed_clipped_steps = 0
+        self._small_prefill_log(f"DSV41_PREFILL_SMALL mode=small max={_SMALL_PREFILL_MAX} share=1/2")
+        self._small_prefill_log("DSV41_PREFILL_SMALL clipped_steps=0 mixed_clipped_steps=0")
+
+    @staticmethod
+    def _small_prefill_log(message):
+        try:
+            logger.info(message)
+        except Exception:
+            # Evidence must never interrupt serving.
+            pass
+
+    def _small_prefill_clip(self, mixed):
+        self._small_clipped_steps += 1
+        self._small_mixed_clipped_steps += mixed
+        count = self._small_clipped_steps
+        if count & (count - 1) == 0 or (mixed and self._small_mixed_clipped_steps == 1):
+            self._small_prefill_log(
+                f"DSV41_PREFILL_SMALL clipped_steps={count} "
+                f"mixed_clipped_steps={self._small_mixed_clipped_steps}"
+            )
+
+    def _small_prefill_plan(self, fair, deferred):
+        if (
+            deferred
+            or self._pause_state != PauseState.UNPAUSED
+            or self.policy != SchedulingPolicy.FCFS
+            or not self.scheduler_config.enable_chunked_prefill
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.aux_output_connector is not None
+            or self.async_kv_waiting
+            or self.cache_aware_window
+            or self.need_mamba_block_aligned_split
+            or getattr(self, "enable_kv_cache_events", False)
+            or not (self.waiting or self.kv_holding_waiting or self._inflight_prefills)
+        ):
+            return None
+        decoding = any(not r.is_prefill_chunk for r in self.running)
+        if decoding and (fair is None or fair.limit < 2):
+            return None
+
+        contenders = []
+        for request in self.running:
+            if (request.is_prefill_chunk and not request.has_encoder_inputs
+                    and not request.num_output_placeholders and not request.spec_token_ids
+                    and self.current_step >= request.next_decode_eligible_step):
+                remaining = request.num_tokens - request.num_computed_tokens
+                if remaining > 0:
+                    contenders.append((request, None, remaining))
+
+        def long(remaining):
+            return remaining > _SMALL_PREFILL_MAX and (fair is None or remaining > fair.minimum)
+
+        if contenders and not long(contenders[0][2]):
+            return None
+        slots = self.max_num_active_reqs - len(self.running) - self.num_waiting_for_streaming_input
+        if slots > 0:
+            queues = (self.kv_holding_waiting, self.waiting)
+            if not contenders and sum(map(len, queues)) < 2:
+                return None
+            waiting = ((request, queue) for queue in queues for request in queue)
+            for request, queue in itertools.islice(waiting, 4):
+                if (request.has_encoder_inputs or request.mm_features
+                        or (request.num_stale_output_tokens and not request.drop_stale_output)):
+                    continue
+                if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                    grammar = getattr(request.structured_output_request, "grammar", None)
+                    if grammar is None or isinstance(grammar, Exception):
+                        continue
+                elif request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                    continue
+                remaining = self._small_remaining(request, queue)
+                if not contenders and not long(remaining):
+                    return None
+                contenders.append((request, queue, remaining))
+
+        if len(contenders) < 2 or not long(contenders[0][2]):
+            return None
+        primary, others = contenders[0], contenders[1:]
+        minimum = max(1, fair.minimum) if decoding else 0
+        if decoding:
+            # Fair accounting already permits one long and one short.
+            running_longs = sum(queue is None and long(n) for _, queue, n in contenders)
+            waiting_longs = sum(queue is not None and long(n) for _, queue, n in contenders)
+            if running_longs + min(max(slots, 0), waiting_longs) < fair.limit:
+                return None
+            if slots <= (primary[1] is not None):
+                others = [row for row in others if row[1] is None]
+        if any(minimum < remaining <= _SMALL_PREFILL_MAX for _, _, remaining in others):
+            return primary, [(request, queue) for request, queue, _ in others]
+        return None
+
+    def _small_remaining(self, request, queue):
+        computed = request.num_computed_tokens
+        if queue is not None and computed == 0:
+            _, hit, _, _ = self._get_local_prefix_cache_hit(request)
+            computed = max(0, hit - self.prefix_replay_tokens)
+        return request.num_tokens - computed
+
+    def _small_prefill_shortest(self, candidates, minimum):
+        # An allocation can evict an unpinned hit. Re-rank, keeping FIFO ties.
+        while candidates:
+            slots = self.max_num_active_reqs - len(self.running) - self.num_waiting_for_streaming_input
+            eligible = (
+                (self._small_remaining(request, queue), index)
+                for index, (request, queue) in enumerate(candidates)
+                if (queue is None and request in self.running)
+                or (slots > 0 and queue is not None and request in queue)
+            )
+            _, index = min(
+                (row for row in eligible if minimum < row[0] <= _SMALL_PREFILL_MAX),
+                default=(0, None),
+            )
+            if index is None:
+                break
+            yield candidates.pop(index)
+
+    def _small_prefill_extend(self, request, replay, old, potential, queue, blocks):
+        computed = request.num_computed_tokens
+        potential = min(potential, request.num_tokens - computed,
+                        self.max_model_len - self.num_sampled_tokens_per_step - computed)
+        count = self._reserve_prefill_lookahead(request, computed, potential)
+        if count <= old:
+            return 0
+        if count > replay:
+            # The first visit adopted the hit. Extend its absolute frontier
+            # without touching the hit again or charging a second draft slot.
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request, count - replay, num_new_computed_tokens=replay,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+            )
+            if new_blocks is None:
+                return 0
+            request_id = request.request_id
+            blocks[request_id] = (
+                blocks[request_id] + new_blocks if queue is None
+                else self.kv_cache_manager.get_blocks(request_id)
+            )
+        return count - old
+

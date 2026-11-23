@@ -1,0 +1,50 @@
+Subject: Allow reduced boots and validate the two v0.34 LoRA graph tables.
+
+diff --git a/dsv41_ablit_r7/dsv41_ablit_r7/__init__.py b/dsv41_ablit_r7/dsv41_ablit_r7/__init__.py
+--- a/dsv41_ablit_r7/dsv41_ablit_r7/__init__.py
++++ b/dsv41_ablit_r7/dsv41_ablit_r7/__init__.py
+@@ -3,17 +3,24 @@
+ 
+ 
+ def register():
+-    required = {'DSV41_DENSE_LORA': '1', 'DSV41_ABLIT_R7': '1', 'DSV41_TARGET_ARGMAX': '1',
+-                'DSV41_EG_DEQUANT': '1', 'DSV41_EG_PREFETCH': '1', 'DSV41_EG_ROW_CACHE_MB': '16'}
+-    if any(os.environ.get(k) != v for k, v in required.items()):
+-        raise ValueError('r7a stack audit requires dense LoRA + r7a + target argmax + engram 1/1/16')
+-    from .draft import install as install_draft
++    switch = os.environ.get('DSV41_ABLIT_R7', '0')
++    if switch == '0':
++        return False
++    if switch != '1':
++        raise ValueError('DSV41_ABLIT_R7 must be 0 or 1')
+     from .hooks import install
+-    install_draft()
+     install()
++    draft = os.environ.get('DSV41_DRAFT_SHARD_ARGMAX', '0')
++    if draft != '0':
++        from .draft import install as install_draft
++        install_draft()
+     from vllm.logger import init_logger
+     log = init_logger('vllm.dsv41_stack')
+-    log.info('[vllm.dsv41_stack] DSV41_STACK_READY_R7A dense-lora=1 ablit-r7=1 argmax=1 engram=1')
++    engram = all(os.environ.get(key) == value for key, value in {
++        'DSV41_EG_DEQUANT': '1', 'DSV41_EG_PREFETCH': '1', 'DSV41_EG_ROW_CACHE_MB': '16'
++    }.items())
++    log.info('[vllm.dsv41_stack] DSV41_STACK_READY_R7A dense-lora=1 ablit-r7=1 argmax=%s engram=%d',
++             os.environ.get('DSV41_TARGET_ARGMAX', '0'), engram)
+     log.info('[vllm.dsv41_stack] DSV41_STACK_CONFIG splitk=%s rowmask=%s lookup=%s live=%s',
+              os.environ.get('VLLM_SM80_SPARSE_DECODE', '0'),
+              'cap1' if os.environ.get('VLLM_DSV41_MOE_ROW_MASK') else 'off',
+diff --git a/dsv41_ablit_r7/dsv41_ablit_r7/graphs.py b/dsv41_ablit_r7/dsv41_ablit_r7/graphs.py
+--- a/dsv41_ablit_r7/dsv41_ablit_r7/graphs.py
++++ b/dsv41_ablit_r7/dsv41_ablit_r7/graphs.py
+@@ -32,7 +32,8 @@
+                 or manager._graphs_captured
+                 or any(d.num_active_loras != case
+                        for ds in manager._capture_descs.values() for d in ds)
+-                or any(key[1] != case for key in manager._candidates)):
++                or any(key[1] != case for key in manager._candidates)
++                or any(key[1] != case for key in manager._decode_descs)):
+             raise ValueError('r7a unexpected V2 LoRA graph candidates')
+         resolve = manager._resolve_effective_loras
+ 

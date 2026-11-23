@@ -1,0 +1,258 @@
+Subject: [PATCH 04/10] Port DSpark shard loading and staged Marlin repacking
+
+Origin: r17 vLLM patches 0006, 0007, 0026-filter-dspark-unused-shards.patch.
+
+The DSpark model also supplies local-vocabulary logits used by patch 0006.
+
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index d0ba8fd..2eb3291 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -920,23 +920,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                     and w2_bias.shape[1] == hidden_size
+                 )
+ 
+-        # Convert weights to kernel format
+-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+-            convert_weight_to_mxfp4_moe_kernel_format(
+-                mxfp4_backend=self.mxfp4_backend,
+-                layer=layer,
+-                w13_weight=w13,
+-                w2_weight=w2,
+-                w13_weight_scale=w13_scale,
+-                w2_weight_scale=w2_scale,
+-                w13_bias=w13_bias,
+-                w2_bias=w2_bias,
+-                _cache_permute_indices=self._cache_permute_indices,
+-                activation=self.moe.activation,
+-                use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
+-                activation_key=self.activation_key,
++        if (
++            self.mxfp4_backend == Mxfp4MoeBackend.MARLIN
++            and current_platform.is_device_capability(80)
++        ):
++            del w13, w2, w13_scale, w2_scale
++            from vllm.models.deepseek_v41.marlin_staged import (
++                prepare_marlin_mxfp4_moe_staged,
++            )
++
++            prepare_marlin_mxfp4_moe_staged(layer)
++            w13, w2 = layer.w13_weight, layer.w2_weight
++            w13_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
++            w13_bias = getattr(layer, "w13_bias", None)
++            w2_bias = getattr(layer, "w2_bias", None)
++        else:
++            # Convert weights to kernel format
++            w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
++                convert_weight_to_mxfp4_moe_kernel_format(
++                    mxfp4_backend=self.mxfp4_backend,
++                    layer=layer,
++                    w13_weight=w13,
++                    w2_weight=w2,
++                    w13_weight_scale=w13_scale,
++                    w2_weight_scale=w2_scale,
++                    w13_bias=w13_bias,
++                    w2_bias=w2_bias,
++                    _cache_permute_indices=self._cache_permute_indices,
++                    activation=self.moe.activation,
++                    use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
++                    activation_key=self.activation_key,
++                )
+             )
+-        )
+ 
+         # For TRITON backends, weights are wrapped tensors from triton_kernels
+         # that don't support .detach(). Manually assign parameters.
+@@ -1042,14 +1057,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             self._setup_kernel_k3_situ_gfx942(layer)
+             return
+ 
+-        w13 = layer.w13_weight
+-        w2 = layer.w2_weight
+-        w13_scale = layer.w13_weight_scale
+-        w2_scale = layer.w2_weight_scale
+-        w13_bias = getattr(layer, "w13_bias", None)
+-        w2_bias = getattr(layer, "w2_bias", None)
+-
+-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
++        self._setup_kernel(
++            layer, layer.w13_weight, layer.w2_weight,
++            layer.w13_weight_scale, layer.w2_weight_scale,
++            getattr(layer, "w13_bias", None), getattr(layer, "w2_bias", None),
++        )
+ 
+     def get_fused_moe_quant_config(
+         self,
+diff --git a/vllm/models/deepseek_v41/marlin_staged.py b/vllm/models/deepseek_v41/marlin_staged.py
+new file mode 100644
+index 0000000..b055525
+--- /dev/null
++++ b/vllm/models/deepseek_v41/marlin_staged.py
+@@ -0,0 +1,82 @@
++"""Marlin MXFP4 MoE weight preparation staged through host RAM.
++
++vLLM's prepare keeps the raw [E, N, K/2] expert tensor on the GPU while the packed copy is
++built (and the caller frames pin both raw tensors), so every MoE layer costs ~6.7 GiB of
++transient HBM at load. That is what limits a CMP 170HX rank to 7 expert layers. Here the
++raw tensor is moved to the host first and the packed tensor is filled expert by expert, so
++the GPU peak is just the packed weight: 8 expert layers per rank fit.
++"""
++from __future__ import annotations
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    marlin_permute_bias,
++    marlin_permute_scales,
++)
++from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
++    mxfp4_marlin_process_scales,
++)
++
++from vllm.model_executor.utils import replace_parameter
++
++
++def _repack_staged(layer, name: str, size_n: int, size_k: int):
++    raw = getattr(layer, name)
++    device = raw.device
++    e = raw.shape[0]
++    assert raw.shape == (e, size_n, size_k // 2), raw.shape
++    # pageable on purpose: torch's pinned-host allocator caches freed blocks for the life
++    # of the process, which would keep ~6.7 GiB of locked host RAM per worker after load.
++    host = torch.empty(raw.shape, dtype=raw.dtype, device="cpu")
++    host.copy_(raw.data)
++    torch.cuda.synchronize(device)
++    # drop the GPU copy before allocating the packed one
++    replace_parameter(layer, name, torch.empty(0, dtype=raw.dtype, device=device))
++    del raw
++    torch.cuda.empty_cache()
++    out = None
++    stage = torch.empty(host.shape[1:], dtype=host.dtype, device=device)
++    for i in range(e):
++        stage.copy_(host[i])
++        qweight = stage.view(torch.int32).T.contiguous()
++        packed = ops.gptq_marlin_repack(
++            b_q_weight=qweight, size_k=size_k, size_n=size_n, num_bits=4
++        )
++        if out is None:
++            out = torch.empty((e, *packed.shape), dtype=packed.dtype, device=device)
++        out[i] = packed
++    del stage, host
++    return out
++
++
++def prepare_marlin_mxfp4_moe_staged(layer) -> None:
++    """In-place equivalent of vLLM's prepare_moe_fp4_layer_for_marlin (MXFP4 flavour)."""
++    group_size = 32
++    w13 = layer.w13_weight
++    e, n2, khalf = w13.shape
++    n, k = n2 // 2, khalf * 2
++    param_dtype = layer.params_dtype
++    del w13
++
++    for name, size_n, size_k in (("w13_weight", n * 2, k), ("w2_weight", k, n)):
++        packed = _repack_staged(layer, name, size_n, size_k)
++        replace_parameter(layer, name, packed)
++        del packed
++        torch.cuda.empty_cache()
++
++    for name, size_n, size_k in (("w13", n * 2, k), ("w2", k, n)):
++        scales = getattr(layer, name + "_weight_scale").view(torch.float8_e8m0fnu).to(param_dtype)
++        tensor_list = []
++        for i in range(e):
++            ms = marlin_permute_scales(s=scales[i].T, size_k=size_k, size_n=size_n, group_size=group_size)
++            tensor_list.append(mxfp4_marlin_process_scales(ms))
++        replace_parameter(layer, name + "_weight_scale", torch.cat([x.unsqueeze(0) for x in tensor_list], 0))
++        del scales, tensor_list
++
++    for name in ("w13_bias", "w2_bias"):
++        if getattr(layer, name, None) is None:
++            continue
++        bias = getattr(layer, name).to(param_dtype)
++        replace_parameter(layer, name, torch.cat([marlin_permute_bias(bias[i]).unsqueeze(0) for i in range(e)], 0))
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+index 86c0666..5a515db 100644
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -10,7 +10,8 @@ To implement non-causal attention, we leverage the sparse attention implementati
+ include the future query tokens in the top-k indices for each query token.
+ """
+ 
+-from collections.abc import Iterable
++import os
++from collections.abc import Callable, Iterable
+ 
+ import regex as re
+ import torch
+@@ -19,6 +20,7 @@ import torch.nn as nn
+ import vllm.envs as envs
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
++from vllm.distributed import get_pp_group
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
+@@ -299,6 +301,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+         assert vllm_config.speculative_config is not None
++        self.has_own_embed_tokens = get_pp_group().world_size > 1
+         self.draft_model_config = vllm_config.speculative_config.draft_model_config
+         self.config = self.draft_model_config.hf_config
+         self.quant_config = vllm_config.quant_config
+@@ -374,6 +377,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         """Base logits U_k = lm_head(norm(head_hidden))."""
+         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+ 
++    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return self.logits_processor(
++            self.lm_head, self.model.norm(hidden_states), skip_gather=True
++        )
++
+     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Full-vocab draft: base logits, no d2t scatter.
+         return self.compute_logits(hidden_states)
+@@ -402,6 +410,26 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
++    @property
++    def is_unused_checkpoint_weight(self) -> Callable[[str], bool] | None:
++        """Opt in to skipping target-only shards during draft loading."""
++        if os.environ.get("VLLM_DSV4_DSPARK_FILTER_SHARDS", "0") != "1":
++            return None
++        return self._is_unused_checkpoint_weight
++
++    def _is_unused_checkpoint_weight(self, name: str) -> bool:
++        # Pipeline-parallel drafts load a private embedding before the normal
++        # MTP remap; keep every alias accepted by load_weights below.
++        if self.has_own_embed_tokens and name in (
++            "embed.weight",
++            "embed_tokens.weight",
++            "model.embed_tokens.weight",
++        ):
++            return False
++        # Keep the exact same MTP/head/EXL3 acceptance decision as load_weights.
++        # The loader drops only wholly unused files; mixed files remain intact.
++        return self._remap_dspark_name(name) is None
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
+ 
+@@ -446,6 +474,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+ 
+         weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
+         for name, loaded_weight in weights:
++            if self.has_own_embed_tokens and name in (
++                "embed.weight",
++                "embed_tokens.weight",
++                "model.embed_tokens.weight",
++            ):
++                param = self.model.embed_tokens.weight
++                param.weight_loader(param, loaded_weight)
++                loaded_params.add("model.embed_tokens.weight")
++                continue
+             mapped = self._remap_dspark_name(name)
+             if mapped is None:
+                 continue

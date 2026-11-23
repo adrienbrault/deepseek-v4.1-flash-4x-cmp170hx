@@ -1,0 +1,67 @@
+        plan = self._small_prefill_plan(fair, defer_prefills)
+        if plan is None:
+            schedule_pass()
+        else:
+            (primary, queue, _), shorts = plan
+            primary_id = primary.request_id
+            if fair is not None:
+                # Respect fair caps and run decoders in their original order.
+                schedule_pass(mixed=True)
+                if queue is not None:
+                    visit(primary, queue)
+                if primary_id in fair.charges:
+                    for request, short_queue in self._small_prefill_shortest(shorts, max(1, fair.minimum)):
+                        visit(request, short_queue, short=True)
+                        if request.request_id in fair.charges:
+                            self._small_prefill_clip(mixed=True)
+                            break
+                schedule_pass()
+            else:
+                full = min(token_budget, input_budget - draft_slots)
+                reserve = full // 2
+                chunk = full - reserve
+                if reserve <= draft_slots or chunk < self.num_prefill_lookahead:
+                    schedule_pass()
+                else:
+                    visit(primary, queue, chunk)
+                    if primary_id not in num_scheduled_tokens:
+                        schedule_pass()
+                    else:
+                        used = 0
+                        for request, short_queue in self._small_prefill_shortest(shorts, 0):
+                            if preempted_reqs or reserve - used <= draft_slots:
+                                break
+                            visit(request, short_queue, reserve - used - draft_slots, short=True)
+                            count = num_scheduled_tokens.get(request.request_id, 0)
+                            if count:
+                                used += count + draft_slots
+
+                        old = num_scheduled_tokens[primary_id]
+                        potential = old + min(token_budget, input_budget)
+                        if long_prefill_token_threshold:
+                            potential = min(potential, long_prefill_token_threshold)
+                        extra = self._small_prefill_extend(
+                            primary, primary_replay, old, potential, queue, req_to_new_blocks
+                        )
+                        num_scheduled_tokens[primary_id] += extra
+                        token_budget -= extra
+                        input_budget -= extra
+                        if extra:
+                            drafts_needed = drafts_needed or not self._drafts_unused(
+                                primary, primary.num_computed_tokens, old + extra
+                            )
+                        if used and old + extra < full:
+                            self._small_prefill_clip(mixed=False)
+                        primary_limit = min(
+                            primary.num_tokens - primary.num_computed_tokens,
+                            self.max_model_len - self.num_sampled_tokens_per_step - primary.num_computed_tokens,
+                            long_prefill_token_threshold or full,
+                        )
+                        if old + extra >= primary_limit:
+                            schedule_pass()
+
+        # Measure cadence pressure after the complete step, not between passes.
+        if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL and not defer_prefills:
+            _, num_waiting = self.get_request_counts()
+            self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+

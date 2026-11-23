@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_r7h_switch = dsv41_r7h_switch:register

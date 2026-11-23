@@ -1,0 +1,6 @@
+{
+  "vllm.models.deepseek_v41.amd.rocm:DeepseekV41ROCMAiterSparseSWAMetadataBuilder.__init__": "649e80b1f113cb16eee5c1f459809591c16a0f105d5c807b5e27f3f30e8dde53",
+  "vllm.models.deepseek_v41.amd.rocm:DeepseekV41ROCMAiterSparseSWAMetadataBuilder.build": "ce9f1a2093a484eb95002224f85f10122bb972a6b04fd893ead9dcebceba035a",
+  "vllm.v1.attention.backends.mla.sparse_swa:DeepseekSparseSWAMetadataBuilder.build": "93face96fc99d5e3ee2b603d30f99b5ac5b5e2f22696d7aff0c954c7e85ec71f",
+  "vllm.models.deepseek_v41.sparse_mla:DeepseekV41SparseSWAMetadataBuilder.build": "f40835bb3c77d35f94bc671e518dd627db60fcc84781a2f3218f293389ab13cd"
+}

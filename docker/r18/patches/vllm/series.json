@@ -1,0 +1,323 @@
+{
+  "base": "62d4bc3c7e33b1b6c906e233e6af2d3506c482ca",
+  "version": "v0.34.0",
+  "prior_base": "df3bd094aeea829f27baa0a5282830464f601d9f",
+  "reviewed_paths": [
+    "vllm/config/parallel.py",
+    "vllm/config/vllm.py",
+    "vllm/distributed/device_communicators/cuda_communicator.py",
+    "vllm/distributed/device_communicators/dsv41_int8_all_reduce.py",
+    "vllm/distributed/device_communicators/dsv41_int8_prefill.py",
+    "vllm/distributed/device_communicators/dsv41_int8_prefill_policy.py",
+    "vllm/distributed/device_communicators/dsv41_int8_prefill_rotated.py",
+    "vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py",
+    "vllm/distributed/device_communicators/opera_true_ring.py",
+    "vllm/envs.py",
+    "vllm/lora/layers/base_linear.py",
+    "vllm/model_executor/kernels/mhc/sm80.py",
+    "vllm/model_executor/kernels/mhc/sm80_config.py",
+    "vllm/model_executor/kernels/mhc/tilelang.py",
+    "vllm/model_executor/layers/quantization/mxfp4.py",
+    "vllm/model_executor/layers/sparse_attn_indexer.py",
+    "vllm/model_executor/model_loader/weight_utils.py",
+    "vllm/models/deepseek_v4/common/ops/cache_utils.py",
+    "vllm/models/deepseek_v4/common/ops/fused_indexer_q.py",
+    "vllm/models/deepseek_v41/amd/rocm.py",
+    "vllm/models/deepseek_v41/ampere/__init__.py",
+    "vllm/models/deepseek_v41/ampere/ampere_sparse.py",
+    "vllm/models/deepseek_v41/attention.py",
+    "vllm/models/deepseek_v41/common/engram.py",
+    "vllm/models/deepseek_v41/common/ops/cache_utils.py",
+    "vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py",
+    "vllm/models/deepseek_v41/common/ops/indexer_k_store.py",
+    "vllm/models/deepseek_v41/marlin_staged.py",
+    "vllm/models/deepseek_v41/nvidia/dspark.py",
+    "vllm/models/deepseek_v41/nvidia/model.py",
+    "vllm/models/deepseek_v41/nvidia/prefill_overlap.py",
+    "vllm/models/deepseek_v41/nvidia/vl_model.py",
+    "vllm/models/deepseek_v41/pp_shadow.py",
+    "vllm/models/deepseek_v41/ssd/__init__.py",
+    "vllm/models/deepseek_v41/ssd/engram_ssd.py",
+    "vllm/utils/dsv41_diagnostics.py",
+    "vllm/utils/dsv41_prefill_overlap.py",
+    "vllm/utils/multi_stream_utils.py",
+    "vllm/v1/attention/backends/mla/indexer.py",
+    "vllm/v1/attention/backends/registry.py",
+    "vllm/v1/attention/ops/fp8_sm80.py",
+    "vllm/v1/attention/ops/indexer_prefill_sm80.py",
+    "vllm/v1/attention/ops/mqa_logits_triton.py",
+    "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+    "vllm/v1/attention/ops/sm80_sparse_config.py",
+    "vllm/v1/core/kv_cache_planning.py",
+    "vllm/v1/core/sched/dsv41_adaptive_verify.py",
+    "vllm/v1/core/sched/scheduler.py",
+    "vllm/v1/engine/core.py",
+    "vllm/v1/worker/gpu/cudagraph_utils.py",
+    "vllm/v1/worker/gpu/dp_utils.py",
+    "vllm/v1/worker/gpu/dsv41_tbo.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/sample/distributed.py",
+    "vllm/v1/worker/gpu/sample/distributed_sampler.py",
+    "vllm/v1/worker/gpu/sample/gumbel.py",
+    "vllm/v1/worker/gpu/sample/sampler.py",
+    "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py",
+    "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+    "vllm/v1/worker/gpu/ubatch_utils.py",
+    "vllm/v1/worker/gpu_worker.py",
+    "vllm/v1/worker/ubatching.py"
+  ],
+  "carry_forward_native_sources": [
+    "vllm/models/deepseek_v41/ssd/row_store.cpp"
+  ],
+  "commits": [
+    {
+      "patch": "0001-Port-software-FP8-cache-conversions-on-Ampere.patch",
+      "subject": "Port software FP8 cache conversions on Ampere",
+      "body": "Origin: r17 vLLM patches 0001, 0012.\n\nSource port for vLLM v0.34.0. Existing notices and SPDX headers are retained.",
+      "r17_sources": [
+        {
+          "patch": "0001",
+          "commit": "09232c5c03024ead09291788d5f3c4da0bdb88b5",
+          "subject": "Support software FP8 cache conversions on Ampere",
+          "body": "Retain the upstream cache layouts and use software E4M3 conversion on\ndevices without native FP8 casts. Gate CuTe dispatch by capability and\ncover the new V4.1 cache gather and insertion kernels as well.\n\nOrigin: dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0012",
+          "commit": "f816d50a44231f4010bfdc72836eadfb95043fac",
+          "subject": "Add exact bit-based E4M3FN decode for sparse attention",
+          "body": "Provide an opt-in decoder using exponent rebiasing and exact subnormal conversion. Keep the existing software decoder as the default.\n\nOrigin: Local SM80 sparse attention optimization\nUpstream: Not submitted; GPU qualification pending"
+        }
+      ]
+    },
+    {
+      "patch": "0002-Port-Ampere-sparse-indexer-and-attention-paths.patch",
+      "subject": "Port Ampere sparse indexer and attention paths",
+      "body": "Origin: r17 vLLM patches 0002, 0003, 0011, 0013, 0017, 0018, 0023.\n\nSource port for vLLM v0.34.0. Existing notices and SPDX headers are retained.",
+      "r17_sources": [
+        {
+          "patch": "0002",
+          "commit": "a2eb6131f3741b96609412dc17a221b2c79ccb90",
+          "subject": "Add an Ampere fallback for sparse indexer scoring",
+          "body": "Use BF16 Triton MQA scoring when DeepGEMM cannot execute. Bound\nprefill logits by row chunks and use torch top-k to avoid unsupported\npersistent kernels. Use fixed launch configs during CUDA capture.\n\nOrigin: dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0003",
+          "commit": "74e748bbb0a42baebbae013295203bd05cd6fed5",
+          "subject": "Connect DeepSeek V4.1 sparse attention on SM80",
+          "body": "Select the BF16 Triton sparse path on SM80 and retain grouped WO_A\nweights for MXFP8 emulation. Share current metadata and attention fixes\nwith ROCm without probing AMD devices on CUDA. Keep upstream mHC dispatch.\n\nOrigin: dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0011",
+          "commit": "41c4a3eeec8bb25b3545bd28b5d564f1ae1eb1d6",
+          "subject": "Enable device-trimmed DSpark indexer rows on Ampere",
+          "body": "Advertise device/host query-length mismatch support for the V4.1 Ampere\nindexer. Reuse the existing device metadata kernel to expand each query's\ncausal bound and block-table row into persistent buffers, including graph\npadding, before the Triton MQA fallback consumes single-query rows.\n\nKeep native DeepGEMM varlen support separate and retain the original\nmetadata path when adaptive verification is disabled. Force flattening\nfor adaptive two-row batches as well as the usual six-row DSpark shape.\nCover the architecture, model and opt-in gates with CPU unit tests.\n\nOrigin: new\nUpstream: none\nAssisted-by: OpenAI Codex"
+        },
+        {
+          "patch": "0013",
+          "commit": "99415231f0377bfd2d91ae768a8bb947071f631a",
+          "subject": "Add opt-in offline-tuned sparse decode on SM80",
+          "body": "Reuse BF16 tensor-core split-K and softmax reduction over both paged KV segments. Select fixed launch parameters by row/head/index capacities, validate the device-specific table before capture, and retain the original default. Honor inverse RoPE requests throughout the opt-in path and write BF16 output directly.\n\nOrigin: Local SM80 sparse attention optimization; shared ROCm Triton kernels\nUpstream: Not submitted; GPU qualification pending"
+        },
+        {
+          "patch": "0017",
+          "commit": "e281f9534120a2bbbbc28723b0d995e36647484a",
+          "subject": "Add opt-in SM80 prefill indexer reuse and fused postprocessing",
+          "body": "Reuse BF16 Q and K conversion across row chunks; expose fixed N tiles and keep torch.topk selection while fusing relative-index sorting and padding. All new paths default off.\n\nOrigin: Local SM80 prefill optimization\n\nUpstream: Not submitted; operator GPU validation pending\n\n\nSigned-off-by: Adrien Brault <adrien.brault@gmail.com>"
+        },
+        {
+          "patch": "0018",
+          "commit": "c20e07a8266c10eca2caf7fb06cdb107851d62aa",
+          "subject": "Allow SM80 indexer row sharding with candidate propagation",
+          "body": "Opt in to row sharding for two-level candidate writers and consumers. Exchange source candidate rows as well as final top-k indices; retain the existing sharding threshold and safety predicates.\n\nOrigin: Local SM80 prefill optimization\n\nUpstream: Not submitted; operator GPU validation pending\n\n\nSigned-off-by: Adrien Brault <adrien.brault@gmail.com>"
+        },
+        {
+          "patch": "0023",
+          "commit": "e2298a23bf8fb532c1b5c5d490184d3360df279f",
+          "subject": "Apply the inverse RoPE in the un-tuned sparse decode fallback",
+          "body": "The fallback decode kernel used on Ampere (and on ROCm parts other than\ngfx942/gfx950) has no rotating epilogue, yet rocm_sparse_attn_decode returns\nthe full row count as rotated whenever inv_rope_positions is supplied. The\ncaller then skips its standalone inverse RoPE, so every decode row reaches\nwo_a unrotated. On 4x SM80 cards with DSpark this produced degenerate greedy\ntext after the prefill tokens and a mean acceptance length of about 1.3.\n\nRotate the fallback's output rows in place when positions are supplied.\n\nOrigin: new"
+        }
+      ]
+    },
+    {
+      "patch": "0003-Port-SSD-Engram-and-pipeline-source-shadows.patch",
+      "subject": "Port SSD Engram and pipeline source shadows",
+      "body": "Origin: r17 vLLM patches 0003, 0004, 0005, 0021.\n\nContains shared model initialization, loading, TP logits, and TBO state hooks used by later patches. Native SSD row-store source is carried byte for byte from r17 patch 0004.",
+      "r17_sources": [
+        {
+          "patch": "0003",
+          "commit": "74e748bbb0a42baebbae013295203bd05cd6fed5",
+          "subject": "Connect DeepSeek V4.1 sparse attention on SM80",
+          "body": "Select the BF16 Triton sparse path on SM80 and retain grouped WO_A\nweights for MXFP8 emulation. Share current metadata and attention fixes\nwith ROCm without probing AMD devices on CUDA. Keep upstream mHC dispatch.\n\nOrigin: dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0004",
+          "commit": "c93a85b9ce604dc31d1816a2d344d46a6e42dc18",
+          "subject": "Serve V4.1 Engram rows from bounded SSD storage",
+          "body": "Keep full embedding tables out of host and device allocations. Use\nthe existing threaded pread row store and stream-ordered host callback\nwith upstream hashing, head sharding and BF16 staging. Load tables\nfrom a separate checkpoint root and retain strict real-weight checks.\n\nOrigin: dsv41reap-pp; r5 patch 0006; new\nUpstream: none"
+        },
+        {
+          "patch": "0005",
+          "commit": "16493f6600e1b9156474aadffbf5089f9b622111",
+          "subject": "Forward V4.1 shared cache sources across pipeline cuts",
+          "body": "Instantiate attention-only shadows before local consumers, ship their\nnormalized source inputs and candidate blocks, and load duplicated\nsource weights under shadow names. Use the V2 runner aux-state relay\nfor DSpark instead of maintaining a separate V1 proposer.\n\nOrigin: dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0021",
+          "commit": "d38f4de3cb927f855771eb12937e11fc2b09c2a4",
+          "subject": "Overlap whole-request V4.1 TP4 verify microbatches with upstream DBO",
+          "body": "Keep non-causal DSpark queries intact; pack ragged rows into stable half-batch buffers for FULL graphs and use event-ordered TP reductions on the DBO communication stream. Isolate indexer, Engram and MTP state and add an optional live output gate.\n\nOrigin: dsv41 overlap round r17\nUpstream: local opt-in SM80 experiment"
+        }
+      ]
+    },
+    {
+      "patch": "0004-Port-DSpark-shard-loading-and-staged-Marlin-repacking.patch",
+      "subject": "Port DSpark shard loading and staged Marlin repacking",
+      "body": "Origin: r17 vLLM patches 0006, 0007, 0026-filter-dspark-unused-shards.patch.\n\nThe DSpark model also supplies local-vocabulary logits used by patch 0006.",
+      "r17_sources": [
+        {
+          "patch": "0006",
+          "commit": "28d826db9b7518060f267b3b907b34a49f015639",
+          "subject": "Load a private DSpark embedding on the last pipeline rank",
+          "body": "The target input embedding is absent from the last pipeline stage.\nLoad its checkpoint tensor into the draft there and declare ownership\nso upstream sharing keeps it. Tensor parallel execution still aliases\nthe target embedding and output head through upstream utilities.\n\nOrigin: dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0007",
+          "commit": "9ecb5ad9ed3889cb4f920555efe4d72751354b39",
+          "subject": "Stage Ampere MXFP4 MoE repacking through host memory",
+          "body": "Release the raw GPU expert tensor before allocating its Marlin copy.\nRepack one expert at a time using pageable host staging, preserving\nscale and bias permutations while limiting draft-load GPU peaks.\n\nOrigin: dsv41reap-pp\nUpstream: none"
+        },
+        {
+          "patch": "0026-filter-dspark-unused-shards.patch",
+          "purpose": "Opt-in DSpark unused checkpoint shard filter",
+          "base_installed_file_sha256": "c12b0b9151d3bc56232afc1dbd8c3a8a6f20db18273cadba2d6d0bdb3a2c78f9",
+          "license": "Apache-2.0"
+        }
+      ]
+    },
+    {
+      "patch": "0005-Port-worker-diagnostics-and-breakable-graph-stream-guard.patch",
+      "subject": "Port worker diagnostics and breakable graph stream guard",
+      "body": "Origin: r17 vLLM patches 0008, 0009, 0016.\n\nSource port for vLLM v0.34.0. Existing notices and SPDX headers are retained.",
+      "r17_sources": [
+        {
+          "patch": "0008",
+          "commit": "7bbad2950be37216b18f1f70f16733f5d6f3fbe6",
+          "subject": "Add startup memory census and opt-in phase diagnostics",
+          "body": "Report live, reserved, split and external GPU memory per PP/TP rank\nafter loading and profiling. Keep the recipe debug switches usable with\nthe V2 runner and native DSpark, with bounded host timing and optional\nworker kernel profiling. Synchronize only for explicit timing diagnostics.\n\nOrigin: r6; dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0009",
+          "commit": "604dd844bb56ba27d3da52149aea25166b23c202",
+          "subject": "Serialize auxiliary streams during breakable graph capture",
+          "body": "Match the two-stream helper when capturing a breakable segment: run\nauxiliary projections on the current stream so capture cannot cross an\neager break with pending side-stream work.\n\nOrigin: dsv41reap-pp\nUpstream: none"
+        },
+        {
+          "patch": "0016",
+          "commit": "abdf4dc9f2a6b19c339297fe919051a4d30fd933",
+          "subject": "Export bounded per-rank prefill profiles",
+          "body": "Allow selecting matching worker calls and archive Chrome traces, tables and synchronized wall timing without changing the default capture schedule.\n\nOrigin: Local prefill profiling study\n\nUpstream: Not submitted; operator GPU validation pending\n\n\nSigned-off-by: Adrien Brault <adrien.brault@gmail.com>"
+        }
+      ]
+    },
+    {
+      "patch": "0006-Port-vocabulary-parallel-sampling-and-DSpark-verification.patch",
+      "subject": "Port vocabulary-parallel sampling and DSpark verification",
+      "body": "Origin: r17 vLLM patches 0008, 0015.\n\nThe runner and env dispatch hooks are grouped with microbatching and collective registration where the edits share source.",
+      "r17_sources": [
+        {
+          "patch": "0008",
+          "commit": "7bbad2950be37216b18f1f70f16733f5d6f3fbe6",
+          "subject": "Add startup memory census and opt-in phase diagnostics",
+          "body": "Report live, reserved, split and external GPU memory per PP/TP rank\nafter loading and profiling. Keep the recipe debug switches usable with\nthe V2 runner and native DSpark, with bounded host timing and optional\nworker kernel profiling. Synchronize only for explicit timing diagnostics.\n\nOrigin: r6; dsv41reap-pp; new\nUpstream: none"
+        },
+        {
+          "patch": "0015",
+          "commit": "77b9d6c1c02ced0fd93484049e0446b9d6bc39cb",
+          "subject": "Add opt-in vocabulary-parallel sampling for V4.1 DSpark",
+          "body": "Keep target and draft head logits sharded for greedy and seeded Gumbel\nsampling. Merge bounded top-k/nucleus candidates only when coverage is\ncertified, otherwise retain the dense batch path. Compute rejection token\nprobabilities and residual draws with scalar reductions and local logits.\n\nShare request seeds, preserve raw local proposal caches, and materialize\nthem for unsupported batches. Include CPU math gates, GPU integration\nchecks, and a four-rank sampling-stage benchmark. Defaults are unchanged.\n\nOrigin: Local offline TP4 sampling implementation\nUpstream: Not submitted; requires GPU qualification and human review"
+        }
+      ]
+    },
+    {
+      "patch": "0007-Port-SM80-mHC-kernels-and-prefill-MoE-chunking.patch",
+      "subject": "Port SM80 mHC kernels and prefill MoE chunking",
+      "body": "Origin: r17 vLLM patches 0019, 0020, 0025.\n\nSource port for vLLM v0.34.0. Existing notices and SPDX headers are retained.",
+      "r17_sources": [
+        {
+          "patch": "0019",
+          "commit": "18b39453207569b6966afc2b2febb9eb91ecd92c",
+          "subject": "Pipeline opt-in SM80 EXL3 prefill compute and reductions",
+          "body": "Move only the final MoE reduction out of the fused runner and pipeline balanced token chunks with PyNCCL on a side stream. Restrict the path to SM80 TP4 EXL3 without EP, DP or ubatching; serialize decode and capture. Provide a strict live-layer parity gate.\n\nOrigin: Local TP4 prefill overlap experiment\n\nUpstream: Not submitted; operator GPU validation pending\n\n\nSigned-off-by: Adrien Brault <adrien.brault@gmail.com>"
+        },
+        {
+          "patch": "0020",
+          "commit": "ea41e5a737220edabbdb1902e05deff3e479a643",
+          "subject": "Add opt-in SM80 kernels for delayed mHC decode seams",
+          "body": "Fuse post mapping with a SIMT split-K projection and use a vectorized\ncarried-mix RMSNorm epilogue for V4.1 decode rows. Add tiled standalone\npost, fixed configuration selection, CPU arithmetic checks and an offline\nGPU correctness/graph benchmark and tuner. Keep the existing path by\ndefault and for large rows. GPU qualification is pending.\n\nOrigin: dsv41-mhc-r14\nUpstream: Not submitted; SM80 hardware qualification pending"
+        },
+        {
+          "patch": "0025",
+          "commit": "9e08c43ff5f13efe2cac13c9f18b7d1eda05d2e8",
+          "subject": "Preserve FP32 projection values at the SM80 fused mHC seam",
+          "body": "The upstream fused post/pre projects the FP32 post-mix registers while storing BF16 residual streams. Rounding those registers before projection adds coefficient error that cannot be fixed by changing the gate tolerance. Follow the upstream dispatch decision so the separate post/pre range still projects BF16.\n\nValidate against a float64 oracle, retain both sides of failed comparisons in the GPU gate, and cover the fused-to-separate boundary with CPU interpretation of the Triton bodies. GPU qualification remains pending.\n\nOrigin: dsv41-gatefix-r19\nUpstream: Not submitted; SM80 hardware qualification pending"
+        }
+      ]
+    },
+    {
+      "patch": "0008-Port-whole-request-TP4-microbatching-and-capture.patch",
+      "subject": "Port whole-request TP4 microbatching and capture",
+      "body": "Origin: r17 vLLM patches 0021.\n\nSource port for vLLM v0.34.0. Existing notices and SPDX headers are retained.",
+      "r17_sources": [
+        {
+          "patch": "0021",
+          "commit": "d38f4de3cb927f855771eb12937e11fc2b09c2a4",
+          "subject": "Overlap whole-request V4.1 TP4 verify microbatches with upstream DBO",
+          "body": "Keep non-causal DSpark queries intact; pack ragged rows into stable half-batch buffers for FULL graphs and use event-ordered TP reductions on the DBO communication stream. Isolate indexer, Engram and MTP state and add an optional live output gate.\n\nOrigin: dsv41 overlap round r17\nUpstream: local opt-in SM80 experiment"
+        }
+      ]
+    },
+    {
+      "patch": "0009-Port-INT8-TP4-IPC-all-reduce-and-register-local-envs.patch",
+      "subject": "Port INT8 TP4 IPC all-reduce and register local envs",
+      "body": "Origin: r17 vLLM patches 0015, 0020, 0021, 0022.\n\nSource port for vLLM v0.34.0. Existing notices and SPDX headers are retained.",
+      "r17_sources": [
+        {
+          "patch": "0015",
+          "commit": "77b9d6c1c02ced0fd93484049e0446b9d6bc39cb",
+          "subject": "Add opt-in vocabulary-parallel sampling for V4.1 DSpark",
+          "body": "Keep target and draft head logits sharded for greedy and seeded Gumbel\nsampling. Merge bounded top-k/nucleus candidates only when coverage is\ncertified, otherwise retain the dense batch path. Compute rejection token\nprobabilities and residual draws with scalar reductions and local logits.\n\nShare request seeds, preserve raw local proposal caches, and materialize\nthem for unsupported batches. Include CPU math gates, GPU integration\nchecks, and a four-rank sampling-stage benchmark. Defaults are unchanged.\n\nOrigin: Local offline TP4 sampling implementation\nUpstream: Not submitted; requires GPU qualification and human review"
+        },
+        {
+          "patch": "0020",
+          "commit": "ea41e5a737220edabbdb1902e05deff3e479a643",
+          "subject": "Add opt-in SM80 kernels for delayed mHC decode seams",
+          "body": "Fuse post mapping with a SIMT split-K projection and use a vectorized\ncarried-mix RMSNorm epilogue for V4.1 decode rows. Add tiled standalone\npost, fixed configuration selection, CPU arithmetic checks and an offline\nGPU correctness/graph benchmark and tuner. Keep the existing path by\ndefault and for large rows. GPU qualification is pending.\n\nOrigin: dsv41-mhc-r14\nUpstream: Not submitted; SM80 hardware qualification pending"
+        },
+        {
+          "patch": "0021",
+          "commit": "d38f4de3cb927f855771eb12937e11fc2b09c2a4",
+          "subject": "Overlap whole-request V4.1 TP4 verify microbatches with upstream DBO",
+          "body": "Keep non-causal DSpark queries intact; pack ragged rows into stable half-batch buffers for FULL graphs and use event-ordered TP reductions on the DBO communication stream. Isolate indexer, Engram and MTP state and add an optional live output gate.\n\nOrigin: dsv41 overlap round r17\nUpstream: local opt-in SM80 experiment"
+        },
+        {
+          "patch": "0022",
+          "commit": "5b581ec8ad78d1e8acea9fd308519c60a31184ec",
+          "subject": "Add opt-in two-shot INT8 TP4 IPC all-reduce on SM80",
+          "body": "Quantize finite BF16 partials in blocks of 256 with FP32 scales. Reduce rank-owned quarters in FP32, requantize and gather the quarters. Reuse the CUDA IPC allocation API with dedicated buffers and device epochs so graph replays cannot overwrite unread payloads. Include an independent codec and absolute error-budget CPU test.\n\nOrigin: dsv41 overlap round r17\nUpstream: local numerics-changing experiment"
+        }
+      ]
+    },
+    {
+      "patch": "0010-Port-post-r17-serving-layers.patch",
+      "subject": "Port post-r17 serving layers",
+      "body": "Origin: installed served-minus-pin Python export for sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27.\n\nCarries the image's host adaptive verify width, INT8 prefill, true ring, dense rank-1 LoRA, VL mappings, eager overlap and BF16 mHC rounding. The installed Python export supplies the served-minus-pin delta.",
+      "r17_sources": []
+    }
+  ],
+  "folded": {
+    "0010": "Upstream per-layer lookup iterates group.layer_names, including the empty projection case.",
+    "0014": "Source-only qualification tooling outside the Python serving delta.",
+    "0024": "Source-only gate fixture outside the Python serving delta.",
+    "0025": "Final mHC behaviour comes from the later BF16 rounding overlay; no other landed Python delta is present."
+  }
+}

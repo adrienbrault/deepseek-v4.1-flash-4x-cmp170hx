@@ -1,0 +1,4 @@
+{
+  "src/vllm_exl3/exl3.py": "a8987f6e6c5ca92fed2b0d86c2ab7ed632cc84d357605b51bfad2ba6b6760303",
+  "src/vllm_exl3/coop_kernel.py": "ce7e37df66fd6489b0a7f9a9d29da1ba0340629b0d4197c665fe1a0fb944e73a"
+}

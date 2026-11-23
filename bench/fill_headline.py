@@ -4,7 +4,7 @@
 # dependencies = ["matplotlib>=3.9"]
 # ///
 # SPDX-License-Identifier: MIT
-"""Export headline-report/2 into sanitized results, README, figures and card data."""
+"""Export r7f/r7g headline-report/2 into sanitized results, figures and card data."""
 import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -251,7 +251,8 @@ def move_fixed_reference(markdown):
 def card_data(base, s, result_dir):
     card = deepcopy(base); ready = s['publication_ready']; cells = s['cells']
     agent = [cells.get(spec_key('subset', c), {}) for c in CS]
-    _, peak1 = peak_cell(cells, 1); _, peak8 = peak_cell(cells, 8)
+    peak1_key, peak1 = peak_cell(cells, 1); peak8_key, peak8 = peak_cell(cells, 8)
+    short_code = [cells.get(code_key(1024, 2048, c), {}) for c in CS]
     depth = [cells.get(code_key(65536, 8192, c), {}) for c in (4, 8)]
     cold = s['cold_prefill']; cold_peak = max(cold['cells'], key=lambda r: r['input_tok_s'])
     value = lambda r, k: round(r[k], 1) if ready else None
@@ -263,30 +264,39 @@ def card_data(base, s, result_dir):
         headline=dict(results=result_dir, configuration=s['configuration'], cells=cells,
                       ratios=s['ratios'], subset=s['subset'], cold_prefill=cold,
                       report_sha256=s.get('report_sha256', ''), source_key=s.get('source_key', '')))
-    card['one'] = dict(agents=1, precision=1, metric='tok/s per stream · T=0',
-        kinds=[['Spec-Bench', value(agent[0], 'per_stream_tok_s'), '120 prompts'],
-               ['code peak', value(peak1, 'per_stream_tok_s'), 'cached code']],
-        rate=value(agent[0], 'per_stream_tok_s'), ttft=display(agent[0], 'ttft_p50_ms')+' ms',
+    card['one'] = dict(agents=1, precision=1, matchChart=True, metric='throughput · tok/s',
+        kinds=[['Spec-Bench', value(agent[0], 'output_tok_s'), 'wall output'],
+               ['Code 1K cached', value(short_code[0], 'aggregate_tok_s'), 'decode sum · 2K append']],
+        rate=value(agent[0], 'output_tok_s'), ttft=display(agent[0], 'ttft_p50_ms')+' ms',
         kindsNote='Spec-Bench 256 tokens · cached code 400 tokens')
-    card['many'] = dict(agents=8, sum=value(agent[2], 'output_tok_s'), each=value(agent[2], 'per_stream_tok_s'),
-        ttft=display(agent[2], 'ttft_p50_ms')+' ms', metric='Spec-Bench · output tok/s',
-        eachLabel='tok/s per stream · Spec-Bench')
+    card['many'] = dict(agents=8, precision=1, sum=value(agent[2], 'output_tok_s'),
+        each=value(agent[2], 'per_stream_tok_s'), ttft=display(agent[2], 'ttft_p50_ms')+' ms',
+        metric='Spec-Bench · wall output', eachLabel='tok/s per stream',
+        style='lines', seriesLabel='Spec-Bench · wall output')
     card['conc'] = dict(x=list(CS), sum=[value(r, 'output_tok_s') for r in agent],
-        each=[value(r, 'per_stream_tok_s') for r in agent])
+        each=[value(r, 'per_stream_tok_s') for r in agent],
+        peak=dict(label='Code 1K cached · decode sum',
+                  sum=[value(r, 'aggregate_tok_s') for r in short_code],
+                  each=[value(r, 'per_stream_tok_s') for r in short_code]))
     card['depth'] = dict(src='2026-11-16 · suite v2 · cold c1', prefillLabel='cold prefill, tok/s',
         prefill=[[r['prompt_tokens'], r['input_tok_s']] for r in cold['cells'] if r['concurrency'] == 1], decode=[],
         decodeNote=[display(depth[1], 'per_stream_tok_s')+' tok/s each', '64K+8K · 8 agents · 400 tokens'])
     card['setup'] = [[f'64K+8K · {c} agents',
         f'{display(r,"per_stream_tok_s")} each · {display(r,"aggregate_tok_s")} sum · {latency(r)} first token']
         for c, r in zip((4, 8), depth)]
-    card['evals'] = dict(kind='peaks', note='', items=[
-        [display(peak8, 'aggregate_tok_s'), 'code tok/s · 8 agents'],
-        [display(peak1, 'per_stream_tok_s'), 'code tok/s · 1 agent'],
+    def peak_label(key, agents):
+        prefix, append = next((p, a) for p, a in CONTEXTS if code_key(p, a, agents) == key)
+        count = '1 agent' if agents == 1 else f'{agents} agents'
+        return f'{count} · {prefix//1024}K + {append//1024}K'
+    card['evals'] = dict(kind='peaks', note='tok/s · decode sum', items=[
+        [display(peak8, 'aggregate_tok_s', 1), peak_label(peak8_key, 8)],
+        [display(peak1, 'aggregate_tok_s', 1), peak_label(peak1_key, 1)],
         [peak_text, 'cold prefill tok/s · c8', cold['date_utc']]])
-    card['facts'] = [[display(agent[2], 'output_tok_s'), 'Spec-Bench tok/s · 8 agents'],
-        [display(peak1, 'per_stream_tok_s'), 'peak code tok/s · 1 agent'],
-        [display(peak8, 'aggregate_tok_s'), 'peak code tok/s · 8 agents'], [peak_text, 'peak cold prefill tok/s · c8']]
-    card['kpis'] = [card['facts'][0], [display(agent[0], 'per_stream_tok_s'), 'Spec-Bench per stream · 1 agent'],
+    card['facts'] = [[display(agent[2], 'output_tok_s', 1), 'Spec-Bench wall tok/s · 8 agents'],
+        [display(peak1, 'aggregate_tok_s', 1), 'peak code tok/s · '+peak_label(peak1_key, 1)],
+        [display(peak8, 'aggregate_tok_s', 1), 'peak code tok/s · '+peak_label(peak8_key, 8)],
+        [peak_text, 'peak cold prefill tok/s · c8']]
+    card['kpis'] = [card['facts'][0], [display(agent[0], 'output_tok_s', 1), 'Spec-Bench wall tok/s · 1 agent'],
         [display(agent[2], 'ttft_p50_ms')+' ms', 'first token p50 · 8 agents'], *card['facts'][1:]]
     card['provenance'] = dict(sourceRun='headline-pack-r1; '+s['configuration'],
         recipeResults='https://'+card['repo']+'/tree/main/'+result_dir, inputsSha256=s['subset'].get('full_rows_sha256', ''),

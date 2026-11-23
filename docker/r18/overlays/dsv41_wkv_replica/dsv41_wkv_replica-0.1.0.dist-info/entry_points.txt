@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_wkv_replica = dsv41_wkv_replica:register

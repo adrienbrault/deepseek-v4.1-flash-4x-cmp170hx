@@ -35,3 +35,8 @@ sudo python3 bench/cpu-clock-screen.py --restore results/cpu-original.json
 DECODE_PROBE_SEED=15 DECODE_PROBE_WARMUP=1 DECODE_PROBE_OUT=results/c4.jsonl python3 bench/decode-probe.py 8001 400 3 4 prose
 python3 bench/cpu-clock-screen.py --check-only
 ```
+
+
+## Headline figures
+
+The [2026-11-24 cached-code and Spec-Bench summary](results/2026-11-24-current-r18b-headline/) uses the published x16 ledger values. The detailed x16 report is unavailable locally. Regenerate its SVGs with `python3 bench/plot.py --headline bench/results/2026-11-24-current-r18b-headline/summary.json` from the repository root with Matplotlib installed. `fill_headline.py` is the r7f/r7g exporter for a full `headline-report/2` and the historical README marker layout.

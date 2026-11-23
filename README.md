@@ -1,187 +1,126 @@
-# DeepSeek-V4.1-Flash on 4x CMP 170HX
+# DeepSeek-V4.1-Flash on four CMP 170HX cards
 
-![Recipe card: Spec-Bench real work, cached-code peaks and parallel agents at 64K depth on four CMP 170HX cards, 2026-11-16][card]
+![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-160aceb9.png)
 
-Serving configuration, [patch series][patches], [runtime overlays][overlays] and [measurements][results] for [DeepSeek-V4.1-Flash-1017][model] on four NVIDIA CMP 170HX cards (GA100, `sm_80`, 64 GB each after the memory unlock). The single-socket host uses an EPYC 7401P and NVMe-backed Engram tables. Historical summaries recorded 46 GB host RAM; the current export records the container limit, with host capacity unverified. All four cards use PCIe Gen2 x16 links and a 175 W cap per card. Tensor parallelism spans all four GPUs.
+Serving configuration, image sources, launch settings and benchmarks for DeepSeek-V4.1-Flash-1017 on four NVIDIA CMP 170HX cards.
 
-The selected serving definition is **current-r7f**, selected on 2026-11-16 at 18:25 UTC (19:25 Paris). It adds a 52 GiB container memory limit to current-r7e, with identical kernels and model. Current-r7e adds the bitwise eager prefill MoE schedule to r7d. The raw model is `deepseek-v4.1-flash-1017`; the [per-request rank-one adapter][ablit] exposes `deepseek-v4.1-flash-1017-abliterated`. Weights and adapters remain external. Serving is stopped between measurement chains; this is the selected definition, rather than a live-service audit.
+**Goal.** Run many coding agents from one desktop box. Four-way tensor parallelism fits the model across the GPUs, prefix caching reuses the code agents have already sent, and fair prefill gives long appends and ongoing generations time to run together. The two Engram tables live on NVMe to stay within the host RAM budget.
 
-The stack combines pinned [vLLM df3bd094][engine], [EXL3 EAQ v1.1 2.9 bpw routed experts][eaq], official FP8/MXFP4 components, [DSpark][dspark] K5, the [fixed640 cooperative kernel][native], the exact bounded indexer with its read-only k1b library, the [single-bank decode MoE stack][moe-stack] and the [workspace-borrowing eager prefill schedule][prefill-code]. The [reproduction guide][reproduce] lists the retained source and model-pin gaps. The [launcher][serve] prints a plan without Docker by default and refuses execution while those gaps remain unresolved.
+- **Model.** DeepSeek-V4.1-Flash-1017 with EXL3 EAQ v1.1 routed experts at 2.9 bits per weight. The official checkpoint supplies attention, shared experts, the output head, the DSpark drafter and Engram. [Model and quantization pins](THIRD_PARTY.md)
+- **Engine.** Patched vLLM 0.34.0 on four memory-unlocked 64 GB Ampere GPUs. The headline run used PCIe Gen2 x16 and a configured 175 W cap on every card. [Serving plan](config/served.json)
+- **Window and KV pool.** Up to 262,144 prompt-plus-output tokens per request, with eight active sequence slots. The FP8 KV pool held 2,483,207 tokens at the 2026-11-20 serving acceptance on the same image with one GPU at x8. [Pool record](config/served.json)
+- **Enabled features.** DSpark speculative decoding, prefix caching, fair prefill, images, reasoning and tool calls. The API also exposes separate model names for a rank-one adapter and opt-in sampling policies. [Served configuration](#served-configuration)
 
 ## Numbers
 
-[headline-begin]: #
+The 2026-11-24 UTC headline covers the base model name on `current-r18b`, on one boot with all four cards at x16. Spec-Bench uses 120 prompts and 256 forced output tokens per request. Cached code uses 400 forced output tokens and seed 15. Both use temperature zero. [Results and protocol][headline]
 
-Measured 2026-11-16 UTC on **current-r7f**, TP4, four CMP 170HX cards at 175 W per card, EAQ 2.9 bpw routed experts and four PCIe Gen2 x16 links. [Results and protocol](bench/results/2026-11-16-current-r7f-headline/NOTES.md), [numeric records](bench/results/2026-11-16-current-r7f-headline/summary.json). Only `deepseek-v4.1-flash-1017` is timed; the abliterated and opt-in fast names are excluded.
+![Spec-Bench wall output, per-stream rate and first-token latency at one, four and eight streams](docs/img/headline-agent.svg)
 
-![Spec-Bench real-work throughput and first-token latency](docs/img/headline-agent.svg)
+- **Spec-Bench.** One agent produces 137.4 output tok/s over benchmark wall time. Eight reach 291.8 tok/s over wall time, with a 357.5 ms median time to first token. [Spec-Bench results][headline]
 
-- **Real work:** Spec-Bench frozen 120-prompt subset, 256 forced output tokens, T=0 and all arrivals at once subject to c1/c4/c8. At eight agents: output 291.4 tok/s over benchmark wall, 40.0 tok/s per stream and TTFT p50/p99 363.3 / 1,109.6 ms.
-- **Code peaks:** highest measured c1 stream 265.6 tok/s (`code-shared-t65536-a8192-c1`); highest c8 sum 439.7 tok/s (`code-shared-t1024-a2048-c8`). Cached code, 400 forced tokens, T=0 and seed 15; measured common decode window with no interleaved prefill.
-- **Parallel agents at depth:** 64K cached code plus an 8K append, eight agents, 400 forced tokens, T=0 and seed 15: 50.5 tok/s each, 404.3 tok/s sum and 11.287 s first token p50. The four-agent row and the 32K+2K companions are below.
-- **Dated cold prefill:** 2026-11-16 UTC, r7e suite v2, nominal 2K/8K prompts at c1/c4/c8, one output token, T=0, thinking off, zero prompt-cache hits and warm-steady host page cache. Peak input rate 3,961 tok/s at 8,192 tokens and c8; r7f uses the same kernels. [Fixed-work reference](#loaded-suite-v2-2026-11-16-utc).
+![Cached-code decode and append latency at 1K, 32K and 64K shared prefix lengths](docs/img/headline-code.svg)
 
-### Real agent work
+- **Cached code.** With a 1K cached prefix and a 2K append, one agent decodes at 250.5 tok/s and eight reach a measured sum of 477.1 tok/s. The highest one-agent decode rate is 260.6 tok/s with a 64K prefix and an 8K append. [Cached-code results][headline]
+- **Eight agents at 64K.** With an 8K append per agent, decode runs at 57.0 tok/s per stream and 456.3 tok/s summed. The median first token arrives in 14.00 s. [Cached-code results][headline]
 
-Output rate divides completion tokens by client wall time; per-stream rate is 1000 / TPOT p50. TTFT includes HTTP, scheduling and first decode. Spec-Bench TTFT is not a cold-prefill speed. DSpark acceptance length follows the source recorded per cell.
+## Quick start
 
-| streams | output tok/s, wall | per-stream tok/s | TTFT p50 / p99, ms | DSpark acceptance length |
+Inspect the exported plan with Python 3.10 or later. It prints the container configuration, model inputs and vLLM arguments without starting Docker.
+
+```sh
+bash scripts/serve.sh --print
+cp scripts/host.env.example scripts/host.env
+# Set the local input directories in scripts/host.env.
+bash scripts/serve.sh --check
+```
+
+The engine runs on Linux with Docker and the NVIDIA runtime. This source export still requires the authenticated launch and native build inputs. The local launcher reports those prerequisites in `--check` and refuses `--run`. The build recipe, image identity and remaining inputs are in the [reproduction guide](docs/REPRODUCING.md).
+
+## Full results
+
+### Spec-Bench
+
+The 2026-11-24 UTC run used the 120-prompt subset, 256 forced output tokens, temperature zero and the base name on current-r18b. Wall output includes scheduling, prefill, decode and request turnover. Per-stream rate uses median time per output token. [Results][headline]
+
+| Streams | Wall output tok/s | Per-stream tok/s | TTFT p50 / p99 | DSpark acceptance length |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 138.6 | 159.4 | 211.7 / 516.1 | 3.10 |
-| 4 | 244.1 | 66.2 | 290.2 / 785.3 | 2.79 |
-| 8 | 291.4 | 40.0 | 363.3 / 1,109.6 | 2.45 |
+| 1 | 137.4 | 155.8 | 207.6 / 534.0 ms | 3.10 |
+| 4 | 240.0 | 67.0 | 293.6 / 714.2 ms | 2.77 |
+| 8 | 291.8 | 39.3 | 357.5 / 882.8 ms | 2.40 |
 
-The same calibration also measures all 480 prompts with the same sampler and output length:
+### Cached code
 
-| streams | full-480 output tok/s | full-480 per-stream tok/s | TTFT p50 / p99, ms | acceptance length |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 137.9 | 160.2 | 208.6 / 504.6 | 3.09 |
-| 4 | 243.1 | 67.2 | 294.7 / 651.5 | 2.80 |
-| 8 | 290.1 | 39.0 | 358.7 / 703.6 | 2.43 |
+The 2026-11-24 UTC run used a shared, verified cached prefix, a fresh append per request and one batch per cell. Each request used temperature zero, seed 15 and 400 forced output tokens on current-r18b. Decode sum and mean are measured over the common decode window. [Results][headline]
 
-### Cached code matrix
-
-Frozen code tasks reuse a shared cached 1K+2K, 32K+2K or 64K+8K context and append, with 400 forced output tokens, T=0, seed 15 and EOS suppression. Every request confirms prefix residency. The aggregate sums measured stream rates inside the common decode interval; per-stream is their arithmetic mean. Append TTFT describes a separate phase of the same request.
-
-![Cached-code peaks, parallel agents and append TTFT at depth](docs/img/headline-code.svg)
-
-| cached context + append | streams | mean per-stream tok/s | decode sum tok/s | append TTFT p50 / p99, ms |
+| Cached prefix + append | Streams | Mean per-stream tok/s | Measured decode sum tok/s | Append TTFT p50 |
 | --- | ---: | ---: | ---: | ---: |
-| 1K + 2K | 1 | 255.7 | 255.7 | 810.6 / 810.6 |
-| 1K + 2K | 4 | 106.0 | 424.1 | 2,426.8 / 3,045.5 |
-| 1K + 2K | 8 | 55.0 | 439.7 | 3,010.5 / 4,749.8 |
-| 32K + 2K | 1 | 261.3 | 261.3 | 868.3 / 868.3 |
-| 32K + 2K | 4 | 100.5 | 402.2 | 2,359.4 / 2,942.8 |
-| 32K + 2K | 8 | 52.3 | 418.0 | 3,512.9 / 5,409.8 |
-| 64K + 8K | 1 | 265.6 | 265.6 | 2,712.6 / 2,712.6 |
-| 64K + 8K | 4 | 96.9 | 387.6 | 6,622.2 / 9,885.4 |
-| 64K + 8K | 8 | 50.5 | 404.3 | 11,286.6 / 19,581.4 |
-
-Code cells contain one batch per point; p99 over 1, 4 or 8 requests is descriptive. Forced outputs can continue beyond a finished function; no code correctness score is implied.
-
-### Subset calibration
-
-The frozen subset contains 20 prompts in each of six strata. Calibration date: 2026-11-16 UTC, current-r7f. Each 120/480 pair shares a boot; the c1 pair and c4/c8 pairs use separate boots. Routine measurements use one boot and retain the matching calibration. Ratios are subset / full; flags outside 0.98–1.02 are descriptive.
-
-| streams | output ratio | per-stream ratio | TTFT p50 ratio | TTFT p99 ratio | acceptance ratio |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1.0053 | 0.9945 | 1.0150 | 1.0227 FLAG | 1.0059 |
-| 4 | 1.0040 | 0.9853 | 0.9845 | 1.2054 FLAG | 0.9936 |
-| 8 | 1.0045 | 1.0245 FLAG | 1.0129 | 1.5769 FLAG | 1.0083 |
-
-[headline-end]: #
+| 1K + 2K | 1 | 250.5 | 250.5 | 0.76 s |
+| 1K + 2K | 4 | 106.8 | 427.3 | 1.78 s |
+| 1K + 2K | 8 | 59.6 | 477.1 | 2.84 s |
+| 32K + 2K | 1 | 256.6 | 256.6 | 0.83 s |
+| 32K + 2K | 4 | 103.6 | 414.4 | 2.04 s |
+| 32K + 2K | 8 | 54.7 | 437.7 | 3.22 s |
+| 64K + 8K | 1 | 260.6 | 260.6 | 2.59 s |
+| 64K + 8K | 4 | 99.7 | 398.7 | 7.92 s |
+| 64K + 8K | 8 | 57.0 | 456.3 | 14.00 s |
 
 ## Served configuration
 
-| item | current-r7f |
+The [parameterized plan](config/served.json) records current-r18b, installed image `sha256:f3027769f90387db0c6f6d0cbd2f05348a8e74023094f9c0d4ec4946d1ea206c`, and seal `seal-nORCnYLm`.
+
+| Item | Setting |
 | --- | --- |
-| runtime | [vLLM][vllm] [df3bd094aeea829f27baa0a5282830464f601d9f][engine], installed image ID `sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27` |
-| weights | [EAQ v1.1 EXL3 2.9 bpw routed experts][eaq]; [official attention, shared experts, head, draft and Engram components][model] |
-| parallelism | TP4, PP1; four CMP 170HX cards |
-| power and bus | 175 W per GPU; PCIe Gen2 x16 on each GPU |
-| Engram | NVMe row reads, [fused dequantization, early prefetch and bounded host row cache][engram] |
-| request window | 262,144 tokens configured |
-| scheduling | eight sequences; 2,048 batched tokens; async scheduling and prefix caching |
-| graphs | FULL_DECODE_ONLY; capture sizes every integer from 1 through 48; LoRA specialization disabled |
-| speculation | [DSpark][dspark] maximum five draft tokens; adaptive verification disabled; [calibrated row-mask features][depth] only through batch one |
-| KV | `fp8_ds_mla`; FP8 indexer |
-| attention | [tuned BF16x2 split-K table][splitk], [fused SWA metadata and top-k glue][attention]; exact bounded indexer top-k enabled |
-| communication | true ring at the [r7 row list][served-plan]; existing INT8 prefill reduction; [replicated Engram wkv][wkv] |
-| MoE | [fused dispatch preparation][dispatch], [fixed640 native cooperative kernel][native] and [rows-family kernels for 24 row counts plus K2 fixed16][moe-stack]; STACK only during eligible target decode graph capture, single bank; [bitwise 7b eager prefill schedule][prefill-code] at 128–2,048 rows, borrowed incumbent workspace, decode graph path retained |
-| API | DeepSeek tokenizer, tool and reasoning parsers; raw default plus the [per-request abliterated name][ablit] |
-| chat | earlier reasoning preserved with `drop_thinking=false`; image count limit 999 |
-| container memory | `--memory=55834574848 --memory-swap=55834574848`: 52 GiB, container swap disabled |
-| host | GPU workers pinned to their card's local CPUs; engine/API affinity retained |
-| other policies | fair prefill and prompt lookup disabled; client sampling defaults unchanged |
+| Parallelism | Tensor parallel 4, pipeline parallel 1. Workers use CPUs local to each GPU. |
+| Request and cache | 262,144 tokens per request, 8 sequence slots, fixed `fp8_ds_mla` cache with 128-token blocks and an FP8 sparse indexer. GPU memory utilization is configured at 0.98. |
+| Scheduling | Async scheduling, prefix caching and a 2,048-token batch budget. Fair prefill caps work for long prefills beside active decoders. A short request can share part of a long prefill's budget, including requests using the adapter. |
+| Speculative decode | DSpark drafts up to five tokens. The host verification policy caps uniform decode verification width at three for batches of seven or more. [Policy](config/adaptive-verify.json) |
+| GPU execution | Decode CUDA graphs with LoRA specialization disabled, exact bounded indexer, tuned SM80 sparse attention and ring all-reduce. |
+| Engram | NVMe-backed row reads with fused dequantization, prefetch and a bounded host row cache. |
+| Memory and power | 52 GiB container memory cap with container swap disabled. 175 W configured per card. |
+| API | OpenAI-compatible interface with DeepSeek's tokenizer, tool and reasoning parsers. The server preserves prior reasoning and includes request timing and speculation metrics. |
+
+The default API name is `deepseek-v4.1-flash-1017`. The `-abliterated` suffix selects the rank-one adapter per request. The two `-fast` names opt into a separate per-name sampling policy. All headline measurements use the default name.
 
 ## What the stack is
 
-The base r17 image kit supplies SM80 sparse attention, SSD Engram storage, [ExLlamaV3][exl3] integration through [vllm-exl3][vllm-exl3] and tensor-core prefill support on the pinned nightly. The installed f760 image contains later layers; rebuilding the r17 kit alone does not reproduce it. The [ordered patch documentation][patches] gives each exported patch's purpose, target and base, with links into [`patches/vllm/`][vllm-patches], [`patches/vllm-exl3/`][exl3-patches], [`patches/native/`][native], [`patches/engram/`][engram] and [`patches/splitk/`][splitk]. **vllm-exl3 is AGPL-3.0-only**; its [licence][agpl], [NOTICE][notice] and [third-party notices][third-party] apply to the modified integration.
+The recipe starts from [vLLM 0.34.0](https://github.com/vllm-project/vllm/tree/62d4bc3c7e33b1b6c906e233e6af2d3506c482ca). The image recipe ports the Ampere sparse attention, Engram and EXL3 changes to that release and installs the runtime plugins and native libraries in the image. It keeps the tuned attention table, model view and host policy as separate inputs. The [patch series](docs/PATCHES.md) gives the application order and targets. The [Dockerfile](docker/r18/Dockerfile) describes the build from the pinned Linux image.
 
-The runtime adds the [split-K precision table][splitk], [cap-1 depth bridge][depth], [target][target-argmax] and [draft sharded argmax][draft-argmax], [attention metadata fusions][attention], [lean row statistics][rowstats], [replicated wkv][wkv], [fused dispatch][dispatch] and expanded true-ring rows. The [r7a plugin][ablit] binds the dense rank-one update per request. R7b supplies the [fixed640 native series][native]; r7c adds exact bounded indexer top-k with the read-only k1b native library. R7d adds the [single-bank MoE stack][moe-stack], retaining the incumbent graph descriptor set and eager functions outside eligible capture forwards. R7e adds the bitwise eager prefill schedule with its borrowed workspace, native-profile identity check, capture fences and fixed boot switch. R7f raises only the container memory and memory-swap values from 36 to 52 GiB. The bounded plugin, measured STACK/7b native bundles and native baseline remain explicit [source gaps][reproduce]. The [source inventory][inventory] records exported hashes; [provenance][provenance] and [third-party inputs][third-party] record their origins and unresolved pins.
+The two Engram lookup tables occupy about 203 GB and their rows are read from NVMe as needed. The model's sparse attention, Engram and DSpark are described in the [DeepSeek technical report][report]. The EXL3 integration uses [vllm-exl3][exl3], which remains **AGPL-3.0-only**. [Third-party pins and licences](THIRD_PARTY.md)
 
-The model's DSpark, sparse attention and Engram components are described in the [DeepSeek-V4.1 technical report][report] and [official inference source][dspark]. The [sibling Qwen3.8-Flash-Next recipe for two CMP 170HX cards][qwen-cmp] records the same card family on a different model and serving stack.
+## How the numbers are measured
 
-## Loaded suite v2, 2026-11-16 UTC
+- **Spec-Bench** submits the same 120 stratified prompts at concurrency 1, 4 and 8. Output throughput divides generated tokens by client wall time. The per-stream figure is 1,000 divided by median time per output token in milliseconds. The benchmark supplies no measured decode sum. First-token latency includes client and server request handling. [2026-11-24 notes][headline]
+- **Cached code** reuses a warmed code prefix and sends a fresh append. The client checks that every stream hits its cached prefix. The aggregate sums the rates measured in the window when all streams are decoding, and the per-stream column gives their mean. Append TTFT measures from send to first token independently of decode. [2026-11-24 notes][headline]
+- **Acceptance length** is one plus accepted draft tokens per draft. The Spec-Bench number describes the workload as measured. Cached code uses one batch per cell, so single-stream peaks are specific to the supplied tasks. Forced outputs measure serving speed without scoring code correctness. [2026-11-24 notes][headline]
 
-Loaded suite v2 remains the dated reference for fixed-work comparisons. The same-hour r7d/r7e run was measured on 2026-11-16 at 11:04–11:35 UTC, run `20261116T110411Z-1955810-suite-r7e`: one boot per definition, TP4, four Gen2 x16 links at 175 W per card. R7f changes only the memory cap; these are measurements of r7e. [Results and protocol](bench/results/2026-11-16-current-r7e-suite/NOTES.md), [summary](bench/results/2026-11-16-current-r7e-suite/summary.json).
+## Output checks and caveats
 
-Decode uses frozen `decode-prompts-v2` chat prompts, mostly reasoning prose before code, 400 output tokens per request, temperature zero, seed 15 and EOS suppression. Each batch sums measured request decode rates, `(completion_tokens - 1) / (stream_end - first_content_event)`, then the boot averages scored batches. Individual stream statistics and shared-overlap-window decode are unavailable in this suite summary.
+- **GPU and network scope.** The 2026-11-20 acceptance of the r18b image preserved base-name token identity in the mixed-adapter test and confirmed prefix isolation. The adapter's text could vary with neighbouring requests. Those checks ran against the local serving endpoint. [Acceptance and promotion](docs/HISTORY.md)
+- **Longer appends.** The 2026-11-24 x16 headline measured higher eight-stream cached-code decode sums than the 2026-11-16 r7f x16 baseline. The eight-stream 64K + 8K append also took longer to reach its first token. Both runs used temperature zero, seed 15 and 400 forced output tokens for cached code. Spec-Bench wall throughput was equal within noise. [Run comparison][headline]
+- **Evidence scope.** The retained x16 headline is a summary of the run, with code p99, counters, raw rows and headline memory measurements unavailable. The device power values are configured caps. The [measurement notes][headline] and [instrument guide](docs/GOTCHAS.md) describe the boundaries of the results.
 
-| streams / protocol | r7e decode aggregate, tok/s | r7d same-hour reference | r7e step, ms |
-| --- | ---: | ---: | ---: |
-| 1 ordered | 166.9 | 168.0 | 18.82 |
-| 4 ordered | 370.1 | 370.5 | 32.16 |
-| 8 burst | 456.7 | 454.3 | 44.69 |
+## Other configurations
 
-Prefill uses nominal 2K/8K prompts, one output token, temperature zero, thinking off, zero prompt-cache hits and warm-steady host page cache. These are suite-v2 input rates, separate from the headline append TTFT measurement.
+The [serving history](docs/HISTORY.md) records promotion decisions and links to the previous benchmark sets. Cold prefill changed with the scheduler, so the table below is a historical reference.
 
-| nominal prompt tokens | streams | r7e input tok/s | r7d same-hour reference |
-| ---: | ---: | ---: | ---: |
-| 2,048 | 1 | 2,946 | 2,800 |
-| 2,048 | 4 | 3,340 | 3,176 |
-| 2,048 | 8 | 3,648 | 3,413 |
-| 8,192 | 1 | 3,680 | 3,485 |
-| 8,192 | 4 | 3,915 | 3,676 |
-| 8,192 | 8 | 3,961 | 3,698 |
+| UTC date and source | Configuration and workload | Input tok/s at 1 / 4 / 8 streams |
+| --- | --- | --- |
+| 2026-11-16 · [loaded suite v2](bench/results/2026-11-16-current-r7e-suite/NOTES.md) | Measured on r7e, not re-measured on r18b. Cold prompts, one output token, temperature zero, thinking off, zero prefix-cache hits and warm host page cache. | 2,048 tokens: 2,946 / 3,340 / 3,648. 8,192 tokens: 3,680 / 3,915 / 3,961. |
 
-Both boots completed with identity and KV checks passing. The chain report failed its same-hour-window check despite the recorded 31-minute duration; these values were transcribed from the retained per-boot summary table. The notes preserve that limitation. Suite boot-to-boot noise limits attribution of the small decode changes.
+## Repository map
 
-## Reproducing
+| Path | Contents |
+| --- | --- |
+| [`config/served.json`](config/served.json) and [`scripts/serve.sh`](scripts/serve.sh) | Parameterized current launch plan and prerequisite checks |
+| [`docker/r18/`](docker/r18/) and [`docker/overlays/`](docker/overlays/) | Current build recipe and runtime source, plus the archived r7 overlays |
+| [`patches/series`](patches/series) and [`docs/PATCHES.md`](docs/PATCHES.md) | Ordered patch inventory, targets and base revisions |
+| [`bench/results/`](bench/results/) and [`bench/plot.py`](bench/plot.py) | Dated benchmark evidence and chart generation |
+| [`docs/REPRODUCING.md`](docs/REPRODUCING.md) and [`docs/PROVENANCE.md`](docs/PROVENANCE.md) | Reproduction gaps and source receipts |
+| [`docs/HISTORY.md`](docs/HISTORY.md) and [`docs/GOTCHAS.md`](docs/GOTCHAS.md) | Serving progression and instrument limits |
 
-Start with [the reproduction guide][reproduce], [host environment example][host-env], [serving plan][served-plan] and [launcher][serve]. `bash scripts/serve.sh --print` renders the local plan. A complete Linux image build, native compile and GPU acceptance have not been run for this export. The source package still needs the listed runtime assets and full checkpoint/adapter provenance before it can reproduce a serving boot.
+Original recipe work uses the [MIT licence](LICENSE). The [third-party credits](THIRD_PARTY.md) and [NOTICE](NOTICE) apply to the included upstream and modified source.
 
-## Measurement limits
-
-Earlier Spec-Bench pass A on r7d does not describe current TTFT or wall output because r7e changed prefill. Earlier measurements remain in the [history][history] and dated [results][results]. The headline protocol covers the base served name only. It does not establish sampled agent performance at temperature one, fast-name speed, abliterated-model speed, public benchmark accuracy, maximum KV capacity, memory-category use or wall power.
-
-R7e actual-launcher acceptance passed on 2026-11-16 at 08:33–08:48 UTC, run `20261116T083315Z-760421-actual-acceptance`. R7f acceptance passed at 18:08–18:22 UTC, run `20261116T180842Z-1157942-actual-acceptance`: both-name identity before and after work, the exact memory pair, KV and client contracts passed; the report-only suite was skipped for lack of time. Serving remained absent after teardown. Loopback checks do not establish client-network reachability. Correctable PCIe errors remain a hardware caveat. [History][history].
-
-Original recipe work uses [MIT][license]; third-party components retain the notices in [NOTICE][notice] and [THIRD_PARTY.md][third-party].
-
-[model]: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
-[vllm]: https://github.com/vllm-project/vllm
-[engine]: https://github.com/vllm-project/vllm/commit/df3bd094aeea829f27baa0a5282830464f601d9f
-[exl3]: https://github.com/turboderp-org/exllamav3
-[vllm-exl3]: https://github.com/vcruz305/vllm-exl3
-[eaq]: https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1.1-2.9-bpw
-[dspark]: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L1022
+[headline]: bench/results/2026-11-24-current-r18b-headline/
+[exl3]: https://github.com/vcruz305/vllm-exl3
 [report]: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/DeepSeek_V41_Tech_Report.pdf
-[qwen-cmp]: https://github.com/adrienbrault/qwen3.8-flash-next-2x-cmp170hx
-[decode-chart]: docs/img/decode-concurrency.svg
-[history-chart]: docs/img/history.svg
-[qualification]: bench/results/2026-11-15-current-r7d-qualification/NOTES.md
-[summary]: bench/results/2026-11-15-current-r7d-qualification/summary.json
-[qualification-dir]: bench/results/2026-11-15-current-r7d-qualification/
-[results]: bench/results/
-[history]: docs/HISTORY.md
-[gotchas]: docs/GOTCHAS.md
-[reproduce]: docs/REPRODUCING.md
-[third-party]: THIRD_PARTY.md
-[notice]: NOTICE
-[license]: LICENSE
-[agpl]: licenses/vllm-exl3-AGPL-3.0-only.txt
-[provenance]: docs/PROVENANCE.md
-[inventory]: docs/SOURCE-INVENTORY.json
-[patches]: docs/PATCHES.md
-[overlays]: docker/overlays/
-[vllm-patches]: patches/vllm/
-[exl3-patches]: patches/vllm-exl3/
-[native]: patches/native/
-[engram]: patches/engram/
-[splitk]: patches/splitk/
-[depth]: docker/overlays/dsv41_depth/
-[target-argmax]: docker/overlays/dsv41_lora_argmax/
-[draft-argmax]: docker/overlays/dsv41_draft_argmax/
-[attention]: docker/overlays/dsv41_attn_port/
-[rowstats]: docker/overlays/dsv41_rowstats/
-[wkv]: docker/overlays/dsv41_wkv_replica/
-[dispatch]: docker/overlays/dsv41_dispatch_fuse/
-[ablit]: docker/overlays/dsv41_ablit_r7/
-[serve]: scripts/serve.sh
-[host-env]: scripts/host.env.example
-[served-plan]: config/served.json
-[plot]: bench/plot.py
-[moe-stack]: docker/overlays/dsv41_moe_stack/
-[prefill-code]: docker/overlays/prefill-code/
-[card]: docs/img/recipe-card-010a921e.png

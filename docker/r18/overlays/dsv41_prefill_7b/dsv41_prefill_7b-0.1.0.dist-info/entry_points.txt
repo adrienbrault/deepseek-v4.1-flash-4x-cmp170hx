@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_prefill_7b = dsv41_prefill_7b:register

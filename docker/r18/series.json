@@ -1,0 +1,28 @@
+{
+  "base": "62d4bc3c7e33b1b6c906e233e6af2d3506c482ca",
+  "vllm": "patches/vllm/series.json",
+  "vllm_exl3": {
+    "base": "3c60e6b45b5ec9e845b07aa70b4f974819010ffe",
+    "inherited": [
+      "0001-plugin-gemv-half-param.patch",
+      "0002-plugin-arity-named-args.patch",
+      "0003-require-direct-fill-arenas.patch",
+      "0004-plugin-ep-offset-only-with-ep.patch",
+      "0005-tp-aligned-rotated-trellis-arenas.patch",
+      "0006-curtis-tensor-core-moe.patch",
+      "0007-build-cxx20-for-torch-2.14.patch",
+      "0008-load-reclaim-fast.patch",
+      "0009-load-strided-bounce.patch"
+    ],
+    "r18": [
+      "0010-replay-served-coop.patch",
+      "0011-v034-plugin-and-coop-abi.patch"
+    ],
+    "license": "AGPL-3.0-only"
+  },
+  "native_after_core": [
+    "native/rowstore/MANIFEST.json",
+    "opera-true-ring/manifest.json",
+    "ring-helper-build.json"
+  ]
+}

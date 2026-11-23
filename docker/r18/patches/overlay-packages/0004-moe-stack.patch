@@ -1,0 +1,55 @@
+Subject: Forward the v0.34 capture API and authenticate the baked measured binaries.
+
+diff --git a/dsv41_moe_stack/dsv41_moe_stack/stack_plugin.py b/dsv41_moe_stack/dsv41_moe_stack/stack_plugin.py
+--- a/dsv41_moe_stack/dsv41_moe_stack/stack_plugin.py
++++ b/dsv41_moe_stack/dsv41_moe_stack/stack_plugin.py
+@@ -69,8 +69,11 @@
+     switch = os.environ.get('DSV41_MOE_STACK','0')
+     if switch not in ('0','1'): raise ValueError('STACK switch')
+     if switch == '0': return  # absolutely no imports/native allocation/hooks off
++    if os.environ.get('VLLM_EXL3_COOP_KERNEL') != '1':
++        raise ValueError('STACK needs VLLM_EXL3_COOP_KERNEL=1')
+     import sys
+     sys.path.insert(0,'/opt/stack-code')
++    sys.path.insert(0,'/opt/qv')
+     import dsv41_lora_argmax.hooks as hooks
+     if getattr(hooks.patch,'_moe_stack_single',False): return
+     original = hooks.patch
+@@ -84,11 +87,12 @@
+     if target is not None: wrap(target.GPUModelRunner)
+     from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager as Manager
+     old = Manager.capture
+-    def capture(manager, factory, *a, **kw):
+-        if manager is not owner: return old(manager,factory,*a,**kw)
++    @functools.wraps(old)
++    def capture(manager, create_forward_fn, *a, **kw):
++        if manager is not owner: return old(manager,create_forward_fn,*a,**kw)
+         targets.add(manager)
+         def scoped(d, warmup):
+-            fn = factory(d,warmup=warmup)
++            fn = create_forward_fn(d,warmup=warmup)
+             from stack_runtime import kind
+             if kind(d) is None: return fn
+             def forward(mode):
+diff --git a/rootfs/opt/stack-code/stack_runtime.py b/rootfs/opt/stack-code/stack_runtime.py
+--- a/rootfs/opt/stack-code/stack_runtime.py
++++ b/rootfs/opt/stack-code/stack_runtime.py
+@@ -81,13 +81,16 @@
+ 
+ def install():
+     import hashlib
+-    import os
+     bundle = Path('/opt/stack-native')
+-    need(hashlib.sha256((bundle/'seal.json').read_bytes()).hexdigest() == os.environ['DSV41_STACK_NATIVE_SEAL'],
++    need(hashlib.sha256((bundle/'seal.json').read_bytes()).hexdigest() == (bundle/'seal.sha256').read_text().strip(),
+          'native seal changed')
+     seal = json.loads((bundle/'seal.json').read_text())
++    need(seal['schema'] == 'r18-stack-native/1', 'unknown stack seal schema')
+     need(all(hashlib.sha256((bundle/n).read_bytes()).hexdigest() == h for n,h in seal['binaries'].items()),
+          'exact measured binary changed')
++    from native_build import check_r18_environment
++    import torch
++    check_r18_environment(seal, torch)
+     import vllm_exl3.coop_kernel as coop
+     incumbent = coop.load()
+     rows = load('/opt/stack-native/opera_rows_family.so', 'opera_rows_family')

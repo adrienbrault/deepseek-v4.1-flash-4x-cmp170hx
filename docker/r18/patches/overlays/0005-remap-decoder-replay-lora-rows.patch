@@ -1,0 +1,288 @@
+diff --git a/vllm/lora/punica_wrapper/punica_gpu.py b/vllm/lora/punica_wrapper/punica_gpu.py
+--- a/vllm/lora/punica_wrapper/punica_gpu.py
++++ b/vllm/lora/punica_wrapper/punica_gpu.py
+@@ -4,10 +4,12 @@
+ Chen, L., Ye, Z., Wu, Y., Zhuo, D., Ceze, L., & Krishnamurthy, A. (2023).
+ Punica: Multi-Tenant LoRA Serving.
+ https://arxiv.org/abs/2310.18547
+ """
+ 
++from collections.abc import Callable
++from contextlib import AbstractContextManager, contextmanager
+ from typing import Any, final
+ 
+ import torch
+ 
+ from vllm.lora.layers import LoRAMapping
+@@ -85,10 +87,77 @@
+         # TODO avoid gpu<->cpu sync here
+         with gpu_sync_allowed():
+             # Prepare cuda kernel metadata tensors
+             self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
+             self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
++
++    def make_token_replay_context(
++        self,
++    ) -> Callable[[torch.Tensor, int], AbstractContextManager[None]]:
++        """Allocate the token tables for eager replay on a subset of batch rows."""
++        replay_indices = torch.empty_like(self._token_lora_indices)
++        replay_meta = LoRAKernelMeta.make(
++            self.max_loras, replay_indices.numel(), device=replay_indices.device
++        )
++        sorted_slots = torch.empty_like(replay_meta.token_lora_mapping)
++        sorted_rows = torch.empty_like(replay_indices)
++        # Fixed buckets for base and every adapter slot. An absent slot has zero
++        # rows, so grouping doesn't need unique() or a device-to-host count.
++        replay_meta.active_lora_ids.copy_(
++            torch.arange(-1, self.max_loras, device=replay_indices.device)
++        )
++        replay_meta.num_active_loras_cpu.fill_(self.max_loras + 1)
++        starts = replay_meta.lora_token_start_loc
++
++        @contextmanager
++        def replay_context(rows: torch.Tensor, num_tokens: int):
++            full_indices = self._token_lora_indices
++            full_length = self.indices_len[0]
++            full_meta = self.token_mapping_meta
++            num_rows = rows.numel()
++            assert full_length is not None
++            assert num_rows <= num_tokens <= replay_indices.numel()
++            torch.index_select(
++                full_indices[:full_length], 0, rows, out=replay_indices[:num_rows]
++            )
++            if num_rows < num_tokens:
++                replay_indices[num_rows:num_tokens].fill_(-1)
++
++            # Dense wo_b reads the raw token indices. Generic GPU Punica reads
++            # the same slots in int32 plus a stable grouping of compact rows.
++            mapping = replay_meta.token_lora_mapping[:num_tokens]
++            mapping.copy_(replay_indices[:num_tokens])
++            torch.sort(
++                mapping, stable=True,
++                out=(sorted_slots[:num_tokens], sorted_rows[:num_tokens]),
++            )
++            replay_meta.token_indices_sorted_by_lora_ids[:num_tokens].copy_(
++                sorted_rows[:num_tokens]
++            )
++            torch.searchsorted(
++                sorted_slots[:num_tokens], replay_meta.active_lora_ids,
++                right=True, out_int32=True, out=starts[1:],
++            )
++            torch.sub(starts[1:], starts[:-1], out=replay_meta.num_tokens_per_lora)
++            # Replay keeps at least one row of each request. Only padding adds
++            # a new label (-1), so the original CPU flag is still valid.
++            replay_meta.no_lora_flag_cpu.copy_(full_meta.no_lora_flag_cpu)
++
++            # Keep the outer buffers and their captured addresses intact.
++            # Logits/sampler indices describe the scattered outputs and stay
++            # on the outer batch throughout.
++            self._token_lora_indices = replay_indices
++            self.indices_len[0] = num_tokens
++            self.token_mapping_meta = replay_meta
++            try:
++                yield
++            finally:
++                self._token_lora_indices = full_indices
++                self.indices_len[0] = full_length
++                self.token_mapping_meta = full_meta
++
++        return replay_context
+ 
+     def add_shrink(
+         self,
+         y: torch.Tensor,
+         x: torch.Tensor,
+diff --git a/vllm/models/deepseek_v41/decoder_replay_layers.py b/vllm/models/deepseek_v41/decoder_replay_layers.py
+--- a/vllm/models/deepseek_v41/decoder_replay_layers.py
++++ b/vllm/models/deepseek_v41/decoder_replay_layers.py
+@@ -12,11 +12,13 @@
+ break out to the replay batch, which may run in a graph of its own
+ (decoder_replay_cudagraph.py).
+ """
+ 
+ from collections.abc import Callable
++from contextlib import AbstractContextManager, nullcontext
+ from dataclasses import dataclass
++from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.forward_context import (
+@@ -24,10 +26,13 @@
+     get_forward_context,
+     in_piecewise_cudagraph,
+     override_forward_context,
+ )
+ from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
++
++if TYPE_CHECKING:
++    from vllm.lora.punica_wrapper.punica_gpu import PunicaWrapperGPU
+ 
+ 
+ @dataclass
+ class ReplayBatch:
+     """One forward's replay batch; ``run_graph`` is set when it runs in a graph."""
+@@ -56,17 +61,23 @@
+         run_layers: Callable[..., tuple[torch.Tensor, ...]],
+         write_batch_kv: Callable[..., None],
+         metadata_prefixes: set[str],
+         first_swa_prefix: str,
+         has_early_aux: Callable[[], bool] = lambda: False,
++        get_lora_wrapper: Callable[[], "PunicaWrapperGPU"] | None = None,
+     ) -> None:
+         self.window = window
+         self.run_layers = run_layers
+         self.write_batch_kv = write_batch_kv
+         self.metadata_prefixes = metadata_prefixes
+         self.first_swa_prefix = first_swa_prefix
+         self.has_early_aux = has_early_aux
++        # Model state binds this after the LoRA manager has wrapped wo_b.
++        self.get_lora_wrapper = get_lora_wrapper
++        self.lora_context: (
++            Callable[[torch.Tensor, int], AbstractContextManager[None]] | None
++        ) = None
+         # Set by the model state every step; None runs the layers on the batch.
+         self.replay_batch: ReplayBatch | None = None
+         # Set by the model state with replay graphs: PIECEWISE model graphs of
+         # this many tokens or more break out to the replay batch.
+         self.trim_threshold: int | None = None
+@@ -120,10 +131,11 @@
+         assert isinstance(hidden_states, torch.Tensor)
+         rows = replay_batch.rows
+         inputs = (hidden_states, *states)
+         with override_forward_context(replay_batch.forward_context):
+             if replay_batch.run_graph is not None:
++                assert self.lora_context is None
+                 row_outputs = replay_batch.run_graph(rows, inputs)
+             else:
+                 row_inputs = [
+                     None if t is None else t.index_select(0, rows) for t in inputs
+                 ]
+@@ -133,11 +145,14 @@
+                         None
+                         if t is None
+                         else torch.cat((t, t.new_zeros((padding, *t.shape[1:]))))
+                         for t in row_inputs
+                     ]
+-                row_outputs = self.run_layers(*row_inputs)
++                num_tokens = replay_batch.num_padded or rows.numel()
++                lora_context = self.lora_context
++                with lora_context(rows, num_tokens) if lora_context else nullcontext():
++                    row_outputs = self.run_layers(*row_inputs)
+         # The trimmed rows' outputs stay zero; nothing reads them.
+         num_tokens = hidden_states.shape[0]
+         return tuple(
+             out.new_zeros((num_tokens, *out.shape[1:])).index_copy_(
+                 0, rows, out[: rows.numel()]
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -1118,10 +1118,11 @@
+                 self._run_replay_layers,
+                 self.layers[cut].write_kv,
+                 metadata_prefixes,
+                 self.layers[cut].attn.swa_cache_layer.prefix,
+                 lambda: any(i < cut for i in self.aux_hidden_state_layers),
++                get_lora_wrapper=lambda: self.layers[cut].attn.wo_b.punica_wrapper,
+             )
+             logger.info_once(
+                 "Decoder SWA bounded replay: in eager prefill steps, layer %d "
+                 "writes its KV for every token, and the rest of it and layers "
+                 "%d-%d run on each request's last %d tokens only.",
+@@ -1130,11 +1131,12 @@
+                 self.end_layer - 1,
+                 config.sliding_window,
+             )
+             if vllm_config.lora_config is not None:
+                 logger.info_once(
+-                    "Decoder SWA bounded replay with LoRA: base-only eager steps."
++                    "Decoder SWA bounded replay with LoRA: eager steps use "
++                    "replay-local adapter rows."
+                 )
+ 
+         # The n-gram hash needs a slot-keyed rolling store of compressed ids
+         # (chunked prefill / decode lookback); key it off the first local
+         # layer's sliding-window KV cache. Only PP ranks owning an engram
+@@ -1584,13 +1586,12 @@
+         )
+ 
+     def _decoder_replay_enabled(self, vllm_config: VllmConfig, cut: int) -> bool:
+         lora = vllm_config.lora_config
+         parallel = vllm_config.parallel_config
+-        # With wo_b-only LoRA we can trim eager batches whose token mapping is
+-        # entirely inactive. Restrict the exception to local request batches
+-        # without PIECEWISE prefill graph breaks or DP replay agreement.
++        # Eager replay remaps wo_b's token metadata. Keep LoRA restricted to
++        # local batches without PIECEWISE graph breaks or DP replay agreement.
+         lora_compatible = lora is None or (
+             tuple(lora.target_modules or ()) == ("wo_b",)
+             and parallel.data_parallel_size == 1
+             and parallel.pipeline_parallel_size == 1
+             and parallel.prefill_context_parallel_size == 1
+diff --git a/vllm/models/deepseek_v41/nvidia/model_state.py b/vllm/models/deepseek_v41/nvidia/model_state.py
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py
+@@ -221,14 +221,21 @@
+         self._replay: tuple[int, torch.Tensor] | None = None
+ 
+         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
+             model, "decoder_replay_layers", None
+         )
++        layers = self.decoder_replay_layers
+         self._has_lora_np: np.ndarray | None = None
+-        if self.decoder_replay_layers is not None:
++        if layers is not None:
+             if vllm_config.lora_config is not None:
+-                self._has_lora_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
++                if layers.get_lora_wrapper is None:
++                    # Retain the base-only fallback for backends without a
++                    # replay token mapping.
++                    self._has_lora_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
++                else:
++                    wrapper = layers.get_lora_wrapper()
++                    layers.lora_context = wrapper.make_token_replay_context()
+             if self.pcp_size > 1:
+                 assert self.decoder_replay_layers.window >= 2 * self.pcp_size, (
+                     "PCP replay requires window >= 2 * PCP size so each trimmed "
+                     "request is represented on every rank."
+                 )
+@@ -258,11 +265,10 @@
+             )
+             # The replay layers' and the first one's SWA attention groups.
+             self._replay_attn_groups: (
+                 tuple[list[list[AttentionGroup]], list[list[AttentionGroup]]] | None
+             ) = None
+-        layers = self.decoder_replay_layers
+         compilation_config = vllm_config.compilation_config
+         self.replay_cudagraphs: DecoderReplayCudaGraphManager | None = None
+         if (
+             layers is not None
+             and compilation_config.cudagraph_decoder_replay
+@@ -511,21 +517,24 @@
+         replay batch, trimmed or not; FULL and smaller PIECEWISE graphs keep the
+         whole batch. Under DP every rank replays if any does."""
+         layers = self.decoder_replay_layers
+         assert layers is not None
+         layers.replay_batch = None
++        if layers.lora_context is not None and (
++            cudagraph_mode != CUDAGraphMode.NONE or capture_desc is not None
++        ):
++            return
+         force_replay_batch = capture_desc is not None or (
+             cudagraph_mode == CUDAGraphMode.PIECEWISE
+             and layers.graph_uses_replay_batch(input_batch.num_tokens_after_padding)
+         )
+         if cudagraph_mode != CUDAGraphMode.NONE and not force_replay_batch:
+             return
+ 
+         num_reqs = input_batch.num_reqs
+         idx_mapping_np = input_batch.idx_mapping_np[:num_reqs]
+-        # Punica still indexes the outer batch. Dropping rows before another
+-        # request could shift its adapter indices, so keep the whole step.
++        # Backends without a replay token mapping still index the outer batch.
+         if self._has_lora_np is not None and self._has_lora_np[idx_mapping_np].any():
+             return
+         query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+         seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
+         keeps_rows = self._keeps_rows_np[idx_mapping_np]

@@ -1,0 +1,49 @@
+[
+  {
+    "patch": "0001-lora-argmax.patch",
+    "purpose": "Read vocabulary width from the v0.34 draft cache.",
+    "files": [
+      "dsv41_lora_argmax/dsv41_lora_argmax/eligibility.py"
+    ]
+  },
+  {
+    "patch": "0002-ablit-r7.patch",
+    "purpose": "Allow reduced boots and validate the two v0.34 LoRA graph tables.",
+    "files": [
+      "dsv41_ablit_r7/dsv41_ablit_r7/__init__.py",
+      "dsv41_ablit_r7/dsv41_ablit_r7/graphs.py"
+    ]
+  },
+  {
+    "patch": "0003-indexer.patch",
+    "purpose": "Bind bounded indexer to the baked build seal and the enabled token glue.",
+    "files": [
+      "dsv41_indexer_bounded/dsv41_indexer_bounded/__init__.py",
+      "rootfs/opt/qv/indexer_runtime.py",
+      "rootfs/opt/qv/native_build.py"
+    ]
+  },
+  {
+    "patch": "0004-moe-stack.patch",
+    "purpose": "Forward the v0.34 capture API and authenticate the baked measured binaries.",
+    "files": [
+      "dsv41_moe_stack/dsv41_moe_stack/stack_plugin.py",
+      "rootfs/opt/stack-code/stack_runtime.py"
+    ]
+  },
+  {
+    "patch": "0005-prefill-qv.patch",
+    "purpose": "Include uniform CUDA graphs in the prefill fence and resolve the installed stack observer.",
+    "files": [
+      "rootfs/opt/qv/graph_policy.py",
+      "rootfs/opt/qv/prefill_7b_candidate.py"
+    ]
+  },
+  {
+    "patch": "0006-fly.patch",
+    "purpose": "Check the v0.34 verifier cache ABI and preserve persistent-slot mappings.",
+    "files": [
+      "fly_names/fly_names/runtime.py"
+    ]
+  }
+]

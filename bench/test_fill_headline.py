@@ -142,12 +142,14 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(card['conc']['each'],[None,None,None])
         self.assertEqual(card['evals']['items'][2],['3,961','cold prefill tok/s · c8','2026-11-16'])
 
-    def test_flash_next_card_semantics_and_dated_cold_prefill(self):
+    def test_card_c1_matches_chart_and_prefill_is_dated(self):
         s=self.normalize()
         card, update=f.card_data(f.read(f.ROOT/'bench/headline-card.template.json'),s,'numeric-results')
-        self.assertEqual(card['one']['rate'],125.)
-        self.assertEqual(card['one']['kinds'][0],['Spec-Bench',125.,'120 prompts'])
-        self.assertNotEqual(card['one']['rate'],s['cells']['specbench-subset-c1']['output_tok_s'])
+        self.assertEqual(card['one']['rate'], 131.3)
+        self.assertEqual(card['one']['kinds'][0], ['Spec-Bench', 131.3, 'wall output'])
+        self.assertEqual(card['one']['rate'], card['conc']['sum'][0])
+        self.assertEqual(card['one']['kinds'][1][1], card['conc']['peak']['sum'][0])
+        self.assertEqual(card['one']['precision'], card['many']['precision'])
         self.assertEqual(card['many']['sum'],282.8)
         self.assertEqual(card['many']['each'],125.)
         self.assertEqual(card['conc']['each'],[125.,125.,125.])
@@ -171,7 +173,8 @@ class ExportTests(unittest.TestCase):
         s['cells']['code-shared-t65536-a8192-c1']['aggregate_tok_s']=250.
         s['cells']['code-shared-t65536-a8192-c1']['per_stream_tok_s']=250.
         card, _=f.card_data(f.read(f.ROOT/'bench/headline-card.template.json'),s,'numeric-results')
-        self.assertEqual(card['evals']['items'][:2],[['900','code tok/s · 8 agents'],['250','code tok/s · 1 agent']])
+        self.assertEqual(card['evals']['items'][:2], [['900.0', '8 agents · 32K + 2K'], ['250.0', '1 agent · 64K + 8K']])
+        self.assertEqual(card['one']['kinds'][1][1], 200.)
         self.assertIn('`code-shared-t32768-a2048-c8`',f.tables(s))
         self.assertIn('`code-shared-t65536-a8192-c1`',f.tables(s))
 
@@ -194,12 +197,16 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn('Interim note',moved)
         self.assertEqual(moved,f.move_fixed_reference(moved))
 
-    def test_launcher_joins_eager_prefill_and_memory_pair(self):
+    def test_launcher_joins_prefill_and_verification_policies_with_memory_pair(self):
         spec=importlib.util.spec_from_file_location('serve',f.ROOT/'scripts/serve.py')
         serve=importlib.util.module_from_spec(spec);spec.loader.exec_module(serve)
         plan=f.read(f.ROOT/'config/served.json');serve.validate_plan(plan)
-        for mutate in (lambda r:r['docker_options'].__setitem__(1,'38654705664'),
-                       lambda r:r['environment'].update(DSV41_PREFILL_7B_R7D='0')):
+        for mutate in (
+            lambda r: r['docker_options'].__setitem__(r['docker_options'].index('--memory') + 1, '38654705664'),
+            lambda r: r['environment'].update(VLLM_DSV41_PREFILL_SHARE='off'),
+            lambda r: r['environment'].update(VLLM_DSV41_ADAPTIVE_VERIFY_POLICY=''),
+            lambda r: r['policy'].update(adaptive_verify_sha256='0' * 64),
+        ):
             bad=deepcopy(plan);mutate(bad)
             with self.assertRaises(ValueError):serve.validate_plan(bad)
 
@@ -222,8 +229,14 @@ class ExportTests(unittest.TestCase):
     def test_end_to_end_deterministic_and_failure_without_writes(self):
         with tempfile.TemporaryDirectory(prefix='headline-fill-') as tmp:
             root=Path(tmp)/'recipe';cards=Path(tmp)/'cards'
-            for rel in ('bench/plot.py','bench/headline-card.template.json','README.md','config/served.json',f.COLD_DIR+'/summary.json'):
+            for rel in ('bench/plot.py','bench/headline-card.template.json',f.COLD_DIR+'/summary.json'):
                 p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(f.ROOT/rel,p)
+            (root/'README.md').write_text(
+                f'# Recipe\n\n## Numbers\n\n{f.BEGIN}\n{f.END}\n\n'
+                '## Loaded suite v2, 2026-11-16 UTC\n\n| 8 burst | 456.7 |\n'
+            )
+            (root/'config').mkdir()
+            (root/'config/served.json').write_text(f.encoded({'definition': 'current-r7f', 'promoted_utc': '2026-11-16T18:25:00Z'}))
             (cards/'recipes').mkdir(parents=True)
             # A local reference file has only shape/hardware; no measurements are imported.
             source=Path(__file__).resolve().parent/'headline-card.template.json'

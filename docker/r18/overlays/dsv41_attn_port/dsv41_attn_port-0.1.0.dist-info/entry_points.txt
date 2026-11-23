@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_attn_port = dsv41_attn_port:register

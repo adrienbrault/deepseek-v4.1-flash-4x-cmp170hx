@@ -19,7 +19,13 @@ def main():
             if hashlib.sha256(f.read_bytes()).hexdigest() != row['sha256']:
                 raise ValueError('source digest mismatch: ' + row['file'])
             count += 1
-    files = list((ROOT / 'docker/overlays').rglob('*.py'))
+    manifest = json.loads((ROOT / 'patches/manifest.json').read_text())
+    series = [(ROOT / 'patches' / path).resolve() for path in
+              (ROOT / 'patches/series').read_text().splitlines()]
+    if series != [(ROOT / row['file']).resolve() for row in manifest] or len(set(series)) != len(series):
+        raise ValueError('patch series and manifest differ')
+    files = sorted(path for folder in ('docker/overlays', 'docker/r18')
+                   for path in (ROOT / folder).rglob('*.py'))
     files += [ROOT / 'scripts/serve.py', ROOT / 'bench/plot.py']
     for f in files:
         ast.parse(f.read_text(), filename=str(f.relative_to(ROOT)))

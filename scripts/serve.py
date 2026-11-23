@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Render the documented serving settings; refuse an incomplete runtime export."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,17 +10,25 @@ import shlex
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+INPUTS = ('MODEL_ROOT', 'OFFICIAL_ROOT', 'ADAPTER_ROOT', 'SERVING_CONFIG_ROOT',
+          'CACHE_ROOT', 'RUNTIME_ASSETS_ROOT')
 
 
 def validate_plan(plan):
-    """Keep the exported daily's two additive policies joined to its launcher."""
-    if plan['definition'] not in {'current-r7f', 'current-r7g'}:
+    """Keep the r18b launch settings and adaptive verification receipt aligned."""
+    if plan['definition'] != 'current-r18b':
         raise ValueError('unsupported serving export definition')
-    if plan.get('docker_options') != ['--memory', '55834574848', '--memory-swap', '55834574848']:
-        raise ValueError('selected definition requires the exact 52 GiB memory pair')
+    options = plan['docker_options']
+    for flag in ('--memory', '--memory-swap'):
+        if options[options.index(flag) + 1] != '55834574848':
+            raise ValueError('selected definition requires the exact 52 GiB memory pair')
     env = plan['environment']
-    if env.get('DSV41_PREFILL_7B_R7D') != '1' or env['VLLM_PLUGINS'].split(',').count('dsv41_prefill_7b') != 1:
-        raise ValueError('selected definition requires the bitwise eager prefill serving bootstrap')
+    if env.get('VLLM_DSV41_PREFILL_SHARE') != plan['policy']['prefill_share'] or env['VLLM_DSV41_PREFILL_SHARE'] != 'half':
+        raise ValueError('selected definition requires half-share prefill')
+    if env.get('DSV41_TRUE_RING') != '1' or env.get('VLLM_DSV41_ADAPTIVE_VERIFY_POLICY') != '/configs-hav/policy.json':
+        raise ValueError('selected definition requires the true ring and adaptive verification')
+    if hashlib.sha256((ROOT / 'config/adaptive-verify.json').read_bytes()).hexdigest() != plan['policy']['adaptive_verify_sha256']:
+        raise ValueError('adaptive verification policy hash differs')
 
 
 def local_inputs():
@@ -33,11 +42,10 @@ def local_inputs():
             if len(words) != 1 or '=' not in words[0]:
                 raise ValueError('host.env accepts only NAME=value assignments')
             key, value = words[0].split('=', 1)
-            if key not in {'MODEL_ROOT', 'OFFICIAL_ROOT', 'ADAPTER_ROOT', 'CACHE_ROOT', 'RUNTIME_ASSETS_ROOT'}:
+            if key not in INPUTS:
                 raise ValueError('unknown host.env input: ' + key)
             values[key] = value
-    return {key: os.environ.get(key, values.get(key, '')) for key in
-            ('MODEL_ROOT', 'OFFICIAL_ROOT', 'ADAPTER_ROOT', 'CACHE_ROOT', 'RUNTIME_ASSETS_ROOT')}
+    return {key: os.environ.get(key, values.get(key, '')) for key in INPUTS}
 
 
 def main():

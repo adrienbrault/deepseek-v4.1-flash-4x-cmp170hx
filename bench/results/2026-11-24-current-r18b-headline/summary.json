@@ -1,0 +1,139 @@
+{
+  "schema": "headline-summary/1",
+  "configuration": "current-r18b",
+  "date_utc": "2026-11-24",
+  "window_utc": [
+    "2026-11-24T00:33Z",
+    "2026-11-24T00:45Z"
+  ],
+  "run": "headline-r18b-20261123T002211Z-mUo7Jh",
+  "serve_seal": "seal-nORCnYLm",
+  "image": "sha256:f3027769f90387db0c6f6d0cbd2f05348a8e74023094f9c0d4ec4946d1ea206c",
+  "served_name": "deepseek-v4.1-flash-1017",
+  "hardware": {
+    "gpus": 4,
+    "tp": 4,
+    "pcie": "Gen2 x16 per GPU",
+    "power_cap_w_per_gpu": 175
+  },
+  "publication_ready": true,
+  "protocols": {
+    "specbench": {
+      "subset_size": 120,
+      "concurrency": [
+        1,
+        4,
+        8
+      ],
+      "forced_output_tokens": 256,
+      "temperature": 0
+    },
+    "cached_code": {
+      "concurrency": [
+        1,
+        4,
+        8
+      ],
+      "forced_output_tokens": 400,
+      "temperature": 0,
+      "seed": 15
+    }
+  },
+  "source": {
+    "record": "NUMBERS.md, current-r18b headline, 2026-11-24",
+    "commit": "9c9b8910911af97a22794566906a9f79ba630d24",
+    "raw_report_available": false
+  },
+  "unavailable": [
+    "Run-specific input and subset receipt hashes, raw request counts and counters, end-to-end percentiles, code TTFT p99, code step time and acceptance per step, and GPU telemetry for the headline boot."
+  ],
+  "cells": {
+    "specbench-subset-c1": {
+      "status": "COMPLETE",
+      "output_tok_s": 137.4,
+      "per_stream_tok_s": 155.8,
+      "ttft_p50_ms": 207.6,
+      "ttft_p99_ms": 534.0,
+      "acceptance_length": 3.1
+    },
+    "specbench-subset-c4": {
+      "status": "COMPLETE",
+      "output_tok_s": 240.0,
+      "per_stream_tok_s": 67.0,
+      "ttft_p50_ms": 293.6,
+      "ttft_p99_ms": 714.2,
+      "acceptance_length": 2.77
+    },
+    "specbench-subset-c8": {
+      "status": "COMPLETE",
+      "output_tok_s": 291.8,
+      "per_stream_tok_s": 39.3,
+      "ttft_p50_ms": 357.5,
+      "ttft_p99_ms": 882.8,
+      "acceptance_length": 2.4
+    },
+    "code-shared-t1024-a2048-c1": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 250.5,
+      "per_stream_tok_s": 250.5,
+      "ttft_p50_ms": 760,
+      "cache_confirmed": true
+    },
+    "code-shared-t1024-a2048-c4": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 427.3,
+      "per_stream_tok_s": 106.8,
+      "ttft_p50_ms": 1780,
+      "cache_confirmed": true
+    },
+    "code-shared-t1024-a2048-c8": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 477.1,
+      "per_stream_tok_s": 59.6,
+      "ttft_p50_ms": 2840,
+      "cache_confirmed": true
+    },
+    "code-shared-t32768-a2048-c1": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 256.6,
+      "per_stream_tok_s": 256.6,
+      "ttft_p50_ms": 830,
+      "cache_confirmed": true
+    },
+    "code-shared-t32768-a2048-c4": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 414.4,
+      "per_stream_tok_s": 103.6,
+      "ttft_p50_ms": 2040,
+      "cache_confirmed": true
+    },
+    "code-shared-t32768-a2048-c8": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 437.7,
+      "per_stream_tok_s": 54.7,
+      "ttft_p50_ms": 3220,
+      "cache_confirmed": true
+    },
+    "code-shared-t65536-a8192-c1": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 260.6,
+      "per_stream_tok_s": 260.6,
+      "ttft_p50_ms": 2590,
+      "cache_confirmed": true
+    },
+    "code-shared-t65536-a8192-c4": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 398.7,
+      "per_stream_tok_s": 99.7,
+      "ttft_p50_ms": 7920,
+      "cache_confirmed": true
+    },
+    "code-shared-t65536-a8192-c8": {
+      "status": "COMPLETE",
+      "aggregate_tok_s": 456.3,
+      "per_stream_tok_s": 57.0,
+      "ttft_p50_ms": 14000,
+      "cache_confirmed": true
+    }
+  }
+}

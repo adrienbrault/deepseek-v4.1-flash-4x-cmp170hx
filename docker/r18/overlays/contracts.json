@@ -1,0 +1,716 @@
+{
+  "dsv41_lora_argmax/dsv41_lora_argmax/hooks.py": {
+    "hook": [
+      "vllm.model_executor.layers.linear:RowParallelLinear.__init__",
+      "vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.load_weights",
+      "vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.compute_logits",
+      "vllm.models.deepseek_v41.nvidia.vl_model:DeepseekV41ForCausalLM.load_weights",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample"
+    ],
+    "instance or callable contract": [
+      "vllm.envs:VLLM_TP_DISTRIBUTED_SAMPLING"
+    ],
+    "signature": {
+      "vllm.model_executor.layers.linear:RowParallelLinear.__init__": [
+        "self",
+        "input_size",
+        "output_size",
+        "bias",
+        "input_is_parallel",
+        "skip_bias_add",
+        "params_dtype",
+        "reduce_results",
+        "quant_config",
+        "prefix",
+        "*",
+        "return_bias",
+        "disable_tp"
+      ],
+      "vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.load_weights": [
+        "self",
+        "weights"
+      ],
+      "vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.compute_logits": [
+        "self",
+        "hidden_states"
+      ],
+      "vllm.models.deepseek_v41.nvidia.vl_model:DeepseekV41ForCausalLM.load_weights": [
+        "self",
+        "weights"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model": [
+        "self",
+        "load_dummy_weights",
+        "*args",
+        "model",
+        "**kwargs"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample": [
+        "self",
+        "hidden_states",
+        "input_batch",
+        "grammar_output"
+      ]
+    }
+  },
+  "dsv41_lora_argmax/dsv41_lora_argmax/eligibility.py": {
+    "instance or callable contract": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.model",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sampler",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.speculator",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.rejection_sampler",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.lora_config",
+      "vllm.v1.worker.gpu.spec_decode.draft_logits:DraftLogitsCache.values",
+      "vllm.v1.worker.gpu.model_states.interface:ModelState.compute_sample_logits",
+      "vllm.v1.worker.gpu.sample.sampler:Sampler.get_logprobs_dims",
+      "vllm.v1.worker.gpu.sample.sampler:Sampler.needs_logits_processing",
+      "vllm.v1.worker.gpu.sample.sampler:Sampler.distributed_fallback"
+    ]
+  },
+  "dsv41_lora_argmax/dsv41_lora_argmax/argmax.py": {
+    "instance or callable contract": [
+      "vllm.model_executor.layers.vocab_parallel_embedding:ParallelLMHead.shard_indices",
+      "vllm.model_executor.layers.vocab_parallel_embedding:ParallelLMHead.tp_rank"
+    ]
+  },
+  "dsv41_depth/dsv41_depth/host_rule.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.async_utils:AsyncOutput.__init__",
+      "vllm.v1.worker.gpu.async_utils:AsyncOutput.get_output"
+    ],
+    "instance or callable contract": [
+      "vllm.v1.worker.gpu.async_utils:async_copy_to_np",
+      "vllm.v1.worker.gpu.async_utils:AsyncOutput.copy_event"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.async_utils:AsyncOutput.__init__": [
+        "self",
+        "model_runner_output",
+        "sampler_output",
+        "num_sampled_tokens",
+        "main_stream",
+        "copy_stream",
+        "check_ep_fault",
+        "pending_aux_output"
+      ],
+      "vllm.v1.worker.gpu.async_utils:AsyncOutput.get_output": [
+        "self"
+      ]
+    }
+  },
+  "dsv41_depth/dsv41_depth/scheduler.py": {
+    "instance or callable contract": [
+      "vllm.v1.core.sched.scheduler:Scheduler.schedule",
+      "vllm.v1.core.sched.scheduler:Scheduler.update_from_output"
+    ]
+  },
+  "dsv41_attn_port/dsv41_attn_port/integration.py": {
+    "hook": [
+      "vllm.models.deepseek_v41.amd.rocm:DeepseekV41ROCMAiterSparseSWAMetadataBuilder.build",
+      "vllm.model_executor.layers.indexer_topk:SparseIndexerTopk.forward"
+    ],
+    "instance or callable contract": [
+      "vllm.platforms.interface:Platform.is_cuda",
+      "vllm.platforms.interface:Platform.is_device_capability"
+    ],
+    "signature": {
+      "vllm.models.deepseek_v41.amd.rocm:DeepseekV41ROCMAiterSparseSWAMetadataBuilder.build": [
+        "self",
+        "common_prefix_len",
+        "common_attn_metadata",
+        "fast_build",
+        "replay_start"
+      ],
+      "vllm.model_executor.layers.indexer_topk:SparseIndexerTopk.forward": [
+        "self",
+        "logits",
+        "seq_lens",
+        "next_n",
+        "topk_indices",
+        "topk_tokens",
+        "max_seq_len"
+      ]
+    }
+  },
+  "dsv41_attn_port/dsv41_attn_port/contracts.py": {
+    "instance or callable contract": [
+      "vllm.model_executor.layers.indexer_topk:SparseIndexerTopk._row_ends",
+      "vllm.model_executor.layers.indexer_topk:SparseIndexerTopk.resolve_backend"
+    ]
+  },
+  "dsv41_attn_audit/dsv41_attn_audit/__init__.py": {
+    "hook": [
+      "dsv41_attn_port.swa_meta:build",
+      "dsv41_attn_port.topk_glue:run"
+    ]
+  },
+  "dsv41_draft_argmax/dsv41_draft_argmax/hooks.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.load_draft_model",
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential",
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.propose"
+    ],
+    "instance or callable contract": [
+      "vllm.utils.dsv41_row_mask:features_enabled",
+      "vllm.utils.dsv41_row_mask:confidence_enabled"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.load_draft_model": [
+        "self",
+        "target_model",
+        "target_attn_layer_names"
+      ],
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._sample_sequential": [
+        "self",
+        "num_reqs",
+        "head_hidden"
+      ],
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.propose": [
+        "self",
+        "input_batch",
+        "attn_metadata",
+        "slot_mappings",
+        "last_hidden_states",
+        "aux_hidden_states",
+        "num_sampled",
+        "num_rejected",
+        "last_sampled",
+        "next_prefill_tokens",
+        "temperature",
+        "seeds",
+        "dp_sync_state",
+        "dummy_run",
+        "skip_attn_for_dummy_run",
+        "mm_inputs",
+        "is_profile",
+        "num_speculative_tokens"
+      ]
+    }
+  },
+  "dsv41_draft_argmax/dsv41_draft_argmax/shard.py": {
+    "instance or callable contract": [
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator._markov_step",
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.draft_tokens",
+      "vllm.v1.worker.gpu.spec_decode.dspark.speculator:DSparkSpeculator.draft_token_confidence_probs"
+    ]
+  },
+  "dsv41_rowstats/dsv41_rowstats/hooks.py": {
+    "hook": [
+      "vllm.utils.dsv41_row_mask:configure_drafter",
+      "vllm.utils.dsv41_row_mask:record_top1",
+      "vllm.utils.dsv41_row_mask:publish",
+      "vllm.utils.dsv41_row_mask:begin_target",
+      "vllm.utils.dsv41_row_mask:_STATE"
+    ],
+    "instance or callable contract": [
+      "vllm.utils.dsv41_row_mask:features_enabled"
+    ]
+  },
+  "dsv41_rowstats/dsv41_rowstats/equivalence.py": {
+    "hook": [
+      "vllm.utils.dsv41_row_mask:_STATE"
+    ]
+  },
+  "dsv41_wkv_replica/dsv41_wkv_replica/hooks.py": {
+    "hook": [
+      "vllm.v1.worker.gpu_worker:Worker.load_model"
+    ]
+  },
+  "dsv41_wkv_replica/dsv41_wkv_replica/replica.py": {
+    "hook": [
+      "vllm.model_executor.layers.linear:ColumnParallelLinear.forward"
+    ],
+    "instance or callable contract": [
+      "vllm.model_executor.layers.quantization.modelopt:ModelOptLinearMethod",
+      "vllm.model_executor.layers.quantization.modelopt:FormatScheme",
+      "vllm.models.deepseek_v41.common.engram:Engram.wkv",
+      "vllm.models.deepseek_v41.common.engram:Engram.layer_hash_index"
+    ],
+    "subclass base": [
+      "vllm.model_executor.layers.linear:ColumnParallelLinear"
+    ]
+  },
+  "dsv41_dispatch_fuse/dsv41_dispatch_fuse/hooks.py": {
+    "hook": [
+      "vllm_exl3.exl3:apply_exl3_fused_moe",
+      "vllm_exl3.coop_kernel:execute"
+    ],
+    "instance or callable contract": [
+      "vllm_exl3.exl3:_COOP",
+      "vllm_exl3.exl3:_COOP_KERNEL",
+      "vllm_exl3.exl3:FAT_EXPERT_THRESHOLD",
+      "vllm_exl3.exl3:TEMP_ROWS_FUSED",
+      "vllm_exl3.exl3:_MCG_CODEBOOK_FLAGS",
+      "vllm_exl3.exl3:MOE_ACT_SILU",
+      "vllm_exl3.exl3:get_moe_kernel_backend",
+      "vllm_exl3.exl3:_apply_native_fused_moe",
+      "vllm_exl3.tc_moe_hook:try_apply"
+    ],
+    "signature": {
+      "vllm_exl3.exl3:apply_exl3_fused_moe": [
+        "x2d",
+        "ids",
+        "weights",
+        "layer",
+        "inners",
+        "expert_map",
+        "limit"
+      ],
+      "vllm_exl3.coop_kernel:execute": [
+        "*args"
+      ]
+    }
+  },
+  "dsv41_ablit_r7/dsv41_ablit_r7/hooks.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model",
+      "vllm.v1.worker.gpu_worker:Worker.determine_available_memory",
+      "vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.compute_logits",
+      "dsv41_lora_argmax.hooks:patch",
+      "dsv41_lora_argmax.eligibility:eligible"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model": [
+        "self",
+        "load_dummy_weights",
+        "*args",
+        "model",
+        "**kwargs"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample": [
+        "self",
+        "hidden_states",
+        "input_batch",
+        "grammar_output"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model": [
+        "self",
+        "*",
+        "profile_only"
+      ],
+      "vllm.v1.worker.gpu_worker:Worker.determine_available_memory": [
+        "self"
+      ],
+      "vllm.models.deepseek_v41.nvidia.model:DeepseekV41LLMForCausalLM.compute_logits": [
+        "self",
+        "hidden_states"
+      ],
+      "dsv41_lora_argmax.hooks:patch": [
+        "module"
+      ],
+      "dsv41_lora_argmax.eligibility:eligible": [
+        "r",
+        "batch",
+        "grammar",
+        "sampler_type",
+        "rejection_type"
+      ]
+    }
+  },
+  "dsv41_ablit_r7/dsv41_ablit_r7/draft.py": {
+    "hook": [
+      "dsv41_draft_argmax.hooks:ineligible"
+    ]
+  },
+  "dsv41_ablit_r7/dsv41_ablit_r7/dense.py": {
+    "hook": [
+      "vllm.lora.layers.base_linear:_dsv41_dense_rank1"
+    ]
+  },
+  "dsv41_ablit_r7/dsv41_ablit_r7/graphs.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.initialize_kv_cache",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._resolve_effective_loras",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.captured_token_counts"
+    ],
+    "instance or callable contract": [
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._candidates",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._capture_descs",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.graphs",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.lora_capture_cases",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._graphs_captured",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.lora_capture_cases",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.cudagraph_manager",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._decode_descs"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.initialize_kv_cache": [
+        "self",
+        "kv_cache_config",
+        "is_profiling",
+        "kv_cache_allocation_context",
+        "extensible"
+      ],
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._resolve_effective_loras": [
+        "self",
+        "num_active_loras"
+      ],
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.captured_token_counts": [
+        "self"
+      ]
+    }
+  },
+  "dsv41_indexer_bounded/dsv41_indexer_bounded/__init__.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model",
+      "dsv41_lora_argmax.hooks:patch"
+    ]
+  },
+  "rootfs/opt/qv/indexer_runtime.py": {
+    "hook": [
+      "dsv41_attn_port.topk_glue:run"
+    ],
+    "instance or callable contract": [
+      "dsv41_attn_audit:observe",
+      "vllm.platforms.interface:Platform.is_cuda",
+      "vllm.platforms.interface:Platform.is_device_capability"
+    ]
+  },
+  "dsv41_moe_stack/dsv41_moe_stack/stack_plugin.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture",
+      "dsv41_lora_argmax.hooks:patch",
+      "vllm_exl3.coop_kernel:execute",
+      "vllm_exl3.exl3:apply_exl3_fused_moe"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model": [
+        "self",
+        "load_dummy_weights",
+        "*args",
+        "model",
+        "**kwargs"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model": [
+        "self",
+        "*",
+        "profile_only"
+      ],
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture": [
+        "self",
+        "create_forward_fn",
+        "progress_bar_desc",
+        "stream"
+      ],
+      "dsv41_lora_argmax.hooks:patch": [
+        "module"
+      ],
+      "vllm_exl3.coop_kernel:execute": [
+        "*args"
+      ],
+      "vllm_exl3.exl3:apply_exl3_fused_moe": [
+        "x2d",
+        "ids",
+        "weights",
+        "layer",
+        "inners",
+        "expert_map",
+        "limit"
+      ]
+    }
+  },
+  "rootfs/opt/stack-code/stack_runtime.py": {
+    "hook": [
+      "vllm_exl3.coop_kernel:execute",
+      "vllm_exl3.exl3:apply_exl3_fused_moe"
+    ],
+    "instance or callable contract": [
+      "vllm_exl3.coop_kernel:load",
+      "vllm_exl3.coop_kernel:eligible"
+    ]
+  },
+  "rootfs/opt/prefill-bitwise/runtime.py": {
+    "hook": [
+      "vllm_exl3.tc_moe_hook:try_apply",
+      "vllm.model_executor.layers.linear:ColumnParallelLinear.forward"
+    ]
+  },
+  "dsv41_prefill_7b/dsv41_prefill_7b/__init__.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.execute_model",
+      "dsv41_lora_argmax.hooks:patch"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.execute_model": [
+        "self",
+        "scheduler_output",
+        "intermediate_tensors",
+        "dummy_run",
+        "skip_attn_for_dummy_run",
+        "is_profile",
+        "context_len",
+        "valid_dummy_state_slots",
+        "randomize_inputs"
+      ],
+      "dsv41_lora_argmax.hooks:patch": [
+        "module"
+      ]
+    }
+  },
+  "rootfs/opt/qv/prefill_7b_owner.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.run_fullgraph",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.dispatch",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture": [
+        "self",
+        "create_forward_fn",
+        "progress_bar_desc",
+        "stream"
+      ],
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.run_fullgraph": [
+        "self",
+        "desc"
+      ],
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.dispatch": [
+        "self",
+        "num_reqs",
+        "num_tokens",
+        "uniform_token_count",
+        "num_active_loras",
+        "max_query_len",
+        "num_ubatches"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.load_model": [
+        "self",
+        "load_dummy_weights",
+        "*args",
+        "model",
+        "**kwargs"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.capture_model": [
+        "self",
+        "*",
+        "profile_only"
+      ]
+    },
+    "measurement-only hook": [
+      "dsv41_qv:wrap_worker"
+    ]
+  },
+  "rootfs/opt/qv/prefill_7b_candidate.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.run_fullgraph",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.profile_run"
+    ],
+    "signature": {
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.capture": [
+        "self",
+        "create_forward_fn",
+        "progress_bar_desc",
+        "stream"
+      ],
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.run_fullgraph": [
+        "self",
+        "desc"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.profile_run": [
+        "self",
+        "randomize_inputs"
+      ]
+    },
+    "measurement-only hook": [
+      "dsv41_qv:wrap_worker"
+    ]
+  },
+  "rootfs/opt/qv/graph_policy.py": {
+    "instance or callable contract": [
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._candidates",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._capture_descs",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager.graphs",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.get_model",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.model_state",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.speculator",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.cudagraph_manager",
+      "vllm.v1.worker.gpu.cudagraph_utils:CudaGraphManager._decode_descs"
+    ]
+  },
+  "rootfs/opt/qv/r7b_identity.py": {
+    "hook": [
+      "vllm.v1.core.sched.scheduler:Scheduler.add_request",
+      "vllm.v1.core.sched.scheduler:Scheduler.schedule"
+    ]
+  },
+  "fly_names/fly_names/runtime.py": {
+    "hook": [
+      "vllm.entrypoints.openai.chat_completion.protocol:ChatCompletionRequest.to_sampling_params",
+      "vllm.entrypoints.openai.completion.protocol:CompletionRequest.to_sampling_params",
+      "vllm.entrypoints.openai.models.serving:OpenAIServingModels.init_static_loras",
+      "vllm.entrypoints.openai.models.serving:OpenAIServingModels.show_available_models",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.add_requests",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner._remove_request",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample",
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.gather_batch_req_state",
+      "vllm.v1.worker.gpu.spec_decode.rejection_sampler:RejectionSampler._verify",
+      "vllm.v1.worker.gpu.spec_decode.rejection_sampler:rejection_sample",
+      "dsv41_lora_argmax.hooks:patch"
+    ],
+    "instance or callable contract": [
+      "vllm.v1.worker.gpu.lora_utils:LoraState",
+      "vllm.v1.worker.gpu.sample.sampler:Sampler",
+      "vllm.v1.worker.gpu.spec_decode.draft_logits:DraftLogitsCache.values",
+      "vllm.v1.worker.gpu.spec_decode.draft_logits:DraftLogitsCache.row_mapping"
+    ],
+    "signature": {
+      "vllm.entrypoints.openai.chat_completion.protocol:ChatCompletionRequest.to_sampling_params": [
+        "self",
+        "max_tokens",
+        "default_sampling_params"
+      ],
+      "vllm.entrypoints.openai.completion.protocol:CompletionRequest.to_sampling_params": [
+        "self",
+        "max_tokens",
+        "default_sampling_params"
+      ],
+      "vllm.entrypoints.openai.models.serving:OpenAIServingModels.init_static_loras": [
+        "self"
+      ],
+      "vllm.entrypoints.openai.models.serving:OpenAIServingModels.show_available_models": [
+        "self"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.add_requests": [
+        "self",
+        "scheduler_output"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner._remove_request": [
+        "self",
+        "req_id"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.sample": [
+        "self",
+        "hidden_states",
+        "input_batch",
+        "grammar_output"
+      ],
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.gather_batch_req_state": [
+        "self",
+        "scheduler_output",
+        "dummy_run"
+      ],
+      "vllm.v1.worker.gpu.spec_decode.rejection_sampler:RejectionSampler._verify": [
+        "self",
+        "logits",
+        "draft_logits",
+        "draft_sampled",
+        "pos",
+        "cu_num_logits",
+        "idx_mapping",
+        "idx_mapping_np",
+        "expanded_idx_mapping",
+        "expanded_local_pos",
+        "seq_lens_upper_bound_np",
+        "verify_draft_sampled"
+      ],
+      "vllm.v1.worker.gpu.spec_decode.rejection_sampler:rejection_sample": [
+        "target_logits",
+        "draft_logits_cache",
+        "draft_sampled",
+        "cu_num_logits",
+        "pos",
+        "idx_mapping",
+        "expanded_idx_mapping",
+        "expanded_local_pos",
+        "temperature",
+        "seed",
+        "num_speculative_steps",
+        "synthetic_conditional_rates",
+        "use_fp64",
+        "use_block_verification",
+        "contexts",
+        "watermarking",
+        "watermarking_skip_mask",
+        "watermark_key",
+        "fly_window_size",
+        "fly_entropy_threshold",
+        "fly_entropy_top_k",
+        "skip_masked_vocab_blocks"
+      ],
+      "dsv41_lora_argmax.hooks:patch": [
+        "module"
+      ]
+    }
+  },
+  "dsv41_fly_names/dsv41_fly_names/__init__.py": {
+    "hook": [
+      "vllm.v1.worker.gpu.model_runner:GPUModelRunner.execute_model",
+      "dsv41_lora_argmax.hooks:patch",
+      "fly_names.runtime:cell_control"
+    ]
+  },
+  "dsv41_r7h_switch/dsv41_r7h_switch/__init__.py": {
+    "hook": [
+      "vllm.v1.engine.core:EngineCore.reset_prefix_cache",
+      "vllm.v1.engine.core:EngineCore.step",
+      "vllm.v1.engine.core:EngineCore.step_with_batch_queue",
+      "vllm.v1.engine.core:EngineCore.add_request"
+    ],
+    "instance or callable contract": [
+      "vllm.v1.core.sched.scheduler:Scheduler.has_unfinished_requests"
+    ],
+    "signature": {
+      "vllm.v1.engine.core:EngineCore.reset_prefix_cache": [
+        "self",
+        "reset_running_requests",
+        "reset_connector"
+      ],
+      "vllm.v1.engine.core:EngineCore.step": [
+        "self"
+      ],
+      "vllm.v1.engine.core:EngineCore.step_with_batch_queue": [
+        "self"
+      ],
+      "vllm.v1.engine.core:EngineCore.add_request": [
+        "self",
+        "request",
+        "request_wave"
+      ]
+    }
+  },
+  "rootfs/opt/qv/borrowed_workspace.py": {
+    "subclass base": [
+      "layers:MoeSchedule"
+    ],
+    "override": [
+      "layers:MoeSchedule.prepare",
+      "layers:MoeSchedule.__call__"
+    ]
+  },
+  "fly_names/fly_names/admission.py": {
+    "hook": [
+      "vllm.v1.core.sched.scheduler:Scheduler.add_request"
+    ]
+  },
+  "fly_names/fly_names/policy.py": {
+    "instance or callable contract": [
+      "vllm.sampling_params:SamplingParams.extra_args"
+    ]
+  },
+  "dsv41_attn_port/dsv41_attn_port/swa_meta.py": {
+    "instance or callable contract": [
+      "vllm.v1.attention.backends.mla.sparse_swa:DeepseekSparseSWAMetadataBuilder.device",
+      "vllm.models.deepseek_v41.amd.rocm:DeepseekV41ROCMAiterSparseSWAMetadataBuilder.decode_swa_indices"
+    ]
+  },
+  "dsv41_engram_gap/dsv41_engram_gap/prefetch.py": {
+    "instance or callable contract": [
+      "vllm.models.deepseek_v41.common.engram:Engram._start_prefetch",
+      "vllm.models.deepseek_v41.common.engram:Engram._finish_prefetch"
+    ]
+  },
+  "fly_names/fly_names/host.py": {
+    "measurement-only hook": [
+      "qv_host:write",
+      "qv_workload:write"
+    ]
+  }
+}

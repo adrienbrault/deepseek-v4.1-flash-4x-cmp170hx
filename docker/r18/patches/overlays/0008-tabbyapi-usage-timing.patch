@@ -1,0 +1,162 @@
+diff --git a/vllm/entrypoints/generate/base/serving.py b/vllm/entrypoints/generate/base/serving.py
+--- a/vllm/entrypoints/generate/base/serving.py
++++ b/vllm/entrypoints/generate/base/serving.py
+@@ -18,7 +18,7 @@
+ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+-from vllm.entrypoints.serve.engine.protocol import ErrorResponse
++from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageTiming
+ from vllm.entrypoints.serve.engine.serving import BaseServing
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+ from vllm.exceptions import GenerationError
+@@ -104,6 +104,21 @@
+         prefill_tokens_per_second=prefill_tokens_per_second,
+         decode_tokens_per_second=decode_tokens_per_second,
+     )
++
++
++def set_usage_timing(usage: UsageTiming, metrics: PerRequestMetrics) -> None:
++    """Copy the available timing measurements onto the response's usage."""
++    usage.prompt_tokens_per_sec = metrics.prefill_tokens_per_second
++    usage.completion_tokens_per_sec = metrics.decode_tokens_per_second
++    prompt_ms = metrics.time_to_first_token_ms
++    completion_ms = metrics.generation_time_ms
++    queue_ms = metrics.queue_time_ms
++    if prompt_ms is not None:
++        usage.prompt_time = prompt_ms / 1000
++    if completion_ms is not None:
++        usage.completion_time = completion_ms / 1000
++    if queue_ms is not None and prompt_ms is not None and completion_ms is not None:
++        usage.total_time = (queue_ms + prompt_ms + completion_ms) / 1000
+
+
+ def build_spec_decoding_metrics(
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -25,6 +25,7 @@
+     chat_top_logprobs_limit,
+     clamp_prompt_logprobs,
+     format_token_id_placeholder,
++    set_usage_timing,
+ )
+ from vllm.entrypoints.openai.chat_completion.message_assembly import (
+     assemble_chat_message_fields,
+@@ -905,6 +906,9 @@
+                         stream_per_request_metrics = build_per_request_timing_metrics(
+                             last_metrics, completion_tokens
+                         )
++                        set_usage_timing(
++                            final_usage, stream_per_request_metrics
++                        )
+                     spec_stats = build_spec_decoding_metrics(last_res)
+                     if spec_stats is not None:
+                         if stream_per_request_metrics is None:
+@@ -1138,6 +1142,7 @@
+                 per_request_metrics = build_per_request_timing_metrics(
+                     final_res.metrics, num_generated_tokens
+                 )
++                set_usage_timing(usage, per_request_metrics)
+             spec_stats = build_spec_decoding_metrics(final_res)
+             if spec_stats is not None:
+                 if per_request_metrics is None:
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -23,6 +23,7 @@
+     clamp_prompt_logprobs,
+     completion_top_logprobs_limit,
+     format_token_id_placeholder,
++    set_usage_timing,
+ )
+ from vllm.entrypoints.openai.completion.protocol import (
+     CompletionLogProbs,
+@@ -594,6 +595,9 @@
+                         stream_per_request_metrics = build_per_request_timing_metrics(
+                             last_metrics, total_completion_tokens
+                         )
++                        set_usage_timing(
++                            final_usage_info, stream_per_request_metrics
++                        )
+                     spec_stats = build_spec_decoding_metrics(last_res)
+                     if spec_stats is not None:
+                         if stream_per_request_metrics is None:
+@@ -757,6 +761,7 @@
+                 per_request_metrics = build_per_request_timing_metrics(
+                     last_metrics, num_generated_tokens
+                 )
++                set_usage_timing(usage, per_request_metrics)
+             spec_stats = build_spec_decoding_metrics(last_final_res)
+             if spec_stats is not None:
+                 if per_request_metrics is None:
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -69,7 +69,7 @@
+     resolve_return_mm_kwargs_alias,
+     validate_cache_salt,
+ )
+-from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel
++from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageTiming
+ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.renderers import (
+@@ -110,7 +110,7 @@
+     tool_output_tokens_per_turn: list[int] = Field(default_factory=list)
+
+
+-class ResponseUsage(OpenAIBaseModel):
++class ResponseUsage(UsageTiming):
+     input_tokens: int
+     input_tokens_details: InputTokensDetails
+     output_tokens: int
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -32,6 +32,7 @@
+     GenerateBaseServing,
+     build_per_request_timing_metrics,
+     build_spec_decoding_metrics,
++    set_usage_timing,
+ )
+ from vllm.entrypoints.mcp.tool_server import ToolServer
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+@@ -930,6 +931,7 @@
+                 per_request_metrics = build_per_request_timing_metrics(
+                     context.request_metrics, num_generated_tokens
+                 )
++                set_usage_timing(usage, per_request_metrics)
+             if context.request_spec_decode_metrics is not None:
+                 if per_request_metrics is None:
+                     per_request_metrics = PerRequestMetrics()
+diff --git a/vllm/entrypoints/serve/engine/protocol.py b/vllm/entrypoints/serve/engine/protocol.py
+--- a/vllm/entrypoints/serve/engine/protocol.py
++++ b/vllm/entrypoints/serve/engine/protocol.py
+@@ -132,7 +132,25 @@
+     reasoning_tokens: int = 0
+
+
+-class UsageInfo(OpenAIBaseModel):
++class UsageTiming(OpenAIBaseModel):
++    """TabbyAPI-compatible throughput in tokens/second and timing in seconds."""
++
++    prompt_tokens_per_sec: float | None = Field(
++        default=None, exclude_if=lambda value: value is None
++    )
++    completion_tokens_per_sec: float | None = Field(
++        default=None, exclude_if=lambda value: value is None
++    )
++    prompt_time: float | None = Field(
++        default=None, exclude_if=lambda value: value is None
++    )
++    completion_time: float | None = Field(
++        default=None, exclude_if=lambda value: value is None
++    )
++    total_time: float | None = Field(default=None, exclude_if=lambda value: value is None)
++
++
++class UsageInfo(UsageTiming):
+     prompt_tokens: int = 0
+     total_tokens: int = 0
+     completion_tokens: int | None = 0

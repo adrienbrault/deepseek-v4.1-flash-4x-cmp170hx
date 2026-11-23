@@ -1,0 +1,73 @@
+Subject: Bind bounded indexer to the baked build seal and the enabled token glue.
+
+diff --git a/dsv41_indexer_bounded/dsv41_indexer_bounded/__init__.py b/dsv41_indexer_bounded/dsv41_indexer_bounded/__init__.py
+--- a/dsv41_indexer_bounded/dsv41_indexer_bounded/__init__.py
++++ b/dsv41_indexer_bounded/dsv41_indexer_bounded/__init__.py
+@@ -26,6 +26,8 @@
+     arm = os.environ.get('DSV41_INDEXER_BOUNDED', '0')
+     if arm not in ('0','1'): raise ValueError('bounded indexer: switch')
+     if arm == '0': return  # no imports, allocations, native load or hooks
++    if os.environ.get('DSV41_ATTN_TOPK_GLUE') != '1':
++        raise ValueError('bounded indexer needs DSV41_ATTN_TOPK_GLUE=1')
+     sys.path.insert(0, '/opt/qv')
+     import dsv41_lora_argmax.hooks as owner
+     if getattr(owner.patch, '_indexer_confirm3', False): return
+diff --git a/rootfs/opt/qv/indexer_runtime.py b/rootfs/opt/qv/indexer_runtime.py
+--- a/rootfs/opt/qv/indexer_runtime.py
++++ b/rootfs/opt/qv/indexer_runtime.py
+@@ -10,7 +10,7 @@
+ import os
+ from pathlib import Path
+ from types import CodeType, FunctionType
+-from indexer_common import ROWS, IMAGE, TORCH_GIT, need, read, sha
++from indexer_common import ROWS, need, read, sha
+ 
+ SWITCH = 'DSV41_INDEXER_BOUNDED'
+ LIVE = 'DSV41_INDEXER_BOUNDED_LIVE'
+@@ -54,7 +54,7 @@
+ def native(directory, seal_path, expected_seal):
+     need(sha(seal_path) == expected_seal, 'native seal changed')
+     seal = read(seal_path)
+-    need(seal['image'] == IMAGE and seal['torch_git'] == TORCH_GIT, 'native image/torch seal')
++    need(seal['schema'] == 'r18-indexer-native/1', 'native seal schema')
+     need(sha(directory/'build-receipt.json') == seal['receipt_sha256'], 'native receipt changed')
+     name = seal['binary']
+     need(Path(name).name == name and name.startswith(NAME) and name.endswith('.so'), 'native basename')
+@@ -63,8 +63,8 @@
+     need(name == NAME+'.so' and set(receipt['artifacts']) == {name, 'build.ninja'} and
+          all(sha(directory/f) == h for f,h in receipt['artifacts'].items()), 'native build artifacts changed')
+     import torch
+-    from native_build import check_environment
+-    check_environment(receipt, torch)
++    from native_build import check_r18_environment
++    check_r18_environment(receipt, torch)
+     spec = importlib.util.spec_from_file_location(NAME, directory/name)
+     obj = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(obj)
+@@ -127,7 +127,7 @@
+     need(current_platform.is_cuda() and current_platform.is_device_capability(80), 'requires SM80')
+     authenticate_glue(glue, read('/opt/qv/native-seal.json')['glue_sha256'])
+     op = native(Path('/opt/indexer-native'), Path('/opt/qv/native-seal.json'),
+-                env['DSV41_INDEXER_NATIVE_SEAL_SHA256'])
++                Path('/opt/qv/native-seal.sha256').read_text().strip())
+     binding = Binding(torch, op, torch.device('cuda', torch.cuda.current_device()))
+     binding.on = env.get(SWITCH, '0') == '1'
+     binding.install(glue)
+diff --git a/rootfs/opt/qv/native_build.py b/rootfs/opt/qv/native_build.py
+--- a/rootfs/opt/qv/native_build.py
++++ b/rootfs/opt/qv/native_build.py
+@@ -85,3 +85,14 @@
+         need(sha(f) == receipt['source_headers'][rel] and data.startswith(HEADER_PREFIX) and
+              data.endswith(HEADER_SUFFIX) and hashlib.sha256(data[len(HEADER_PREFIX):-len(HEADER_SUFFIX)]).hexdigest()
+              == expected, 'runtime normalized build header')
++
++
++def check_r18_environment(receipt, torch):
++    import sysconfig
++    package = Path(torch.__file__).parent
++    actual = dict(torch_version=str(torch.__version__), torch_git=torch.version.git_version,
++                  cuda_version=torch.version.cuda, python_soabi=sysconfig.get_config_var('SOABI'),
++                  cxx11_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI))
++    need(actual == receipt['abi'], 'r18 runtime ABI differs')
++    need(all(sha(package/'lib'/name) == digest
++             for name,digest in receipt['torch_libraries'].items()), 'r18 Torch library bytes differ')

@@ -1,0 +1,122 @@
+--- current-r7g-scheduler.py
++++ current-r7h-scheduler.py
+@@ -90,34 +90,41 @@
+ class _FairStep:
+     """One allowance, shared across both scheduling loops, discarded after this step.
+ 
+-    The donor supplies the contended total and even split. This port removes
+-    bypass, snapshots actual charges, and makes M an admission bound as well.
++    The donor supplies the contended total and even split. R2 applies both
++    only to long remaining prefills beside decoders; short work bypasses both.
+     Decode/speculation retains the parent's token and input-row accounting.
+     """
+     def __init__(self, scheduler):
+         self.charges = {}
++        self.minimum = scheduler.fair_min_tokens
+         self.limit = scheduler.fair_split
+         total = scheduler.max_num_scheduled_tokens
+         if any(not r.is_prefill_chunk for r in scheduler.running):
+             total = min(total, scheduler.fair_cap)
+         # Count before lookup: cache hits can conservatively reserve a share.
+         # Actual work is classified later, after cache lookup and SWA replay.
+-        running = sum(r.is_prefill_chunk for r in scheduler.running)
++        running = sum(self.eligible(r, None) for r in scheduler.running)
+         slots = max(0, scheduler.max_num_active_reqs - len(scheduler.running)
+                     - scheduler.num_waiting_for_streaming_input)
+-        waiting = len(scheduler.kv_holding_waiting)
++        waiting = sum(self.eligible(r, r.num_computed_tokens) for r in scheduler.kv_holding_waiting)
+         if scheduler._pause_state == PauseState.UNPAUSED:
+-            waiting += len(scheduler.waiting)
++            waiting += sum(self.eligible(r, r.num_computed_tokens) for r in scheduler.waiting)
+         shares = min(self.limit, running + min(waiting, slots)) if self.limit else 1
+         # Init rejects a cap/split combination that cannot cross the MTP
+         # lookahead window; never enlarge the requested contended allowance.
+         self.left = total
+         self.share = total // max(1, shares)
+ 
+-    def cap(self, request, computed, tokens):
+-        if not (request.is_prefill_chunk if computed is None else computed < request.num_tokens - 1):
++    def eligible(self, request, computed):
++        # Waiting callers pass the actual position AFTER cache lookup/SWA replay.
++        prefill = request.is_prefill_chunk if computed is None else computed < request.num_tokens - 1
++        position = request.num_computed_tokens if computed is None else computed
++        return prefill and request.num_tokens - position > self.minimum
++
++    def cap(self, request, computed, tokens):
++        if not self.eligible(request, computed):
+             return tokens
+-        # Even tiny final chunks consume a prompt share. There is no bypass.
++        # Only long remaining prefills consume a share or allowance.
+         if self.limit and len(self.charges) >= self.limit:
+             return 0
+         return min(tokens, self.share, self.left)
+@@ -125,7 +132,7 @@
+     def charge(self, request, computed, tokens):
+         # Call only after successful KV allocation, before request state moves.
+         # None means the running-loop prefill flag; waiting uses actual work.
+-        if request.is_prefill_chunk if computed is None else computed < request.num_tokens - 1:
++        if self.eligible(request, computed):
+             self.charges[request.request_id] = tokens
+             self.left -= tokens
+             assert self.left >= 0
+@@ -789,13 +796,41 @@
+         try:
+             self.fair_cap = int(os.environ.get("VLLM_DSV41_FAIR_PREFILL", "0"))
+             self.fair_split = int(os.environ.get("VLLM_DSV41_FAIR_PREFILL_SPLIT", "0"))
+-            assert self.fair_cap >= 0 and self.fair_split >= 0
++            self.fair_min_tokens = int(os.environ.get("VLLM_DSV41_FAIR_PREFILL_MIN_TOKENS", "2048"))
++            assert self.fair_cap >= 0 and self.fair_split >= 0 and self.fair_min_tokens >= 0
+             if self.fair_cap:
+                 assert self.scheduler_config.enable_chunked_prefill
+                 assert self.fair_cap <= self.max_num_scheduled_tokens
+                 assert self.fair_cap // max(1, self.fair_split) > self.num_prefill_lookahead
+         except (ValueError, AssertionError):
+             raise ValueError("invalid fair prefill settings") from None
++
++    def _fair_has_long_prefill(self):
++        # Reuse the parent's incremental inventory: admission adds unfinished
++        # prefills; completion, preemption and cancellation remove them. Never
++        # scan the running decode batch just to discover there is no prefill.
++        minimum = self.fair_min_tokens
++        for request in self._inflight_prefills:
++            if (request.status == RequestStatus.RUNNING and request.is_prefill_chunk
++                    and request.num_tokens - request.num_computed_tokens > minimum):
++                return True
++        # A connector can roll a failed remote load back to position zero in
++        # _handle_blocked_waiting_request. Retain conservative a2 accounting in
++        # that case; the local no-connector path needs only raw remaining work.
++        if self.connector is not None:
++            return True
++        # No cache queries, generators, temporary containers or fair objects.
++        # Fresh local cache/SWA lookup cannot increase work beyond this bound;
++        # computed > 0 skips that lookup, so it cannot roll back the position.
++        waiting_minimum = max(1, minimum)
++        for request in self.kv_holding_waiting:
++            if request.num_tokens - request.num_computed_tokens > waiting_minimum:
++                return True
++        if self._pause_state == PauseState.UNPAUSED:
++            for request in self.waiting:
++                if request.num_tokens - request.num_computed_tokens > waiting_minimum:
++                    return True
++        return False
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
+@@ -820,7 +855,16 @@
+         spec = self.vllm_config.speculative_config
+         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+         input_budget = self.scheduler_config.max_num_batched_tokens
+-        fair = _FairStep(self) if self.fair_cap else None
++        fair = None
++        # Decode-only: no helper, allocation, request classification or scan.
++        # Short waiters: allocation-free O(waiting) rejection before scanning
++        # decoders or constructing accounting. Ongoing long prefills still cap
++        # when both waiting queues are empty, via the existing prefill inventory.
++        if (self.fair_cap and self.running and
++                (self.waiting or self.kv_holding_waiting or self._inflight_prefills) and
++                self._fair_has_long_prefill() and
++                any(not r.is_prefill_chunk for r in self.running)):
++            fair = _FairStep(self)
+         if self._pause_state == PauseState.PAUSED_ALL:
+             # Do not schedule any requests when paused.
+             token_budget = 0

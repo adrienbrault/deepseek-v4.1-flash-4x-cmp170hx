@@ -1,0 +1,92 @@
+diff --git a/vllm/entrypoints/openai/responses/context.py b/vllm/entrypoints/openai/responses/context.py
+--- a/vllm/entrypoints/openai/responses/context.py
++++ b/vllm/entrypoints/openai/responses/context.py
+@@ -47,10 +47,11 @@
+ from vllm.utils.gc_utils import untracked_list
+ 
+ if TYPE_CHECKING:
+     from mcp.client import ClientSession
+ 
++    from vllm.entrypoints.generate.base.protocol import SpeculativeDecodingMetrics
+     from vllm.v1.metrics.stats import RequestStateStats
+ 
+ logger = logging.getLogger(__name__)
+ 
+ # This is currently needed as the tool type doesn't 1:1 match the
+@@ -107,10 +108,11 @@
+ 
+ 
+ class ConversationContext(ABC):
+     response_parser: Parser | None = None
+     request_metrics: "RequestStateStats | None" = None
++    request_spec_decode_metrics: "SpeculativeDecodingMetrics | None" = None
+     # Built-in tools can trigger additional model generations. In that case,
+     # the stored engine timestamps cover only one turn, while token usage is
+     # accumulated across all turns.
+     request_metrics_cover_all_generation_turns: bool = True
+ 
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -23,15 +23,17 @@
+ from vllm import envs
+ from vllm.config.utils import replace
+ from vllm.engine.protocol import EngineClient
+ from vllm.entrypoints.generate.base.protocol import (
+     DeltaMessage,
++    PerRequestMetrics,
+     RequestResponseMetadata,
+ )
+ from vllm.entrypoints.generate.base.serving import (
+     GenerateBaseServing,
+     build_per_request_timing_metrics,
++    build_spec_decoding_metrics,
+ )
+ from vllm.entrypoints.mcp.tool_server import ToolServer
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+ from vllm.entrypoints.openai.responses.context import (
+     ConversationContext,
+@@ -686,10 +688,14 @@
+                 reasoning_ended=reasoning_ended,
+             )
+ 
+             async for res in generator:
+                 context.request_metrics = res.metrics
++                if res.finished and len(res.outputs) == 1:
++                    context.request_spec_decode_metrics = (
++                        build_spec_decoding_metrics(res)
++                    )
+                 context.append_output(res)
+                 # NOTE(woosuk): The stop condition is handled by the engine.
+                 yield context
+ 
+             if not context.need_builtin_tool_call():
+@@ -917,17 +923,21 @@
+                     turn.tool_output_tokens for turn in context.all_turn_metrics
+                 ],
+             ),
+         )
+         per_request_metrics = None
+-        if (
+-            self.enable_per_request_metrics
+-            and context.request_metrics_cover_all_generation_turns
+-        ):
+-            per_request_metrics = build_per_request_timing_metrics(
+-                context.request_metrics, num_generated_tokens
+-            )
++        if context.request_metrics_cover_all_generation_turns:
++            if self.enable_per_request_metrics:
++                per_request_metrics = build_per_request_timing_metrics(
++                    context.request_metrics, num_generated_tokens
++                )
++            if context.request_spec_decode_metrics is not None:
++                if per_request_metrics is None:
++                    per_request_metrics = PerRequestMetrics()
++                per_request_metrics.speculative_decoding = (
++                    context.request_spec_decode_metrics
++                )
+         response = ResponsesResponse.from_request(
+             request,
+             sampling_params,
+             input_messages=input_messages,
+             output_messages=output_messages,

@@ -1,0 +1,23 @@
+Subject: Check the v0.34 verifier cache ABI and preserve persistent-slot mappings.
+
+diff --git a/fly_names/fly_names/runtime.py b/fly_names/fly_names/runtime.py
+--- a/fly_names/fly_names/runtime.py
++++ b/fly_names/fly_names/runtime.py
+@@ -171,6 +171,8 @@
+     signature = inspect.signature(original)
+     native_sig = inspect.signature(native)
+     slot_argument = list(signature.parameters).index('idx_mapping_np') - 1
++    if 'draft_logits_cache' not in native_sig.parameters:
++        raise ValueError('FLy expected the v0.34 persistent draft-logits cache ABI')
+     native_positions = {name:i for i,(name,p) in enumerate(native_sig.parameters.items())
+                         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)}
+     fly_options = dict(fly_window_size=1, fly_entropy_threshold=.3, fly_entropy_top_k=3)
+@@ -272,6 +274,8 @@
+         lo, hi = offsets[i], offsets[end]
+         # BoundArguments must be separate for each span; never mutate the
+         # original/default call or slice arrays indexed by persistent slots.
++        # In v0.34 draft_logits_cache includes a persistent-slot row mapping.
++        # Pass the same cache and mapping through, even for sharded logits.
+         selected = type(bound)(bound.signature, dict(arguments))
+         for key in ('target_logits','draft_sampled','pos','expanded_idx_mapping','expanded_local_pos',
+                     'contexts','watermarking_skip_mask'):

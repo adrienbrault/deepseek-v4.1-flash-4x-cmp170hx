@@ -1,0 +1,36 @@
+    @staticmethod
+    def _schedule_probe_tag(request_id):
+        # The chat API adds chatcmpl- and the engine can append its own suffix.
+        if request_id.startswith(_SCHEDULE_PROBE_PREFIX):
+            tag = request_id[len(_SCHEDULE_PROBE_PREFIX):].partition("-")[0]
+            if len(tag) == 32 and all(c in "0123456789abcdef" for c in tag):
+                return tag
+        return None
+
+    def _trace_schedule_step(self, output):
+        import json
+
+        rows = []
+        new = {req.req_id for req in output.scheduled_new_reqs}
+        for req_id, count in output.num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            tag = self._schedule_probe_tag(req_id)
+            if tag is not None:
+                request._dsv41_schedule_steps = getattr(request, "_dsv41_schedule_steps", 0) + 1
+            rows.append([tag, count, request.num_computed_tokens, request.num_prompt_tokens,
+                         request.replay_start, len(output.scheduled_spec_decode_tokens.get(req_id, ())),
+                         req_id in new])
+        self._small_prefill_log("DSV41_SCHED_STEP " + json.dumps({
+            "step": self.current_step, "rows": rows,
+            "draft_limit": output.num_spec_tokens_to_schedule, "skip_drafts": output.skip_drafts,
+        }))
+
+    def _trace_schedule_end(self, request):
+        import json
+
+        tag = self._schedule_probe_tag(request.request_id)
+        if tag is not None:
+            self._small_prefill_log("DSV41_SCHED_END " + json.dumps({
+                "tag": tag, "steps": getattr(request, "_dsv41_schedule_steps", 0),
+            }))
+

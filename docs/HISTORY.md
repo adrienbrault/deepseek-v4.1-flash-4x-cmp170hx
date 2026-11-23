@@ -15,6 +15,14 @@ The table records changes of the daily definition. A selected definition can rem
 | 2026-11-16 00:00 | current-r7d | Rows-family kernels for 24 row counts plus K2 fixed16, single-bank capture-only MoE plugin; [confirmation and acceptance](../bench/results/2026-11-15-current-r7d-qualification/). Serving remains stopped. |
 | 2026-11-16 09:08 | current-r7e | Bitwise eager prefill MoE schedule at 128–2,048 rows, borrowed workspace; acceptance `20261116T083315Z-760421-actual-acceptance` PASS, serving stopped. [Same-hour suite](../bench/results/2026-11-16-current-r7e-suite/). |
 | 2026-11-16 18:25 | current-r7f | Container memory and memory-swap 36 -> 52 GiB, same kernels/model; acceptance `20261116T180842Z-1157942-actual-acceptance` PASS at 18:08–18:22 UTC, identity before/after, KV and client contracts PASS; report-only suite SKIPPED. Selected, serving stopped. |
+| 2026-11-17 02:48 | current-r7g | Selected the opt-in fast names while retaining base-name and adapter behaviour on the f760 image. |
+| 2026-11-19 | r18 port | Rebased from the nightly to vLLM 0.34.0 and rebuilt the ring for FlashInfer 0.7.3. The first GPU boot passed startup on the new engine. [Patch series](PATCHES.md) |
+| 2026-11-20 04:48 | current-r18a | First promoted r18 daily. Enabled fair prefill, the rebuilt ring, 0.98 GPU memory utilization, startup warm-up and request timing. The short-request share stayed disabled on this image. |
+| 2026-11-20 18:20 | current-r18b | Promoted half-share prefill including adapter requests and capped speculative verification width at three for uniform decode batches of seven or more. [Plan and policy](../config/served.json) |
+| 2026-11-23 to 2026-11-24 | current-r18b x16 headline | The 2026-11-21 PCIe rework preceded the return to x16 on all four cards. The headline records an argv match to seal `seal-nORCnYLm`. [x16 results](../bench/results/2026-11-24-current-r18b-headline/) |
+
+The 2026-11-20 UTC r18b acceptance on the same installed image passed base-name token identity in mixed-adapter traffic, prefix isolation, repeated-session cache reuse and tool and metrics checks. The acceptance flagged neighbour-dependent output for the abliterated name and low free VRAM in the headroom probe. The recorded 2,483,207-token pool is from that acceptance boot with one card at x8. The source was the retained r18 results and acceptance policy. The 2026-11-24 benchmark boot measured the base name on four x16 links. [Serving plan](../config/served.json), [headline notes](../bench/results/2026-11-24-current-r18b-headline/NOTES.md)
+
 
 ## Current-r7b qualification, 2026-11-14
 

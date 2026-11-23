@@ -1,0 +1,32 @@
+Subject: Include uniform CUDA graphs in the prefill fence and resolve the installed stack observer.
+
+diff --git a/rootfs/opt/qv/graph_policy.py b/rootfs/opt/qv/graph_policy.py
+--- a/rootfs/opt/qv/graph_policy.py
++++ b/rootfs/opt/qv/graph_policy.py
+@@ -65,10 +65,12 @@
+     require(descriptors and all(0 < d.num_tokens <= 48 for d in descriptors),
+             'capture descriptor exceeds decode ceiling')
+     require(all(d.num_tokens <= 48 for d in manager.graphs), 'captured graph exceeds ceiling')
+-    require(manager._candidates and all(key[0] <= 48 for key in manager._candidates),
++    token_keyed = manager._candidates
++    uniform = manager._decode_descs
++    require((token_keyed or uniform) and all(key[0] <= 48 for key in token_keyed),
+             'graph dispatch candidate exceeds ceiling')
+     inventory = descriptors + list(manager.graphs) + [
+-        d for candidates in manager._candidates.values() for d in candidates]
++        d for table in (token_keyed, uniform) for candidates in table.values() for d in candidates]
+     require(all(mode_name(d.cg_mode) == 'FULL' and 0 < d.num_tokens <= 48 and
+                 (d.uniform_token_count is not None or d.max_query_len is not None)
+                 for d in inventory), 'non-decode graph descriptor')
+diff --git a/rootfs/opt/qv/prefill_7b_candidate.py b/rootfs/opt/qv/prefill_7b_candidate.py
+--- a/rootfs/opt/qv/prefill_7b_candidate.py
++++ b/rootfs/opt/qv/prefill_7b_candidate.py
+@@ -87,7 +87,7 @@
+                 raise ValueError('7b executed outside registered eager domain')
+             counts[e['arm']]+=1
+             key=str(e['rows']);rows[key]=rows.get(key,0)+1
+-        import stack_plugin
++        from dsv41_moe_stack import stack_plugin
+         b=stack_plugin.binding
+         receipt=dict(pid=os.getpid(),on=enabled(),calls=dict(counts),rows=dict(rows),
+                      graph=runner._prefill_runtime_proof,

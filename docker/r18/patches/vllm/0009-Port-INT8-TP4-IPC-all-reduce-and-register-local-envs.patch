@@ -1,0 +1,643 @@
+Subject: [PATCH 09/10] Port INT8 TP4 IPC all-reduce and register local envs
+
+Origin: r17 vLLM patches 0015, 0020, 0021, 0022.
+
+Source port for vLLM v0.34.0. Existing notices and SPDX headers are retained.
+
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 9efff8e..684d28c 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -117,104 +117,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         self.symm_mem_comm: SymmMemCommunicator | None = None
+         self.fi_ar_comm: FlashInferAllReduce | None = None
+         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
+-        self.aiter_ar_comm: AiterCustomAllreduce | None = None
+-        self.use_aiter_ag_rs: bool = False
+-        self.use_aiter_tp_all_gather: bool = False
+-
+-        # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
+-        config = get_current_vllm_config_or_none()
+-        register = config is None or not config.use_cumem_cudagraph_pool
+-
+-        if use_torch_symm_mem and current_platform.is_cuda():
+-            self.symm_mem_comm = SymmMemCommunicator(
+-                group=self.cpu_group,
+-                device=self.device,
+-            )
+-
+-        if self.use_flashinfer_allreduce and self.world_size > 1:
+-            self.fi_ar_comm = FlashInferAllReduce(
+-                group=self.cpu_group,
+-                device=self.device,
+-            )
+-
+-        if (
+-            self.use_flashinfer_pcie_ipc_allreduce
+-            and self.world_size > 1
+-            and self.device_group is not None
+-        ):
+-            self.fi_pcie_ipc_ar_comm = FlashInferPcieIpcAllReduce(
+-                group=self.device_group,
+-                tune_group=self.cpu_group,
+-                device=self.device,
+-            )
+-
+-        if self.use_aiter_allreduce and self.world_size > 1:
+-            self.aiter_ar_comm = AiterCustomAllreduce(
+-                group=self.cpu_group,
+-                device=self.device,
+-                register_graph_buffers=register,
+-            )
+-
+-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
+-            # Initialize a custom fast all-reduce implementation.
+-            self.ca_comm = CustomAllreduce(
+-                group=self.cpu_group,
+-                device=self.device,
+-                symm_mem_enabled=(
+-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
+-                ),
+-                register_graph_buffers=register,
+-            )
+-
+-        # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine.
+-        # AITER requires a torch.distributed-registered group and exchanges IPC
+-        # handles via the default store; stateless groups satisfy neither.
+-        # Only StatelessGroupCoordinator passes tcp_store_group, so this checks
+-        # the property AITER depends on rather than the feature that currently
+-        # creates stateless groups (elastic EP).
+-        if (
+-            "dp" in unique_name
+-            and tcp_store_group is None
+-            and self.world_size in (2, 4, 8)
+-            and current_platform.is_rocm()
+-            and rocm_aiter_ops.is_custom_all_reduce_enabled()
+-        ):
+-            self.aiter_ar_comm = AiterCustomAllreduce(
+-                group=self.cpu_group,
+-                device=self.device,
+-                register_graph_buffers=register,
++        self.int8_ar_comm = None
++        if envs.VLLM_DSV41_INT8_AR and unique_name.split(":")[0] == "tp":
++            from .dsv41_int8_all_reduce import DSV41Int8AllReduce
++
++            if envs.VLLM_BATCH_INVARIANT:
++                raise ValueError(
++                    "INT8 all-reduce changes numerics; "
++                    "batch invariant mode is incompatible"
++                )
++            self.int8_ar_comm = DSV41Int8AllReduce(self.cpu_group, self.device)
++            logger.warning_once(
++                "Experimental INT8 TP4 all-reduce enabled: "
++                "256-value scales, FP32 sums, finite BF16 inputs only"
+             )
+-            if self.aiter_ar_comm.disabled:
+-                self.aiter_ar_comm = None
+-            else:
+-                self.use_aiter_ag_rs = True
+-        elif self.aiter_ar_comm is not None and self.world_size in (2, 4, 8):
+-            from vllm.platforms.rocm import get_cdna_version
+-
+-            self.use_aiter_tp_all_gather = get_cdna_version() in (3, 4)
+-
+-        if (
+-            use_custom_allreduce
+-            and self.world_size > 1
+-            and current_platform.is_rocm()
+-            and not envs.VLLM_BATCH_INVARIANT
+-        ):
+-            # Initialize a custom quick all-reduce implementation for AMD.
+-            # Quick reduce is designed as a complement to custom allreduce
+-            # (vLLM's or AITER's), so it is initialized for either backend.
+-            # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+-            # On ROCm, 'use_custom_allreduce==True' means it must currently be
+-            # an MI300 series.
+-            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+-
+-        if self.world_size > 1:
+-            self._log_all_reduce_backend_selection()
+-
+-        if self.use_all2all:
+-            if self.all2all_backend in ("naive", "allgather_reducescatter"):
+-                from .all2all import AgRsAll2AllManager
+-
+-                self.all2all_manager = AgRsAll2AllManager(
++        self.all2all_manager = AgRsAll2AllManager(
+                     self.cpu_group, tcp_store_group
+                 )
+             elif self.all2all_backend == "deepep_high_throughput":
+@@ -387,6 +304,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         )
+ 
+     def all_reduce(self, input_):
++        if envs.VLLM_DSV41_TBO:
++            from vllm.v1.worker.ubatching import (
++                dbo_enabled,
++                dbo_switch_to_comm_sync,
++                dbo_yield_and_switch_from_comm_to_compute,
++            )
++
++            if dbo_enabled():
++                # Own the producer output across scratch reuse by the other half.
++                owned = input_.clone()
++                dbo_switch_to_comm_sync()
++                owned.record_stream(torch.cuda.current_stream())
++                out = self._all_reduce(owned).clone()
++                dbo_yield_and_switch_from_comm_to_compute()
++                out.record_stream(torch.cuda.current_stream())
++                return out
++        return self._all_reduce(input_)
++
++    def _all_reduce(self, input_):
++        int8_comm = getattr(self, "int8_ar_comm", None)
++        if int8_comm is not None and int8_comm.supports(input_):
++            return int8_comm.all_reduce(input_)
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+@@ -860,6 +799,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             raise ValueError("No PyNCCL communicator found")
+ 
+     def destroy(self):
++        if self.int8_ar_comm is not None:
++            self.int8_ar_comm.destroy()
++            self.int8_ar_comm = None
+         if self.pynccl_comm is not None:
+             self.pynccl_comm.destroy()
+             self.pynccl_comm = None
+diff --git a/vllm/distributed/device_communicators/dsv41_int8_all_reduce.py b/vllm/distributed/device_communicators/dsv41_int8_all_reduce.py
+new file mode 100644
+index 0000000..387c8c7
+--- /dev/null
++++ b/vllm/distributed/device_communicators/dsv41_int8_all_reduce.py
+@@ -0,0 +1,278 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Experimental TP4 INT8 IPC all-reduce, with FP32 block scales and sums.
++
++Two-shot pull: publish quantized input, reduce each rank's quarter in FP32,
++requantize the sums, then gather the quantized quarters. Three rendezvous
++protect both phases and storage reuse. Uses vLLM's CUDA IPC allocator, with
++dedicated storage rather than aliasing FlashInfer's opaque mailbox.
++"""
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
++from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.triton_utils import tl, triton
++
++WIDTH = 5120
++MAX_ROWS = 48
++BLOCK = 256
++PAYLOAD = MAX_ROWS * WIDTH
++SCALES = PAYLOAD // BLOCK
++# Header: input-ready, shard-ready, consumed epochs; data/scales follow it.
++HEADER = 256
++SCALE_OFFSET = HEADER + PAYLOAD
++SECOND_OFFSET = SCALE_OFFSET + SCALES * 4
++SECOND_SCALE_OFFSET = SECOND_OFFSET + PAYLOAD // 4
++BUFFER_BYTES = SECOND_SCALE_OFFSET + SCALES
++
++
++def int8_reference(inputs):
++    """Independent torch codec and conservative elementwise BF16 error budget.
++
++    Inputs are four finite BF16 rank tensors. The bound includes quantization,
++    FP32 dequantization/addition, and final/reference BF16 rounding.
++    """
++    values = inputs.float().reshape(4, -1, BLOCK)
++    scales = (values.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1.0e-30)
++    quantized = torch.round(values / scales).clamp(-127, 127)
++    decoded = quantized * scales
++    total = torch.zeros_like(decoded[0])
++    exact = torch.zeros_like(values[0])
++    for rank in range(4):
++        total = total + decoded[rank]
++        exact = exact + values[rank]
++    output_scales = (total.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1.0e-30)
++    requantized = torch.round(total / output_scales).clamp(-127, 127)
++    decoded_total = requantized * output_scales
++    result = decoded_total.to(torch.bfloat16).reshape(inputs.shape[1:])
++    reference = exact.to(torch.bfloat16).reshape(inputs.shape[1:])
++    fp32_budget = 1.0e-6 * values.abs().sum(0)
++    bound = (
++        0.5 * (scales.sum(0) + output_scales)
++        + fp32_budget
++        + (decoded_total.abs() + exact.abs()) / 256.0
++    )
++    return result, reference, bound.expand_as(total).reshape(inputs.shape[1:])
++
++
++@triton.jit
++def _quantize(
++    X,
++    Ptrs,
++    RANK: tl.constexpr,
++    HEADER: tl.constexpr,
++    SCALE_OFFSET: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    block = tl.program_id(0)
++    lane = tl.arange(0, BLOCK)
++    x = tl.load(X + block * BLOCK + lane).to(tl.float32)
++    scale = tl.maximum(tl.div_rn(tl.max(tl.abs(x), 0), 127.0), 1.0e-30)
++    # Explicit round-to-nearest-even; no FP8 instructions on Ampere.
++    q = tl.inline_asm_elementwise(
++        "cvt.rni.s32.f32 $0, $1;",
++        constraints="=r,f",
++        args=[tl.div_rn(x, scale)],
++        dtype=tl.int32,
++        is_pure=True,
++        pack=1,
++    )
++    base = tl.load(Ptrs + RANK)
++    values = (base + HEADER).to(tl.pointer_type(tl.int8))
++    scales = (base + SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++    tl.store(values + block * BLOCK + lane, tl.minimum(127, tl.maximum(-127, q)))
++    tl.store(scales + block, scale)
++
++
++@triton.jit
++def _rendezvous(Ptrs, RANK: tl.constexpr, PHASE: tl.constexpr):
++    # One CTA only. Stream order completes quantize/reduce before publishing.
++    # Separate ready/consumed epochs prevent a fast rank overwriting a slow
++    # reader's payload. No host reset or capture-time sequence constants.
++    local = (tl.load(Ptrs + RANK) + PHASE * 8).to(tl.pointer_type(tl.uint64))
++    previous = tl.inline_asm_elementwise(
++        "ld.global.acquire.sys.u64 $0, [$1];", constraints="=l,l",
++        args=[local], dtype=tl.uint64, is_pure=False, pack=1)
++    epoch = previous + 1
++    tl.inline_asm_elementwise(
++        "st.global.release.sys.u64 [$1], $2; mov.u32 $0, 0;",
++        constraints="=r,l,l",
++        args=[local, epoch],
++        dtype=tl.uint32,
++        is_pure=False,
++        pack=1,
++    )
++    for peer in tl.static_range(4):
++        signal = (tl.load(Ptrs + peer) + PHASE * 8).to(tl.pointer_type(tl.uint64))
++        seen = tl.inline_asm_elementwise(
++            "ld.global.acquire.sys.u64 $0, [$1];",
++            constraints="=l,l",
++            args=[signal],
++            dtype=tl.uint64,
++            is_pure=False,
++            pack=1,
++        )
++        while seen < epoch:
++            seen = tl.inline_asm_elementwise(
++                "ld.global.acquire.sys.u64 $0, [$1];",
++                constraints="=l,l",
++                args=[signal],
++                dtype=tl.uint64,
++                is_pure=False,
++                pack=1,
++            )
++
++
++@triton.jit
++def _reduce_quantize(
++    Ptrs,
++    RANK: tl.constexpr,
++    SHARD_BLOCKS: tl.constexpr,
++    HEADER: tl.constexpr,
++    SCALE_OFFSET: tl.constexpr,
++    SECOND_OFFSET: tl.constexpr,
++    SECOND_SCALE_OFFSET: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    local_block = tl.program_id(0)
++    block = RANK * SHARD_BLOCKS + local_block
++    lane = tl.arange(0, BLOCK)
++    total = tl.full((BLOCK,), 0.0, tl.float32)
++    for rank in tl.static_range(4):
++        base = tl.load(Ptrs + rank)
++        values = (base + HEADER).to(tl.pointer_type(tl.int8))
++        scales = (base + SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++        q = tl.load(values + block * BLOCK + lane, cache_modifier=".cg").to(tl.float32)
++        scale = tl.load(scales + block, cache_modifier=".cg")
++        total = total + q * scale
++    scale = tl.maximum(tl.div_rn(tl.max(tl.abs(total), 0), 127.0), 1.0e-30)
++    q = tl.inline_asm_elementwise(
++        "cvt.rni.s32.f32 $0, $1;",
++        constraints="=r,f",
++        args=[tl.div_rn(total, scale)],
++        dtype=tl.int32,
++        is_pure=True,
++        pack=1,
++    )
++    base = tl.load(Ptrs + RANK)
++    values = (base + SECOND_OFFSET).to(tl.pointer_type(tl.int8))
++    scales = (base + SECOND_SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++    tl.store(values + local_block * BLOCK + lane, tl.minimum(127, tl.maximum(-127, q)))
++    tl.store(scales + local_block, scale)
++
++
++@triton.jit
++def _gather(
++    Ptrs,
++    Out,
++    SHARD_BLOCKS: tl.constexpr,
++    SECOND_OFFSET: tl.constexpr,
++    SECOND_SCALE_OFFSET: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    block = tl.program_id(0)
++    rank = block // SHARD_BLOCKS
++    local_block = block % SHARD_BLOCKS
++    lane = tl.arange(0, BLOCK)
++    base = tl.load(Ptrs + rank)
++    values = (base + SECOND_OFFSET).to(tl.pointer_type(tl.int8))
++    scales = (base + SECOND_SCALE_OFFSET).to(tl.pointer_type(tl.float32))
++    q = tl.load(values + local_block * BLOCK + lane, cache_modifier=".cg").to(
++        tl.float32
++    )
++    scale = tl.load(scales + local_block, cache_modifier=".cg")
++    tl.store(Out + block * BLOCK + lane, q * scale)
++
++
++class DSV41Int8AllReduce:
++    """Single serialized stream across eager/capture/replay, like FI IPC.
++
++    TBO's comm stream is joined back to its compute stream on every handoff;
++    that also orders storage reuse against subsequent non-TBO forwards.
++    """
++
++    def __init__(self, group, device):
++        if dist.get_world_size(group) != 4:
++            raise ValueError("INT8 IPC all-reduce requires TP4")
++        if not all(in_the_same_node_as(group, source_rank=0)):
++            raise ValueError("INT8 IPC all-reduce requires a single node")
++        self.rank = dist.get_rank(group)
++        self.group = group
++        self.device = torch.device(device)
++        supported = torch.cuda.get_device_capability(device) == (8, 0)
++        # Agree before allocating: a local-only refusal would strand the peers.
++        supported = supported and all(
++            peer == self.device.index
++            or torch.cuda.can_device_access_peer(self.device.index, peer)
++            for peer in range(torch.cuda.device_count())
++        )
++        votes = [None] * 4
++        dist.all_gather_object(votes, supported, group=group)
++        if not all(votes):
++            raise ValueError("INT8 IPC requires SM80 and complete GPU peer access")
++        self.pointers = CustomAllreduce.create_shared_buffer(BUFFER_BYTES, group)
++        self.ptrs = torch.tensor(self.pointers, device=device, dtype=torch.uint64)
++        self.closed = False
++        torch.cuda.synchronize(device)
++        dist.barrier(group=group)
++
++    @staticmethod
++    def supports(x):
++        return (
++            x.is_cuda
++            and x.dtype == torch.bfloat16
++            and x.is_contiguous()
++            and x.ndim == 2
++            and x.shape[1] == WIDTH
++            and 1 <= x.shape[0] <= MAX_ROWS
++        )
++
++    def all_reduce(self, x):
++        assert self.supports(x)
++        output = torch.empty_like(x)
++        blocks = x.numel() // BLOCK
++        _quantize[(blocks,)](
++            x,
++            self.ptrs,
++            self.rank,
++            HEADER,
++            SCALE_OFFSET,
++            BLOCK,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _rendezvous[(1,)](self.ptrs, self.rank, 0, num_warps=1)
++        _reduce_quantize[(blocks // 4,)](
++            self.ptrs,
++            self.rank,
++            blocks // 4,
++            HEADER,
++            SCALE_OFFSET,
++            SECOND_OFFSET,
++            SECOND_SCALE_OFFSET,
++            BLOCK,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _rendezvous[(1,)](self.ptrs, self.rank, 1, num_warps=1)
++        _gather[(blocks,)](
++            self.ptrs,
++            output,
++            blocks // 4,
++            SECOND_OFFSET,
++            SECOND_SCALE_OFFSET,
++            BLOCK,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _rendezvous[(1,)](self.ptrs, self.rank, 2, num_warps=1)
++        return output
++
++    def destroy(self):
++        if not self.closed:
++            torch.cuda.synchronize(self.device)
++            dist.barrier(group=self.group)
++            CustomAllreduce.free_shared_buffer(self.pointers, rank=self.rank)
++            self.closed = True
+diff --git a/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py b/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
+index 10e9bf8..e92d667 100644
+--- a/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
++++ b/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
+@@ -17,6 +17,7 @@ import torch
+ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+ 
++import vllm.envs as envs
+ from vllm.distributed.parallel_state import in_the_same_node_as
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+@@ -54,6 +55,7 @@ class FlashInferPcieIpcAllReduce:
+         self.world_size = dist.get_world_size(group)
+         self.rank = dist.get_rank(group)
+         self.workspace: Any | None = None
++        self.tbo_workspace = None
+         self.hidden_dim = 0
+         self.dtype: torch.dtype | None = None
+ 
+@@ -99,6 +101,7 @@ class FlashInferPcieIpcAllReduce:
+         dtype: torch.dtype,
+         capture_sizes: Sequence[int],
+         tune_cache: Path,
++        tbo_stream: torch.cuda.Stream | None = None,
+     ) -> None:
+         """Allocate, tune, and prepare the exact graph-capture shapes."""
+         if self.disabled or self.workspace is not None:
+@@ -144,8 +147,25 @@ class FlashInferPcieIpcAllReduce:
+             tune_group=self.tune_group,
+         )
+         workspace.prepare([(batch, self.hidden_dim) for batch in batches], dtype=dtype)
+-        torch.accelerator.synchronize(self.device)
+-        workspace.rebind_stream()
++        if tbo_stream is not None:
++            # One workspace per stream; the two halves serialize on tbo_stream.
++            with torch.cuda.stream(tbo_stream):
++                tbo_workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
++                    group=self.group,
++                    max_numel=max_numel,
++                    dtype=dtype,
++                    tune_batches=batches,
++                    tune_cache=str(tune_cache.with_suffix(".tbo.json")),
++                )
++                tbo_workspace.rebind_stream()
++                tbo_workspace.tune(
++                    [self.hidden_dim], dtype=dtype, tune_group=self.tune_group
++                )
++                tbo_workspace.prepare(
++                    [(n, self.hidden_dim) for n in batches], dtype=dtype
++                )
++                self.tbo_workspace = tbo_workspace
++            torch.accelerator.synchronize(self.device)
+         logger.info_once(
+             "Initialized FlashInfer PCIe IPC all-reduce for TP%d, hidden_dim=%d, "
+             "dtype=%s, max_tokens=%d.",
+@@ -155,8 +175,16 @@ class FlashInferPcieIpcAllReduce:
+             batches[-1],
+         )
+ 
++    def active_workspace(self):
++        if getattr(self, "tbo_workspace", None) is not None:
++            from vllm.v1.worker.ubatching import dbo_enabled
++
++            if dbo_enabled():
++                return self.tbo_workspace
++        return self.workspace
++
+     def should_use(self, inp: torch.Tensor) -> bool:
+-        workspace = self.workspace
++        workspace = self.active_workspace()
+         return bool(
+             not self.disabled
+             and workspace is not None
+@@ -169,8 +197,9 @@ class FlashInferPcieIpcAllReduce:
+         )
+ 
+     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+-        assert self.workspace is not None
+-        return self.workspace.all_reduce(inp)
++        workspace = self.active_workspace()
++        assert workspace is not None
++        return workspace.all_reduce(inp)
+ 
+     @contextmanager
+     def capture(self):
+@@ -193,6 +222,9 @@ class FlashInferPcieIpcAllReduce:
+             workspace.rebind_stream()
+ 
+     def destroy(self) -> None:
++        if self.tbo_workspace is not None:
++            self.tbo_workspace.destroy()
++            self.tbo_workspace = None
+         workspace = self.workspace
+         if workspace is not None:
+             workspace.destroy()
+@@ -216,7 +248,7 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
+     pcie_comm = communicator.fi_pcie_ipc_ar_comm
+     if pcie_comm is None or pcie_comm.disabled:
+         return
+-    if worker.vllm_config.parallel_config.use_ubatching:
++    if worker.vllm_config.parallel_config.use_ubatching and not envs.VLLM_DSV41_TBO:
+         logger.warning_once(
+             "FlashInfer PCIe IPC all-reduce does not yet support DBO or "
+             "multi-ubatch execution; falling back to another backend."
+@@ -228,6 +260,11 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
+     if not capture_sizes:
+         return
+ 
++    tbo_stream = None
++    if envs.VLLM_DSV41_TBO:
++        tbo_stream = worker.model_runner.ubatch_runner.comm_stream
++        # Half sizes differ from parent graph buckets, including ragged totals.
++        capture_sizes = sorted(set(capture_sizes) | set(range(1, 49)))
+     base_cache = resolve_flashinfer_autotune_file(worker.model_runner)
+     ranks = "-".join(str(rank) for rank in tp_group.ranks)
+     tune_cache = base_cache.with_name(f"pcie_ipc_allreduce_tp_{ranks}.json")
+@@ -236,4 +273,5 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
+         dtype=worker.model_config.dtype,
+         capture_sizes=capture_sizes,
+         tune_cache=tune_cache,
++        tbo_stream=tbo_stream,
+     )
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 9837f6a..f7f8fd0 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -12,6 +12,10 @@ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any, Literal
+ 
+ if TYPE_CHECKING:
++    VLLM_DSV41_INT8_AR: bool = False
++    VLLM_DSV41_TBO_CHECK: bool = False
++    VLLM_DSV41_TBO: bool = False
++    VLLM_DSV41_TBO_MIN_ROWS: int = 12
+     VLLM_HOST_IP: str = ""
+     VLLM_PORT: int | None = None
+     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
+@@ -202,6 +206,8 @@ if TYPE_CHECKING:
+     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+     VLLM_V1_USE_OUTLINES_CACHE: bool = False
+     VLLM_TPU_USING_PATHWAYS: bool = False
++    VLLM_MHC_SM80: bool = False
++    VLLM_MHC_SM80_CONFIG: str = ""
+     VLLM_USE_DEEP_GEMM: bool = True
+     VLLM_MOE_USE_DEEP_GEMM: bool = True
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+@@ -267,6 +273,8 @@ if TYPE_CHECKING:
+         | None
+     ) = None
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
++    VLLM_TP_DISTRIBUTED_SAMPLING: bool = False
++    VLLM_TP_SAMPLING_CANDIDATES: int = 256
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+     VLLM_CONFIDENTIAL_COMPUTE: str | None = None
+@@ -660,6 +668,10 @@ removed_environment_variables: dict[str, str] = {
+ }
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    "VLLM_DSV41_INT8_AR": lambda: bool(int(os.getenv("VLLM_DSV41_INT8_AR", "0"))),
++    "VLLM_DSV41_TBO_CHECK": lambda: bool(int(os.getenv("VLLM_DSV41_TBO_CHECK", "0"))),
++    "VLLM_DSV41_TBO": lambda: bool(int(os.getenv("VLLM_DSV41_TBO", "0"))),
++    "VLLM_DSV41_TBO_MIN_ROWS": lambda: int(os.getenv("VLLM_DSV41_TBO_MIN_ROWS", "12")),
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+@@ -1674,6 +1686,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_TPU_USING_PATHWAYS": lambda: bool(
+         "proxy" in os.getenv("JAX_PLATFORMS", "").lower()
+     ),
++    # Inline offline-tuned JSON is included in the compilation cache hash.
++    # Set both before starting workers / graph capture.
++    "VLLM_MHC_SM80": lambda: bool(int(os.getenv("VLLM_MHC_SM80", "0"))),
++    "VLLM_MHC_SM80_CONFIG": lambda: os.getenv("VLLM_MHC_SM80_CONFIG", ""),
+     # Allow use of DeepGemm kernels for fused moe ops.
+     "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
+     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
+@@ -2000,6 +2016,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Enable checking whether the generated logits contain NaNs,
+     # indicating corrupted output. Useful for debugging low level bugs
+     # or bad hardware but it may add compute overhead.
++    "VLLM_TP_DISTRIBUTED_SAMPLING": lambda: bool(
++        int(os.getenv("VLLM_TP_DISTRIBUTED_SAMPLING", "0"))
++    ),
++    "VLLM_TP_SAMPLING_CANDIDATES": lambda: int(
++        os.getenv("VLLM_TP_SAMPLING_CANDIDATES", "256")
++    ),
+     "VLLM_COMPUTE_NANS_IN_LOGITS": lambda: bool(
+         int(os.getenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0"))
+         or int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))

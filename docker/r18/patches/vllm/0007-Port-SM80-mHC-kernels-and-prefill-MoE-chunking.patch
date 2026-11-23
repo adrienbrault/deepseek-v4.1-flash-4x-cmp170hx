@@ -1,0 +1,649 @@
+Subject: [PATCH 07/10] Port SM80 mHC kernels and prefill MoE chunking
+
+Origin: r17 vLLM patches 0019, 0020, 0025.
+
+Source port for vLLM v0.34.0. Existing notices and SPDX headers are retained.
+
+diff --git a/vllm/model_executor/kernels/mhc/sm80.py b/vllm/model_executor/kernels/mhc/sm80.py
+new file mode 100644
+index 0000000..ed8a2b0
+--- /dev/null
++++ b/vllm/model_executor/kernels/mhc/sm80.py
+@@ -0,0 +1,311 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in SIMT mHC for V4.1's delayed pre-mix, hc=4, hidden=5120, SM80."""
++
++import torch
++
++from vllm import envs
++from vllm.model_executor.kernels.mhc.sm80_config import SM80Config, select_config
++from vllm.triton_utils import tl, triton
++
++
++def get_sm80_config(residual, op, width):
++    if (
++        residual.ndim != 3
++        or residual.shape[1:] != (4, 5120)
++        or residual.dtype != torch.bfloat16
++        or not residual.is_contiguous()
++        or not residual.is_cuda
++        or torch.cuda.get_device_capability(residual.device) != (8, 0)
++    ):
++        return None
++    return select_config(op, residual.shape[0], width, envs.VLLM_MHC_SM80_CONFIG)
++
++
++@triton.jit
++def _post_values(X, R, P, C, row, k, valid, H: tl.constexpr):
++    stream = k // H
++    h = k % H
++    value = tl.load(P + row * 4 + stream, valid, 0) * tl.load(
++        X + row * H + h, valid, 0
++    ).to(tl.float32)
++    for i in tl.static_range(4):
++        coeff = tl.load(C + row * 16 + i * 4 + stream, valid, 0)
++        residual = tl.load(R + row * 4 * H + i * H + h, valid, 0).to(tl.float32)
++        value = tl.fma(coeff, residual, value)
++    return value
++
++
++@triton.jit
++def _project(
++    X,
++    R,
++    P,
++    C,
++    W,
++    R_OUT,
++    MIX,
++    SQR,
++    ROWS: tl.constexpr,
++    H: tl.constexpr,
++    K: tl.constexpr,
++    SPLITS: tl.constexpr,
++    BK: tl.constexpr,
++    BN: tl.constexpr,
++    POST: tl.constexpr,
++    ROUND_POST: tl.constexpr,
++):
++    row = tl.program_id(0)
++    tile = tl.program_id(1)
++    split = tl.program_id(2)
++    k = split * BK + tl.arange(0, BK)
++    n = tile * BN + tl.arange(0, BN)
++    if POST:
++        value = _post_values(X, R, P, C, row, k, k < K, H)
++        if tile == 0:
++            tl.store(R_OUT + row * K + k, value, k < K)
++        if ROUND_POST:
++            value = value.to(tl.bfloat16).to(tl.float32)
++    else:
++        value = tl.load(X + row * K + k, k < K, 0).to(tl.float32)
++    weight = tl.load(
++        W + n[:, None] * K + k[None, :], (n[:, None] < 24) & (k[None, :] < K), 0
++    )
++    dot = tl.sum(weight * value[None, :], 1)
++    tl.store(MIX + (split * ROWS + row) * 24 + n, dot, n < 24)
++    if tile == 0:
++        tl.store(SQR + split * ROWS + row, tl.sum(value * value, 0))
++
++
++@triton.jit
++def _finish(
++    R,
++    MIX,
++    SQR,
++    SCALE,
++    BASE,
++    PRE,
++    NORM,
++    POST,
++    COMB,
++    INPUT,
++    NEXT_PRE,
++    AUX,
++    ROWS: tl.constexpr,
++    H: tl.constexpr,
++    K: tl.constexpr,
++    SPLITS: tl.constexpr,
++    BS: tl.constexpr,
++    BH: tl.constexpr,
++    RMS_EPS: tl.constexpr,
++    PRE_EPS: tl.constexpr,
++    SINK_EPS: tl.constexpr,
++    POST_MULT: tl.constexpr,
++    REPEAT: tl.constexpr,
++    NORM_EPS: tl.constexpr,
++    CARRIED: tl.constexpr,
++    NORMALIZE: tl.constexpr,
++    WRITE_AUX: tl.constexpr,
++):
++    row = tl.program_id(0)
++    s = tl.arange(0, BS)
++    n = tl.arange(0, 32)
++    sqr = tl.sum(tl.load(SQR + s * ROWS + row, s < SPLITS, 0), 0)
++    parts = tl.load(
++        MIX + (s[:, None] * ROWS + row) * 24 + n[None, :],
++        (s[:, None] < SPLITS) & (n[None, :] < 24),
++        0,
++    )
++    mix = tl.sum(parts, 0) * tl.rsqrt(sqr / K + RMS_EPS)
++    group = tl.where(n < 4, 0, tl.where(n < 8, 1, 2))
++    logits = mix * tl.load(SCALE + group) + tl.load(BASE + n, n < 24, 0)
++    j = tl.arange(0, 4)
++    pre = tl.sigmoid(tl.gather(logits, j, 0)) + PRE_EPS
++    post = tl.sigmoid(tl.gather(logits, j + 4, 0)) * POST_MULT
++    tl.store(NEXT_PRE + row * 4 + j, pre)
++    tl.store(POST + row * 4 + j, post)
++    ij = tl.arange(0, 16)
++    comb = tl.gather(logits, ij + 8, 0).reshape(4, 4)
++    comb = tl.exp(comb - tl.max(comb, 1)[:, None])
++    comb = comb / tl.sum(comb, 1)[:, None] + SINK_EPS
++    comb = comb / (tl.sum(comb, 0)[None, :] + SINK_EPS)
++    for _ in range(REPEAT - 1):
++        comb = comb / (tl.sum(comb, 1)[:, None] + SINK_EPS)
++        comb = comb / (tl.sum(comb, 0)[None, :] + SINK_EPS)
++    tl.store(COMB + row * 16 + ij, comb.reshape(16))
++
++    h = tl.arange(0, BH)
++    collapsed = tl.full((BH,), 0, tl.float32)
++    mean = tl.full((BH,), 0, tl.float32)
++    for i in tl.static_range(4):
++        value = tl.load(R + row * 4 * H + i * H + h, h < H, 0).to(tl.float32)
++        if CARRIED:
++            coeff = tl.load(PRE + row * 4 + i)
++            collapsed = tl.fma(coeff, value, collapsed)
++        elif i == 0:
++            collapsed = value
++        if WRITE_AUX:
++            mean += value
++    rounded = collapsed.to(tl.bfloat16).to(tl.float32)
++    if NORMALIZE:
++        rstd = tl.rsqrt(tl.sum(rounded * rounded, 0) / H + NORM_EPS)
++        rounded = rounded * rstd * tl.load(NORM + h, h < H, 0).to(tl.float32)
++    tl.store(INPUT + row * H + h, rounded, h < H)
++    if WRITE_AUX:
++        tl.store(AUX + row * H + h, mean * 0.25, h < H)
++
++
++@triton.jit
++def _post(X, R, P, C, OUT, H: tl.constexpr, B: tl.constexpr):
++    row = tl.program_id(0)
++    k = tl.program_id(1) * B + tl.arange(0, B)
++    value = _post_values(X, R, P, C, row, k, k < 4 * H, H)
++    tl.store(OUT + row * 4 * H + k, value, k < 4 * H)
++
++
++def mhc_post_sm80(x, residual, post, comb, config: SM80Config):
++    rows, _, hidden = residual.shape
++    assert residual.shape[1:] == (4, 5120) and 1 <= rows <= 48
++    assert residual.is_contiguous() and residual.dtype == torch.bfloat16
++    assert x.shape == (rows, hidden) and x.is_contiguous()
++    assert x.dtype == torch.bfloat16
++    assert post.shape in ((rows, 4), (rows, 4, 1)) and post.is_contiguous()
++    assert comb.shape == (rows, 4, 4) and comb.is_contiguous()
++    assert post.dtype == comb.dtype == torch.float32
++    out = torch.empty_like(residual)
++    _post[(rows, triton.cdiv(4 * hidden, config.block_h))](
++        x,
++        residual,
++        post,
++        comb,
++        out,
++        hidden,
++        config.block_h,
++        num_warps=config.num_warps,
++    )
++    return out
++
++
++def mhc_pre_sm80(
++    residual,
++    fn,
++    scale,
++    base,
++    rms_eps,
++    pre_eps,
++    sink_eps,
++    post_mult,
++    repeat,
++    pre_mix=None,
++    x=None,
++    norm_weight=None,
++    norm_eps=1e-6,
++    *,
++    sublayer_out=None,
++    post_layer_mix=None,
++    comb_res_mix=None,
++    capture_aux=False,
++    config: SM80Config,
++):
++    """Return the six delayed-seam outputs; standalone pre drops first/last."""
++    rows, _, hidden = residual.shape
++    fused = sublayer_out is not None
++    round_post = False
++    if fused:
++        from vllm.model_executor.kernels.mhc.tilelang_kernels import (
++            mhc_fused_post_pre_split_config,
++        )
++
++        # Upstream's fused seam projects FP32 registers. Its separate post/pre
++        # route projects the stored BF16 residual instead.
++        round_post = mhc_fused_post_pre_split_config(rows, hidden, 4) is None
++    projection = residual.flatten(1) if x is None else x
++    width = projection.shape[1]
++    assert residual.is_contiguous() and residual.dtype == torch.bfloat16
++    assert residual.shape[1:] == (4, 5120) and 1 <= rows <= 48
++    assert projection.is_contiguous() and projection.dtype == torch.bfloat16
++    assert width in (hidden, 4 * hidden) and (not fused or x is None)
++    assert fn.shape == (24, width) and fn.dtype == torch.float32
++    assert fn.is_contiguous() and scale.is_contiguous() and base.is_contiguous()
++    assert scale.shape == (3,) and base.shape == (24,)
++    assert scale.dtype == base.dtype == torch.float32
++    assert repeat >= 1
++    if pre_mix is not None:
++        assert pre_mix.shape == (rows, 4) and pre_mix.is_contiguous()
++        assert pre_mix.dtype == torch.float32
++    if norm_weight is not None:
++        assert norm_weight.shape == (hidden,) and norm_weight.is_contiguous()
++        assert norm_weight.dtype == torch.bfloat16
++    if fused:
++        assert sublayer_out.shape == (rows, hidden)
++        assert sublayer_out.dtype == torch.bfloat16 and sublayer_out.is_contiguous()
++        assert post_layer_mix.shape in ((rows, 4), (rows, 4, 1))
++        assert comb_res_mix.shape == (rows, 4, 4)
++        assert post_layer_mix.is_contiguous() and comb_res_mix.is_contiguous()
++        assert post_layer_mix.dtype == comb_res_mix.dtype == torch.float32
++
++    splits = triton.cdiv(width, config.block_k)
++    mix = torch.empty((splits, rows, 24), device=residual.device, dtype=torch.float32)
++    sqr = torch.empty((splits, rows), device=residual.device, dtype=torch.float32)
++    updated = torch.empty_like(residual) if fused else residual
++    post = torch.empty((rows, 4, 1), device=residual.device, dtype=torch.float32)
++    comb = torch.empty((rows, 4, 4), device=residual.device, dtype=torch.float32)
++    next_pre = torch.empty((rows, 4), device=residual.device, dtype=torch.float32)
++    layer_input = torch.empty(
++        (rows, hidden), device=residual.device, dtype=torch.bfloat16
++    )
++    aux = torch.empty(
++        (rows if capture_aux else 0, hidden),
++        device=residual.device,
++        dtype=torch.bfloat16,
++    )
++    _project[(rows, triton.cdiv(24, config.tile_n), splits)](
++        sublayer_out if fused else projection,
++        residual,
++        post_layer_mix if fused else post,
++        comb_res_mix if fused else comb,
++        fn,
++        updated,
++        mix,
++        sqr,
++        rows,
++        hidden,
++        width,
++        splits,
++        config.block_k,
++        config.tile_n,
++        fused,
++        round_post,
++        num_warps=config.num_warps,
++    )
++    _finish[(rows,)](
++        updated,
++        mix,
++        sqr,
++        scale,
++        base,
++        pre_mix if pre_mix is not None else next_pre,
++        norm_weight if norm_weight is not None else layer_input,
++        post,
++        comb,
++        layer_input,
++        next_pre,
++        aux,
++        rows,
++        hidden,
++        width,
++        splits,
++        triton.next_power_of_2(splits),
++        triton.next_power_of_2(hidden),
++        rms_eps,
++        pre_eps,
++        sink_eps,
++        post_mult,
++        repeat,
++        norm_eps,
++        pre_mix is not None,
++        norm_weight is not None,
++        capture_aux,
++        num_warps=4,
++    )
++    return updated, post, comb, layer_input, next_pre, aux
+diff --git a/vllm/model_executor/kernels/mhc/sm80_config.py b/vllm/model_executor/kernels/mhc/sm80_config.py
+new file mode 100644
+index 0000000..77a21ec
+--- /dev/null
++++ b/vllm/model_executor/kernels/mhc/sm80_config.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fixed decode configurations; offline tuning never runs in a serving process."""
++
++import json
++from dataclasses import asdict, dataclass
++from functools import cache
++
++
++@dataclass(frozen=True)
++class SM80Config:
++    block_k: int = 1024
++    tile_n: int = 4
++    num_warps: int = 4
++    block_h: int = 256
++
++    def __post_init__(self):
++        for name, allowed in (
++            ("block_k", (256, 512, 1024, 2048)),
++            ("tile_n", (2, 4, 8)),
++            ("num_warps", (4, 8)),
++            ("block_h", (128, 256, 512, 1024)),
++        ):
++            value = getattr(self, name)
++            if type(value) is not int or value not in allowed:
++                raise ValueError(f"Invalid SM80 mHC {name}: {value!r}")
++
++    def to_dict(self):
++        return asdict(self)
++
++
++def config_key(op: str, rows: int, width: int) -> str:
++    return f"{op}:{rows}:{width}"
++
++
++@cache
++def parse_configs(raw: str) -> dict[str, SM80Config | None]:
++    if not raw:
++        return {}
++    data = json.loads(raw)
++    if (
++        not isinstance(data, dict)
++        or type(data.get("version")) is not int
++        or data.get("version") != 1
++        or not isinstance(data.get("configs"), dict)
++    ):
++        raise ValueError("SM80 mHC configuration requires version=1 and configs")
++    result = {}
++    for key, value in data["configs"].items():
++        op, rows, width = key.split(":")
++        if not supported_shape(op, int(rows), int(width)) or key != config_key(
++            op, int(rows), int(width)
++        ):
++            raise ValueError(f"Unsupported SM80 mHC configuration key: {key}")
++        result[key] = None if value is None else SM80Config(**value)
++    return result
++
++
++def supported_shape(op: str, rows: int, width: int) -> bool:
++    widths = {"pre": (5120, 20480), "fused": (20480,), "post": (5120,)}
++    return 1 <= rows <= 48 and width in widths.get(op, ())
++
++
++def select_config(op: str, rows: int, width: int, raw: str = ""):
++    if not supported_shape(op, rows, width):
++        return None
++    # Starting points, not measured winners. The tuner can select upstream
++    # (JSON null) independently for every row count and operation.
++    default = SM80Config(
++        block_k=512 if rows <= 2 else 1024 if rows <= 8 else 2048,
++        tile_n=4 if rows <= 8 else 8,
++    )
++    return parse_configs(raw).get(config_key(op, rows, width), default)
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index 5a291b9..9674a29 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import torch
+ 
++from vllm import envs
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+@@ -98,6 +99,29 @@ def mhc_pre_delayed_tilelang(
+         (tokens, hc_mult, hc_mult), (tokens, hidden_size), and (tokens, hc_mult).
+ 
+     """
++    if envs.VLLM_MHC_SM80:
++        from vllm.model_executor.kernels.mhc.sm80 import get_sm80_config, mhc_pre_sm80
++
++        width = residual.shape[-1] * residual.shape[-2] if x is None else x.shape[-1]
++        config = get_sm80_config(residual, "pre", width)
++        if config is not None:
++            return mhc_pre_sm80(
++                residual,
++                fn,
++                hc_scale,
++                hc_base,
++                rms_eps,
++                hc_pre_eps,
++                hc_sinkhorn_eps,
++                hc_post_mult_value,
++                sinkhorn_repeat,
++                pre_mix,
++                x,
++                norm_weight,
++                norm_eps,
++                config=config,
++            )[1:5]
++
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+         _HC_PRENORM_GEMM_TILELANG_KERNEL,
+         mhc_pre_big_fuse_tilelang,
+@@ -310,6 +334,31 @@ def mhc_fused_post_pre_delayed_tilelang(
+         and (tokens, hidden_size).
+ 
+     """
++    if envs.VLLM_MHC_SM80:
++        from vllm.model_executor.kernels.mhc.sm80 import get_sm80_config, mhc_pre_sm80
++
++        config = get_sm80_config(residual, "fused", residual.shape[-1] * 4)
++        if config is not None:
++            return mhc_pre_sm80(
++                residual,
++                fn,
++                hc_scale,
++                hc_base,
++                rms_eps,
++                hc_pre_eps,
++                hc_sinkhorn_eps,
++                hc_post_mult_value,
++                sinkhorn_repeat,
++                pre_mix=pre_mix,
++                norm_weight=norm_weight,
++                norm_eps=norm_eps,
++                sublayer_out=x,
++                post_layer_mix=post_layer_mix,
++                comb_res_mix=comb_res_mix,
++                capture_aux=capture_aux,
++                config=config,
++            )
++
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+         _HC_PRENORM_GEMM_TILELANG_KERNEL,
+         _MHC_FUSED_TILELANG_KERNEL,
+@@ -781,6 +830,16 @@ def mhc_post_tilelang(
+     post_layer_mix: torch.Tensor,
+     comb_res_mix: torch.Tensor,
+ ) -> torch.Tensor:
++    if envs.VLLM_MHC_SM80:
++        from vllm.model_executor.kernels.mhc.sm80 import (
++            get_sm80_config,
++            mhc_post_sm80,
++        )
++
++        config = get_sm80_config(residual, "post", residual.shape[-1])
++        if config is not None:
++            return mhc_post_sm80(x, residual, post_layer_mix, comb_res_mix, config)
++
+     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+         _MHC_POST_TILELANG_KERNEL,
+     )
+diff --git a/vllm/utils/dsv41_prefill_overlap.py b/vllm/utils/dsv41_prefill_overlap.py
+new file mode 100644
+index 0000000..5ea9fae
+--- /dev/null
++++ b/vllm/utils/dsv41_prefill_overlap.py
+@@ -0,0 +1,150 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in, eager prefill MoE compute / PyNCCL reduction pipeline."""
++
++import json
++import os
++import re
++import weakref
++from collections.abc import Callable
++from pathlib import Path
++
++import torch
++
++from vllm.distributed import get_tp_group
++from vllm.forward_context import get_forward_context
++from vllm.utils.torch_utils import direct_register_custom_op
++
++_layers: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
++
++
++def chunk_ranges(rows: int, maximum: int) -> list[tuple[int, int]]:
++    """Cover all rows with balanced chunks, avoiding a tiny decode-shaped tail."""
++    if rows <= 0 or maximum <= 0:
++        raise ValueError("rows and maximum must be positive")
++    count = (rows + maximum - 1) // maximum
++    size, extra = divmod(rows, count)
++    sizes = [size + (i < extra) for i in range(count)]
++    start = 0
++    result = []
++    for size in sizes:
++        result.append((start, start + size))
++        start += size
++    return result
++
++
++def pipeline_moe(
++    compute: Callable[[int, int], torch.Tensor],
++    rows: int,
++    maximum: int,
++    communicator,
++    stream: torch.cuda.Stream,
++) -> torch.Tensor:
++    """Reduce owned output chunks while the producer computes the next chunk.
++
++    Use PyNCCL directly: FlashInfer IPC workspaces are stream-bound. Cloning
++    each local result protects it from scratch reuse in the next MoE call.
++    """
++    producer = torch.cuda.current_stream()
++    output = None
++    try:
++        for lo, hi in chunk_ranges(rows, maximum):
++            local = compute(lo, hi).contiguous().clone()
++            if output is None:
++                output = local.new_empty((rows, *local.shape[1:]))
++                output.record_stream(stream)
++            ready = torch.cuda.Event()
++            ready.record(producer)
++            stream.wait_event(ready)
++            with torch.cuda.stream(stream):
++                communicator.all_reduce(
++                    local, out_tensor=output[lo:hi], stream=stream
++                )
++                local.record_stream(stream)
++    finally:
++        producer.wait_stream(stream)
++    assert output is not None
++    return output
++
++
++def register_moe(layer, prefix: str) -> str:
++    name = f"{prefix}:{id(layer)}"
++    _layers[name] = layer
++    return name
++
++
++def _prefill_moe(
++    hidden: torch.Tensor, input_ids: torch.Tensor | None, name: str
++) -> torch.Tensor:
++    layer = _layers[name]
++    group = get_tp_group()
++    context = get_forward_context()
++    metadata = context.attn_metadata
++    prefill = isinstance(metadata, dict) and any(
++        getattr(m, "num_prefills", 0) > 0 for m in metadata.values()
++    )
++    chunk = layer._dsv41_prefill_chunk
++    communicator = getattr(group.device_communicator, "pynccl_comm", None)
++    if (
++        not prefill
++        or hidden.shape[0] < 2 * chunk
++        or torch.cuda.is_current_stream_capturing()
++    ):
++        return group.all_reduce(layer._dsv41_local_forward(hidden, input_ids))
++    if communicator is None or communicator.disabled:
++        raise RuntimeError(
++            "DSV41 prefill overlap requires an enabled PyNCCL communicator"
++        )
++
++    stream = getattr(layer, "_dsv41_prefill_stream", None)
++    if stream is None:
++        stream = torch.cuda.Stream(device=hidden.device)
++        layer._dsv41_prefill_stream = stream
++
++    full_padding = context.is_padding
++
++    def compute(lo, hi):
++        context.is_padding = (
++            full_padding[lo:hi] if full_padding is not None else None
++        )
++        try:
++            ids = input_ids[lo:hi] if input_ids is not None else None
++            return layer._dsv41_local_forward(hidden[lo:hi], ids)
++        finally:
++            context.is_padding = full_padding
++
++    output = pipeline_moe(compute, hidden.shape[0], chunk, communicator, stream)
++    if os.environ.get("DSV41_PREFILL_MOE_CHECK", "0") == "1":
++        # Expensive qualification only: reject any batch/collective-order change.
++        reference = group.all_reduce(layer._dsv41_local_forward(hidden, input_ids))
++        equal = torch.equal(output, reference)
++        error = (output.float() - reference.float()).abs().max().item()
++        directory = os.environ.get("DSV41_PREFILL_MOE_CHECK_DIR")
++        if directory:
++            import torch.distributed as dist
++
++            rank = dist.get_rank()
++            root = Path(directory)
++            root.mkdir(parents=True, exist_ok=True)
++            label = re.sub(r"[^A-Za-z0-9_.-]", "_", layer.prefix)
++            receipt = root / f"moe-rank{rank}-{label}-t{hidden.shape[0]}-c{chunk}.json"
++            receipt.write_text(json.dumps({
++                "rank": rank, "layer": layer.prefix, "rows": hidden.shape[0],
++                "chunk": chunk, "bit_equal": equal, "max_abs_error": error,
++            }, indent=2) + "\n")
++        if not equal:
++            raise RuntimeError(
++                f"DSV41 MoE overlap failed exact parity at {layer.prefix}: {error}"
++            )
++    return output
++
++
++def _prefill_moe_fake(
++    hidden: torch.Tensor, input_ids: torch.Tensor | None, name: str
++) -> torch.Tensor:
++    return torch.empty_like(hidden)
++
++
++direct_register_custom_op(
++    "dsv41_prefill_moe", _prefill_moe, fake_impl=_prefill_moe_fake
++)

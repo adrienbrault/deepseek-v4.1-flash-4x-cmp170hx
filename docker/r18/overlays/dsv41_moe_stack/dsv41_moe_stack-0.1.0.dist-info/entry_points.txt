@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_moe_stack = dsv41_moe_stack:register

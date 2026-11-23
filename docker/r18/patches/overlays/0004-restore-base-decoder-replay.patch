@@ -1,0 +1,128 @@
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -10,11 +10,11 @@
+ import torch
+ from vllm.utils import dsv41_row_mask as _dsv41_row_mask
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+-from vllm.config import VllmConfig
++from vllm.config import CUDAGraphMode, VllmConfig
+ from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
+ from vllm.distributed import (
+     get_pcp_group,
+     get_pp_group,
+     get_tensor_model_parallel_world_size,
+@@ -1098,16 +1098,11 @@
+         # the last KV source run on each request's trailing window only
+         # (decoder_replay_layers.py).
+         self.decoder_replay_layers: DecoderReplayLayers | None = None
+         self.decoder_replay_start = self.end_layer
+         cut = max(config.kv_source_layer_ids)
+-        if (
+-            cut < self.end_layer - 1
+-            and self._decoder_replay_supported(vllm_config, cut)
+-            and self.layers[cut].attn.swa_cache_layer.bounded_replay
+-            and vllm_config.lora_config is None
+-        ):
++        if self._decoder_replay_enabled(vllm_config, cut):
+             assert self.layers[cut].attn.compress_ratio <= 1
+             # The last KV source writes every row's KV, then replays.
+             self.decoder_replay_start = cut
+             # The attention metadata keys the replay layers read.
+             metadata_prefixes = set()
+@@ -1133,10 +1128,14 @@
+                 cut,
+                 cut + 1,
+                 self.end_layer - 1,
+                 config.sliding_window,
+             )
++            if vllm_config.lora_config is not None:
++                logger.info_once(
++                    "Decoder SWA bounded replay with LoRA: base-only eager steps."
++                )
+ 
+         # The n-gram hash needs a slot-keyed rolling store of compressed ids
+         # (chunked prefill / decode lookback); key it off the first local
+         # layer's sliding-window KV cache. Only PP ranks owning an engram
+         # layer need it.
+@@ -1580,10 +1579,32 @@
+             *(
+                 aux_hidden_by_layer[layer_id]
+                 for layer_id in self.aux_hidden_state_layers
+                 if layer_id in aux_hidden_by_layer
+             ),
++        )
++
++    def _decoder_replay_enabled(self, vllm_config: VllmConfig, cut: int) -> bool:
++        lora = vllm_config.lora_config
++        parallel = vllm_config.parallel_config
++        # With wo_b-only LoRA we can trim eager batches whose token mapping is
++        # entirely inactive. Restrict the exception to local request batches
++        # without PIECEWISE prefill graph breaks or DP replay agreement.
++        lora_compatible = lora is None or (
++            tuple(lora.target_modules or ()) == ("wo_b",)
++            and parallel.data_parallel_size == 1
++            and parallel.pipeline_parallel_size == 1
++            and parallel.prefill_context_parallel_size == 1
++            and parallel.decode_context_parallel_size == 1
++            and vllm_config.compilation_config.cudagraph_mode
++            in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
++        )
++        return (
++            cut < self.end_layer - 1
++            and self._decoder_replay_supported(vllm_config, cut)
++            and self.layers[cut].attn.swa_cache_layer.bounded_replay
++            and lora_compatible
+         )
+ 
+     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
+         """Whether this rank may replay from layer ``cut`` on; warns when not."""
+         parallel_config = vllm_config.parallel_config
+diff --git a/vllm/models/deepseek_v41/nvidia/model_state.py b/vllm/models/deepseek_v41/nvidia/model_state.py
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py
+@@ -221,11 +221,14 @@
+         self._replay: tuple[int, torch.Tensor] | None = None
+ 
+         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
+             model, "decoder_replay_layers", None
+         )
++        self._has_lora_np: np.ndarray | None = None
+         if self.decoder_replay_layers is not None:
++            if vllm_config.lora_config is not None:
++                self._has_lora_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
+             if self.pcp_size > 1:
+                 assert self.decoder_replay_layers.window >= 2 * self.pcp_size, (
+                     "PCP replay requires window >= 2 * PCP size so each trimmed "
+                     "request is represented on every rank."
+                 )
+@@ -282,10 +285,12 @@
+             layers.trim_threshold = threshold
+ 
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
+         self._replay_start_np[req_index] = new_req_data.replay_start
++        if self._has_lora_np is not None:
++            self._has_lora_np[req_index] = new_req_data.lora_request is not None
+         if self.decoder_replay_layers is not None:
+             params = new_req_data.sampling_params
+             self._keeps_rows_np[req_index] = (
+                 params is not None
+                 and (
+@@ -515,10 +520,14 @@
+         if cudagraph_mode != CUDAGraphMode.NONE and not force_replay_batch:
+             return
+ 
+         num_reqs = input_batch.num_reqs
+         idx_mapping_np = input_batch.idx_mapping_np[:num_reqs]
++        # Punica still indexes the outer batch. Dropping rows before another
++        # request could shift its adapter indices, so keep the whole step.
++        if self._has_lora_np is not None and self._has_lora_np[idx_mapping_np].any():
++            return
+         query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+         seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
+         keeps_rows = self._keeps_rows_np[idx_mapping_np]
+         pcp = input_batch.pcp
+         kv_start: np.ndarray | None = None

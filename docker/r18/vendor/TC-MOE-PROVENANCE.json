@@ -1,0 +1,52 @@
+{
+  "tc_source": "CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE",
+  "tc_revision": "88eb6e13de0ea5491579fddb195116a4176f4bc7",
+  "original_authors": "Curtis White (DeepSeek port/hook), Morrowmake (kernels), Turboderp (codec)",
+  "files": {
+    "build_standalone.py": {
+      "original_sha256": "22c2772ca0e964df065d1eb8b3a54a55c43f7f6c22c0576e4907824b90a891f5",
+      "delivered_sha256": "18780a53ad2780390fe603d1efb0bac2421c9d2282ed82a2f0fbbfcac8d4d354",
+      "unchanged": false
+    },
+    "codec.cuh": {
+      "original_sha256": "0b24bd09f73a118af2c673d7f4d193dc08f0d74024b352d950b5327be1951805",
+      "delivered_sha256": "0b24bd09f73a118af2c673d7f4d193dc08f0d74024b352d950b5327be1951805",
+      "unchanged": true
+    },
+    "codec_moe_v2.cuh": {
+      "original_sha256": "2eb328dbacdb781b0ff0e47cfa21526608a4a293d8c37b58177577abe02edc68",
+      "delivered_sha256": "2eb328dbacdb781b0ff0e47cfa21526608a4a293d8c37b58177577abe02edc68",
+      "unchanged": true
+    },
+    "common.h": {
+      "original_sha256": "7c5e4c6aee249fe91333cfa51c5c010dbee0bb0ce99a8ae99b541513409d4893",
+      "delivered_sha256": "7c5e4c6aee249fe91333cfa51c5c010dbee0bb0ce99a8ae99b541513409d4893",
+      "unchanged": true
+    },
+    "module.cpp": {
+      "original_sha256": "9ef6ca8c81e152972786e72cc2b5ab974aa60d33196dca3e929163f60d8cd4fc",
+      "delivered_sha256": "9ef6ca8c81e152972786e72cc2b5ab974aa60d33196dca3e929163f60d8cd4fc",
+      "unchanged": true
+    },
+    "moe_prefill.cu": {
+      "original_sha256": "d7c6b0922f5852e67c82aad5eba1802ed5b74dac850f5412145258ae290d74ff",
+      "delivered_sha256": "d7c6b0922f5852e67c82aad5eba1802ed5b74dac850f5412145258ae290d74ff",
+      "unchanged": true
+    },
+    "moe_prefill.h": {
+      "original_sha256": "93fdd2a27ce58e5da00ec3d4d804676040835ce7c65ae3387a0c93a017c7d3a5",
+      "delivered_sha256": "93fdd2a27ce58e5da00ec3d4d804676040835ce7c65ae3387a0c93a017c7d3a5",
+      "unchanged": true
+    },
+    "moe_v2.cu": {
+      "original_sha256": "b3b041cea133a9ec5f87536891a715b78c2cfe7e5053e561b960d9b65a1761b8",
+      "delivered_sha256": "b3b041cea133a9ec5f87536891a715b78c2cfe7e5053e561b960d9b65a1761b8",
+      "unchanged": true
+    },
+    "moe_v2.h": {
+      "original_sha256": "2f8c8e9dd412507f81af3ae009636ae69b059c5a5183466a7412c707efbc4b40",
+      "delivered_sha256": "2f8c8e9dd412507f81af3ae009636ae69b059c5a5183466a7412c707efbc4b40",
+      "unchanged": true
+    }
+  }
+}

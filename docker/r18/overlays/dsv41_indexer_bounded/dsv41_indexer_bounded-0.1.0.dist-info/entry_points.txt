@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+dsv41_indexer_bounded = dsv41_indexer_bounded:register

@@ -1,0 +1,163 @@
+--- a/include/flashinfer/comm/pcie_ipc_all_reduce.cuh
++++ b/include/flashinfer/comm/pcie_ipc_all_reduce.cuh
+@@ -104,13 +104,14 @@
+   // below -- see the guard at the top of that function.
+   kCopyEngineRing = 4,
+   kCopyEngineIsland = 5,     // 4+4 decomposition; world_size 8 and rootcplx only
+   kCopyEngineRingMemop = 6,  // SM120 single-piece ring with CE publication
+   kCopyEngineRingPiped = 7,  // SM120 pipelined, topology-weighted ring with CE publication
++  kTrueRing = 8,  // private Opera variant 7; stock owns IDs 0 through 7
+ };
+ 
+-constexpr int kVariantCount = 8;
++constexpr int kVariantCount = 9;
+ 
+ // Which staging area a kernel uses. The kernels come in two protocol families
+ // and a region may hold only one of them.
+ //
+ // Sentinel kernels poll for +0.0 meaning "not yet written", sanitise real zeros
+@@ -2187,10 +2188,85 @@
+   views.ce_send_counters = reinterpret_cast<int32_t*>(self_ce);
+   views.ce_wait_counters = views.ce_send_counters + ce_flag_slots(world_size);
+   return views;
+ }
+ 
++// dsv41 (ds41-patches/patch_true_ring.py): cut-through neighbour ring, world_size 4, 16-bit payloads, kBlock region.
++// Every rank only ever writes to rank + 1, and there are no barriers: each pack carries its own arrival signal (the
++// sentinel protocol above), so it moves on to the next hop as soon as it lands. Reduce-scatter and all-gather are one
++// 2*(WorldSize-1)-hop chain per pack, run stage-major so every pack is in flight at once. Chunk c is summed in ring
++// order starting at rank c + 1 (bf16 adds, as in the staged kernels). Each slot is written by exactly one sender and
++// read once by its owner, which resets it right away, so the region is clean on exit. The epoch double buffer is safe
++// without barriers: a rank starts call n + 2 only after call n + 1's all-gather reached it, which its neighbour sent
++// after finishing call n.
++template <typename T, int WorldSize, bool UsePdl>
++__global__ __launch_bounds__(1024, 1) void ipc_true_ring_param_kernel(
++    const PushOneshotParamData<T> __grid_constant__ params) {
++  static_assert(sizeof(T) == 2, "16-bit payloads only");
++  pdl_grid_sync_const<UsePdl>();
++  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
++  const int epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
++  const int rank = params.rank;
++  const int part = params.num_packs / WorldSize;
++  const int slot_stride = part + params.num_packs % WorldSize;  // the last chunk is the largest
++  uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
++  uint4* output = reinterpret_cast<uint4*>(params.output);
++  uint4* local = reinterpret_cast<uint4*>(params.tmp_ptrs[rank]) + epoch * params.epoch_stride_packs;
++  uint4* remote =
++      reinterpret_cast<uint4*>(params.tmp_ptrs[(rank + 1) % WorldSize]) + epoch * params.epoch_stride_packs;
++  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++  const int stride = gridDim.x * blockDim.x;
++  const uint4 reset = {0u, 0u, 0u, 0u};
++  // Reduce-scatter. Step 0 sends this rank's input of chunk (rank - 1); step s receives the partial sum of chunk
++  // (rank - 1 - s), adds this rank's input and forwards it. Step WorldSize - 1 completes this rank's own chunk.
++  {
++    const int c = (rank + WorldSize - 1) % WorldSize;
++    const int base = c * part, len = c == WorldSize - 1 ? params.num_packs - base : part;
++    for (int i = tid; i < len; i += stride) {
++      store_u4_volatile(remote, i, clear_pos_zero_u4_16(input[base + i]));
++    }
++  }
++#pragma unroll
++  for (int s = 1; s < WorldSize; ++s) {
++    const int c = (rank + 2 * WorldSize - 1 - s) % WorldSize;
++    const int base = c * part, len = c == WorldSize - 1 ? params.num_packs - base : part;
++    uint4* in_slot = local + (s - 1) * slot_stride;
++    for (int i = tid; i < len; i += stride) {
++      uint4 v;
++      do {
++        v = load_u4_volatile(in_slot, i);
++      } while (has_pos_zero_u4_16(v));
++      store_u4_volatile(in_slot, i, reset);
++      v = packed_add_u4<T>(v, input[base + i]);
++      if (s == WorldSize - 1) {
++        output[base + i] = v;
++      }
++      store_u4_volatile(remote + s * slot_stride, i, clear_pos_zero_u4_16(v));
++    }
++  }
++  // All-gather. Step t receives the final chunk (rank - 1 - t) and forwards it unless this is its last hop.
++#pragma unroll
++  for (int t = 0; t < WorldSize - 1; ++t) {
++    const int c = (rank + 2 * WorldSize - 1 - t) % WorldSize;
++    const int base = c * part, len = c == WorldSize - 1 ? params.num_packs - base : part;
++    uint4* in_slot = local + (WorldSize - 1 + t) * slot_stride;
++    for (int i = tid; i < len; i += stride) {
++      uint4 v;
++      do {
++        v = load_u4_volatile(in_slot, i);
++      } while (has_pos_zero_u4_16(v));
++      store_u4_volatile(in_slot, i, reset);
++      output[base + i] = v;
++      if (t < WorldSize - 2) {
++        store_u4_volatile(remote + (WorldSize + t) * slot_stride, i, v);
++      }
++    }
++  }
++  debug_commit_per_block_epoch(epoch_slot, epoch);
++  pdl_grid_release_const<UsePdl>();
++}
++
+ template <typename Kernel, typename... Args>
+ inline cudaError_t launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t stream, bool use_pdl,
+                           Args const&... args) {
+ #if CUDART_VERSION >= 12000
+   if (use_pdl) {
+@@ -2324,10 +2400,12 @@
+         return FI_PCIE_IPC_LAUNCH((push_oneshot_param_kernel<T, 4, PDL, false>), PDL);     \
+       case Variant::kStaged:                                                               \
+         return FI_PCIE_IPC_LAUNCH((ipc_rsag_push_param_kernel<T, 4, PDL>), PDL);           \
+       case Variant::kStagedRing:                                                           \
+         return FI_PCIE_IPC_LAUNCH((ipc_rsag_ring_push_param_kernel<T, 4, PDL>), PDL);      \
++      case Variant::kTrueRing:                                                             \
++        return FI_PCIE_IPC_LAUNCH((ipc_true_ring_param_kernel<T, 4, PDL>), PDL);          \
+       default:                                                                             \
+         return cudaErrorInvalidValue;                                                      \
+     }                                                                                      \
+   } while (false)
+ 
+--- a/csrc/pcie_ipc_all_reduce.cu
++++ b/csrc/pcie_ipc_all_reduce.cu
+@@ -15,12 +15,12 @@
+  */
+ #include <tvm/ffi/container/array.h>
+ 
+ #include <cstdint>
+ 
+-#include "flashinfer/comm/pcie_ipc_all_reduce.cuh"
+-#include "flashinfer/comm/pcie_ipc_ce_ring.cuh"
++#include "../include/flashinfer/comm/pcie_ipc_all_reduce.cuh"
++#include "../include/flashinfer/comm/pcie_ipc_ce_ring.cuh"
+ #include "tvm_ffi_utils.h"
+ 
+ namespace fi = flashinfer::comm::pcie_ipc;
+ 
+ using tvm::ffi::Array;
+@@ -314,10 +314,12 @@
+       << "enable_pdl is not supported yet: in the TP8 block kernel the launch-completion "
+          "trigger precedes the island ack and barrier flag stores";
+   TVM_FFI_ICHECK(variant >= 0 && variant < fi::kVariantCount)
+       << "variant must be in [0, " << fi::kVariantCount << "), got " << variant;
+   const auto algo = static_cast<fi::Variant>(variant);
++  TVM_FFI_ICHECK(!(algo == fi::Variant::kTrueRing && (h->world_size != 4 || blocks > 16)))
++      << "experimental kTrueRing requires world4 and at most16 blocks";
+   // Reject rather than silently alias, so one configuration always names one
+   // kernel.
+   TVM_FFI_ICHECK(
+       !(h->world_size == 2 && algo != fi::Variant::kUnstaged && algo != fi::Variant::kStaged))
+       << "world_size 2 accepts only kUnstaged and kStaged, got variant " << variant;
+@@ -393,10 +395,15 @@
+     TVM_FFI_LOG_AND_THROW(RuntimeError)
+         << "pcie ipc all-reduce launch failed: " << cudaGetErrorString(err);
+   }
+ }
+ 
++int64_t opera_ring_variant_count_v1() { return fi::kVariantCount; }
++int64_t opera_ring_variant_id_v1() { return static_cast<int64_t>(fi::Variant::kTrueRing); }
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(opera_ring_variant_count_v1, opera_ring_variant_count_v1);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(opera_ring_variant_id_v1, opera_ring_variant_id_v1);
++
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_memop_supported, pcie_ipc_memop_supported);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_set_memop_enabled, pcie_ipc_set_memop_enabled);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_set_ce_slow_hops, pcie_ipc_set_ce_slow_hops);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_workspace_size, pcie_ipc_workspace_size);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_init, pcie_ipc_init);

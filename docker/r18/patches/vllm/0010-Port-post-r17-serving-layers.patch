@@ -1,0 +1,2610 @@
+Subject: [PATCH 10/10] Port post-r17 serving layers
+
+Origin: installed served-minus-pin Python export for sha256:f760136967d6c4cac9f4de317e2b9a19a170d27519ddeb0ba9aad3e420ec3c27.
+
+Carries the image's host adaptive verify width, INT8 prefill, true ring, dense rank-1 LoRA, VL mappings, eager overlap and BF16 mHC rounding. The installed Python export supplies the served-minus-pin delta.
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index d7a8473..a56de56 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -690,7 +690,15 @@ class VllmConfig:
+             or not speculative_config.uses_dynamic_speculative_decoding()
+             or num_new_sampled_tokens <= 0
+         ):
+-            return {decode_query_len: max_num_seqs}
++            query_lens = {decode_query_len: max_num_seqs}
++            if speculative_config is not None and speculative_config.use_dspark():
++                from vllm.v1.core.sched.dsv41_adaptive_verify import capture_query_lens
++
++                for width in capture_query_lens(
++                    decode_query_len, self.num_speculative_tokens
++                ) or ():
++                    query_lens[width] = max_num_seqs
++            return query_lens
+         from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ 
+         dense_schedule = build_dynamic_sd_schedule_lookup(
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 684d28c..c651088 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ 
+ import torch
+ from torch.distributed import ProcessGroup
+@@ -131,7 +132,132 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 "Experimental INT8 TP4 all-reduce enabled: "
+                 "256-value scales, FP32 sums, finite BF16 inputs only"
+             )
+-        self.all2all_manager = AgRsAll2AllManager(
++        # Opt-in INT8 prefill collectives: rows >= min_rows (> 48) only, so
++        # decode messages keep their backend unchanged.
++        self.int8_prefill_comm = None
++        if unique_name.split(":")[0] == "tp":
++            from .dsv41_int8_prefill_policy import parse_settings
++
++            prefill_config = get_current_vllm_config_or_none()
++            prefill_settings = parse_settings(
++                os.environ,
++                prefill_config.scheduler_config.max_num_batched_tokens
++                if prefill_config is not None
++                else None,
++            )
++            if prefill_settings is not None:
++                if envs.VLLM_BATCH_INVARIANT:
++                    raise ValueError(
++                        "INT8 prefill collectives change numerics; "
++                        "batch invariant mode is incompatible"
++                    )
++                from .dsv41_int8_prefill import DSV41Int8PrefillComm
++
++                self.int8_prefill_comm = DSV41Int8PrefillComm(
++                    self.cpu_group, self.device, prefill_settings
++                )
++                logger.warning_once(
++                    "Experimental INT8 TP4 prefill collectives enabled: %s",
++                    prefill_settings,
++                )
++        self.aiter_ar_comm: AiterCustomAllreduce | None = None
++        self.use_aiter_ag_rs: bool = False
++        self.use_aiter_tp_all_gather: bool = False
++
++        # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
++        config = get_current_vllm_config_or_none()
++        register = config is None or not config.use_cumem_cudagraph_pool
++
++        if use_torch_symm_mem and current_platform.is_cuda():
++            self.symm_mem_comm = SymmMemCommunicator(
++                group=self.cpu_group,
++                device=self.device,
++            )
++
++        if self.use_flashinfer_allreduce and self.world_size > 1:
++            self.fi_ar_comm = FlashInferAllReduce(
++                group=self.cpu_group,
++                device=self.device,
++            )
++
++        if (
++            self.use_flashinfer_pcie_ipc_allreduce
++            and self.world_size > 1
++            and self.device_group is not None
++        ):
++            self.fi_pcie_ipc_ar_comm = FlashInferPcieIpcAllReduce(
++                group=self.device_group,
++                tune_group=self.cpu_group,
++                device=self.device,
++            )
++
++        if self.use_aiter_allreduce and self.world_size > 1:
++            self.aiter_ar_comm = AiterCustomAllreduce(
++                group=self.cpu_group,
++                device=self.device,
++                register_graph_buffers=register,
++            )
++
++        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
++            # Initialize a custom fast all-reduce implementation.
++            self.ca_comm = CustomAllreduce(
++                group=self.cpu_group,
++                device=self.device,
++                symm_mem_enabled=(
++                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
++                ),
++                register_graph_buffers=register,
++            )
++
++        # AITER custom all-gather/reduce-scatter DP-attention dispatch/combine.
++        # AITER requires a torch.distributed-registered group and exchanges IPC
++        # handles via the default store; stateless groups satisfy neither.
++        # Only StatelessGroupCoordinator passes tcp_store_group, so this checks
++        # the property AITER depends on rather than the feature that currently
++        # creates stateless groups (elastic EP).
++        if (
++            "dp" in unique_name
++            and tcp_store_group is None
++            and self.world_size in (2, 4, 8)
++            and current_platform.is_rocm()
++            and rocm_aiter_ops.is_custom_all_reduce_enabled()
++        ):
++            self.aiter_ar_comm = AiterCustomAllreduce(
++                group=self.cpu_group,
++                device=self.device,
++                register_graph_buffers=register,
++            )
++            if self.aiter_ar_comm.disabled:
++                self.aiter_ar_comm = None
++            else:
++                self.use_aiter_ag_rs = True
++        elif self.aiter_ar_comm is not None and self.world_size in (2, 4, 8):
++            from vllm.platforms.rocm import get_cdna_version
++
++            self.use_aiter_tp_all_gather = get_cdna_version() in (3, 4)
++
++        if (
++            use_custom_allreduce
++            and self.world_size > 1
++            and current_platform.is_rocm()
++            and not envs.VLLM_BATCH_INVARIANT
++        ):
++            # Initialize a custom quick all-reduce implementation for AMD.
++            # Quick reduce is designed as a complement to custom allreduce
++            # (vLLM's or AITER's), so it is initialized for either backend.
++            # Based on quickreduce (https://github.com/mk1-project/quickreduce).
++            # On ROCm, 'use_custom_allreduce==True' means it must currently be
++            # an MI300 series.
++            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
++
++        if self.world_size > 1:
++            self._log_all_reduce_backend_selection()
++
++        if self.use_all2all:
++            if self.all2all_backend in ("naive", "allgather_reducescatter"):
++                from .all2all import AgRsAll2AllManager
++
++                self.all2all_manager = AgRsAll2AllManager(
+                     self.cpu_group, tcp_store_group
+                 )
+             elif self.all2all_backend == "deepep_high_throughput":
+@@ -323,6 +449,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         return self._all_reduce(input_)
+ 
+     def _all_reduce(self, input_):
++        prefill_comm = getattr(self, "int8_prefill_comm", None)
++        if prefill_comm is not None and prefill_comm.supports_all_reduce(input_):
++            return prefill_comm.all_reduce(input_)
+         int8_comm = getattr(self, "int8_ar_comm", None)
+         if int8_comm is not None and int8_comm.supports(input_):
+             return int8_comm.all_reduce(input_)
+@@ -449,11 +578,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             return super().all_gather(input_, dim)
+ 
+         input_size = input_.size()
+-        output_size = (input_size[0] * self.world_size,) + input_size[1:]
+-        output_tensor = torch.empty(
+-            output_size, dtype=input_.dtype, device=input_.device
+-        )
+-        pynccl_comm.all_gather(output_tensor, input_.contiguous())
++        prefill_comm = getattr(self, "int8_prefill_comm", None)
++        if prefill_comm is not None and prefill_comm.supports_all_gather(input_, dim):
++            # Same stacked [world * n, ...] layout as the PyNCCL gather below.
++            output_tensor = prefill_comm.all_gather_stacked(input_)
++        else:
++            output_size = (input_size[0] * self.world_size,) + input_size[1:]
++            output_tensor = torch.empty(
++                output_size, dtype=input_.dtype, device=input_.device
++            )
++            pynccl_comm.all_gather(output_tensor, input_.contiguous())
+         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+         output_tensor = output_tensor.movedim(0, dim)
+         return output_tensor.reshape(
+diff --git a/vllm/distributed/device_communicators/dsv41_int8_prefill.py b/vllm/distributed/device_communicators/dsv41_int8_prefill.py
+new file mode 100644
+index 0000000..3029fda
+--- /dev/null
++++ b/vllm/distributed/device_communicators/dsv41_int8_prefill.py
+@@ -0,0 +1,344 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in TP4 INT8 push all-reduce / all-gather for prefill-sized messages.
++
++Sibling of the r17 decode codec (``dsv41_int8_all_reduce.py``), rebuilt for
++2048 x 5120 messages on PCIe 2.0 x4:
++
++* push, not pull: every byte crosses PCIe as a posted write into the peer's
++  inbox; all reads are local. Readers poll local flags.
++* two shots: (1) quantize each block and write it to the rank that owns its
++  quarter, (2) the owner sums the four copies in FP32 in rank order 0..3,
++  requantizes, and writes the reduced quarter to every rank. Each rank sends
++  1.5 x N x (1 + 4/BLOCK) bytes, about half the BF16 ring.
++* symmetric INT8 [-127, 127], one FP32 absmax scale per BLOCK values, round to
++  nearest even, FP32 accumulation, BF16 output. Every rank dequantizes the same
++  bytes, so all ranks return bit-identical tensors.
++* split invariance: a block never straddles a row (5120 = 20 x 256) and the
++  sum order is fixed, so reducing two row halves separately gives the same bits
++  as reducing the whole message.
++* device-side epochs (monotonic, per phase and source) instead of host
++  sequence numbers; no host synchronization per call.
++
++All work runs on the caller's current stream. One instance must not be used
++by two streams concurrently; callers order streams with events (the prefill
++overlap pipeline keeps all of its collectives on one communication stream).
++CUDA graph capture is never used: the dispatch predicate refuses capture.
++
++``Settings.schedule == "rotated"`` (patch 0034) routes both collectives to
++``dsv41_int8_prefill_rotated``: same numerics and bytes, one peer per step.
++"""
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
++from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.triton_utils import tl, triton
++
++from .dsv41_int8_prefill_policy import (
++    HEADER_BYTES,
++    PHASE_AG,
++    PHASE_FREE,
++    PHASE_RS,
++    SCHEDULE_ROTATED,
++    WORLD,
++    Settings,
++    ag_eligible,
++    ar_eligible,
++    make_layout,
++)
++
++TILE = 2048  # values per CTA iteration; GROUP = TILE // BLOCK blocks
++
++
++@triton.jit
++def _rint(x):
++    # Explicit round-to-nearest-even, as the r17 codec (no FP8 on Ampere).
++    return tl.inline_asm_elementwise(
++        "cvt.rni.s32.f32 $0, $1;", constraints="=r,f", args=[x],
++        dtype=tl.int32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _fence_sys(x):
++    # Make this thread's remote (peer) stores visible system-wide before the
++    # kernel ends; the following barrier kernel then publishes the epoch.
++    return tl.inline_asm_elementwise(
++        "fence.sc.sys; mov.u32 $0, $1;", constraints="=r,r", args=[x],
++        dtype=tl.int32, is_pure=False, pack=1)
++
++
++@triton.jit
++def _quant_push(X, Ptrs, RANK: tl.constexpr, NUMEL, PART,
++                VALUES: tl.constexpr, SCALES: tl.constexpr,
++                BLOCK: tl.constexpr, GROUP: tl.constexpr, ALL_PEERS: tl.constexpr):
++    """Quantize X's blocks and write them into peer inboxes (slot RANK).
++
++    Inbox slots are compact for the current message: slot stride PART values
++    and PART / BLOCK scales.
++    ALL_PEERS=False (all-reduce shot 1, PART = NUMEL / 4): block b goes only to
++    the owner of its quarter, rank b // (PART / BLOCK).
++    ALL_PEERS=True (all-gather, PART = NUMEL): every block goes to every rank.
++    """
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    blocks = NUMEL // BLOCK
++    part_blocks = PART // BLOCK
++    tiles = tl.cdiv(blocks, GROUP)
++    g = tl.arange(0, GROUP)
++    lane = tl.arange(0, BLOCK)
++    for tile in range(pid, tiles, nprog):
++        b = tile * GROUP + g
++        live = b < blocks
++        x = tl.load(X + b[:, None] * BLOCK + lane[None, :], mask=live[:, None],
++                    other=0.0).to(tl.float32)
++        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(x), 1), 127.0), 1.0e-30)
++        q = tl.minimum(127, tl.maximum(-127, _rint(tl.div_rn(x, scale[:, None]))))
++        q8 = q.to(tl.int8)
++        if ALL_PEERS:
++            for peer in tl.static_range(4):
++                base = tl.load(Ptrs + peer)
++                v = (base + VALUES).to(tl.pointer_type(tl.int8))
++                s = (base + SCALES).to(tl.pointer_type(tl.float32))
++                tl.store(v + RANK * PART + b[:, None] * BLOCK + lane[None, :], q8,
++                         mask=live[:, None])
++                tl.store(s + RANK * part_blocks + b, scale, mask=live)
++        else:
++            owner = b // part_blocks
++            local = b - owner * part_blocks
++            base = tl.load(Ptrs + owner, mask=live, other=0)
++            v = (base + VALUES).to(tl.pointer_type(tl.int8))
++            s = (base + SCALES).to(tl.pointer_type(tl.float32))
++            tl.store(v[:, None] + (RANK * PART + local[:, None] * BLOCK + lane[None, :]),
++                     q8, mask=live[:, None])
++            tl.store(s + (RANK * part_blocks + local), scale, mask=live)
++    _fence_sys(pid)
++
++
++@triton.jit
++def _barrier(Ptrs, RANK: tl.constexpr, PHASE: tl.constexpr):
++    """Publish this rank's next epoch for PHASE to every rank, then wait.
++
++    The own slot doubles as the counter (only this rank writes it). Flags are
++    monotonic, so no reset is ever needed and a fast rank's next epoch still
++    satisfies a slow rank's wait.
++    """
++    mine = tl.load(Ptrs + RANK)
++    own = (mine + (PHASE * 4 + RANK) * 8).to(tl.pointer_type(tl.uint64))
++    previous = tl.inline_asm_elementwise(
++        "ld.global.acquire.sys.u64 $0, [$1];", constraints="=l,l",
++        args=[own], dtype=tl.uint64, is_pure=False, pack=1)
++    epoch = previous + 1
++    for peer in tl.static_range(4):
++        slot = (tl.load(Ptrs + peer) + (PHASE * 4 + RANK) * 8).to(tl.pointer_type(tl.uint64))
++        tl.inline_asm_elementwise(
++            "st.global.release.sys.u64 [$1], $2; mov.u32 $0, 0;",
++            constraints="=r,l,l", args=[slot, epoch], dtype=tl.uint32,
++            is_pure=False, pack=1)
++    for peer in tl.static_range(4):
++        flag = (mine + (PHASE * 4 + peer) * 8).to(tl.pointer_type(tl.uint64))
++        seen = tl.inline_asm_elementwise(
++            "ld.global.acquire.sys.u64 $0, [$1];", constraints="=l,l",
++            args=[flag], dtype=tl.uint64, is_pure=False, pack=1)
++        while seen < epoch:
++            seen = tl.inline_asm_elementwise(
++                "ld.global.acquire.sys.u64 $0, [$1];", constraints="=l,l",
++                args=[flag], dtype=tl.uint64, is_pure=False, pack=1)
++
++
++@triton.jit
++def _reduce_push(Ptrs, RANK: tl.constexpr, SHARD,
++                 RS_VALUES: tl.constexpr, RS_SCALES: tl.constexpr,
++                 AG_VALUES: tl.constexpr, AG_SCALES: tl.constexpr,
++                 BLOCK: tl.constexpr, GROUP: tl.constexpr):
++    """Sum the four local copies of this rank's quarter in rank order 0..3,
++    requantize, and write the result into every rank's gather slot RANK."""
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    shard_blocks = SHARD // BLOCK
++    tiles = tl.cdiv(shard_blocks, GROUP)
++    g = tl.arange(0, GROUP)
++    lane = tl.arange(0, BLOCK)
++    mine = tl.load(Ptrs + RANK)
++    rs_v = (mine + RS_VALUES).to(tl.pointer_type(tl.int8))
++    rs_s = (mine + RS_SCALES).to(tl.pointer_type(tl.float32))
++    for tile in range(pid, tiles, nprog):
++        b = tile * GROUP + g
++        live = b < shard_blocks
++        total = tl.zeros((GROUP, BLOCK), dtype=tl.float32)
++        for source in tl.static_range(4):
++            q = tl.load(rs_v + source * SHARD + b[:, None] * BLOCK + lane[None, :],
++                        mask=live[:, None], other=0, cache_modifier=".cg").to(tl.float32)
++            s = tl.load(rs_s + source * shard_blocks + b, mask=live, other=0.0,
++                        cache_modifier=".cg")
++            total = total + q * s[:, None]
++        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(total), 1), 127.0), 1.0e-30)
++        q2 = tl.minimum(127, tl.maximum(-127, _rint(tl.div_rn(total, scale[:, None]))))
++        q8 = q2.to(tl.int8)
++        for peer in tl.static_range(4):
++            base = tl.load(Ptrs + peer)
++            v = (base + AG_VALUES).to(tl.pointer_type(tl.int8))
++            s2 = (base + AG_SCALES).to(tl.pointer_type(tl.float32))
++            tl.store(v + RANK * SHARD + b[:, None] * BLOCK + lane[None, :], q8,
++                     mask=live[:, None])
++            tl.store(s2 + RANK * shard_blocks + b, scale, mask=live)
++    _fence_sys(pid)
++
++
++@triton.jit
++def _gather_local(Ptrs, Out, RANK: tl.constexpr, PART,
++                  AG_VALUES: tl.constexpr, AG_SCALES: tl.constexpr,
++                  BLOCK: tl.constexpr, GROUP: tl.constexpr):
++    """Dequantize the four local gather slots (PART values each) into Out.
++
++    Reads local memory only (peers wrote it); .cg bypasses the incoherent L1.
++    """
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    part_blocks = PART // BLOCK
++    blocks = part_blocks * 4
++    tiles = tl.cdiv(blocks, GROUP)
++    g = tl.arange(0, GROUP)
++    lane = tl.arange(0, BLOCK)
++    mine = tl.load(Ptrs + RANK)
++    ag_v = (mine + AG_VALUES).to(tl.pointer_type(tl.int8))
++    ag_s = (mine + AG_SCALES).to(tl.pointer_type(tl.float32))
++    for tile in range(pid, tiles, nprog):
++        b = tile * GROUP + g
++        live = b < blocks
++        source = b // part_blocks
++        local = b - source * part_blocks
++        q = tl.load(ag_v + (source * PART + local * BLOCK)[:, None] + lane[None, :],
++                    mask=live[:, None], other=0, cache_modifier=".cg").to(tl.float32)
++        s = tl.load(ag_s + source * part_blocks + local, mask=live, other=0.0,
++                    cache_modifier=".cg")
++        y = q * s[:, None]
++        tl.store(Out + b[:, None] * BLOCK + lane[None, :], y.to(tl.bfloat16),
++                 mask=live[:, None])
++
++
++@triton.jit
++def _zero_header(Ptrs, RANK: tl.constexpr, WORDS: tl.constexpr):
++    mine = tl.load(Ptrs + RANK)
++    p = mine.to(tl.pointer_type(tl.uint64))
++    i = tl.arange(0, WORDS)
++    tl.store(p + i, tl.zeros((WORDS,), dtype=tl.uint64))
++
++
++class DSV41Int8PrefillComm:
++    """Opt-in compressed prefill collectives for TP4 on one SM80 node."""
++
++    def __init__(self, group, device, settings: Settings):
++        if dist.get_world_size(group) != WORLD:
++            raise ValueError("INT8 prefill collectives require TP4")
++        if not all(in_the_same_node_as(group, source_rank=0)):
++            raise ValueError("INT8 prefill collectives require a single node")
++        self.rank = dist.get_rank(group)
++        self.group = group
++        self.device = torch.device(device)
++        self.settings = settings
++        self.layout = make_layout(settings)
++        supported = torch.cuda.get_device_capability(self.device) == (8, 0)
++        supported = supported and all(
++            peer == self.device.index
++            or torch.cuda.can_device_access_peer(self.device.index, peer)
++            for peer in range(torch.cuda.device_count())
++        )
++        # Agree before allocating: a local-only refusal would strand the peers.
++        votes = [None] * WORLD
++        dist.all_gather_object(votes, (supported, settings), group=group)
++        if not all(v[0] for v in votes):
++            raise ValueError("INT8 prefill collectives need SM80 and full peer access")
++        if any(v[1] != settings for v in votes):
++            raise ValueError("ranks disagree on INT8 prefill settings")
++        self.pointers = CustomAllreduce.create_shared_buffer(self.layout.total_bytes, group)
++        self.ptrs = torch.tensor(self.pointers, device=self.device, dtype=torch.uint64)
++        with torch.cuda.device(self.device):
++            _zero_header[(1,)](self.ptrs, self.rank, HEADER_BYTES // 8, num_warps=1)
++        torch.cuda.synchronize(self.device)
++        dist.barrier(group=group)
++        self.group_blocks = TILE // self.layout.block
++        self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
++        self.closed = False
++        self._rotated = None
++        if settings.schedule == SCHEDULE_ROTATED:
++            from .dsv41_int8_prefill_rotated import RotatedSchedule
++
++            self._rotated = RotatedSchedule(self)
++
++    # Dispatch predicates (identical inputs on every TP rank -> same choice).
++    def supports_all_reduce(self, x: torch.Tensor) -> bool:
++        return ar_eligible(self.settings, tuple(x.shape), str(x.dtype), x.is_contiguous(),
++                           x.is_cuda, torch.cuda.is_current_stream_capturing())
++
++    def supports_all_gather(self, x: torch.Tensor, dim: int) -> bool:
++        return ag_eligible(self.settings, self.layout, tuple(x.shape), dim, str(x.dtype),
++                           x.is_contiguous(), x.is_cuda,
++                           torch.cuda.is_current_stream_capturing())
++
++    def _grid(self, blocks: int) -> tuple[int]:
++        # Remote writers: a few CTAs saturate a x4 link and leave SMs free for
++        # overlapped compute.
++        tiles = -(-blocks // self.group_blocks)
++        return (max(1, min(tiles, self.settings.ctas)),)
++
++    def _local_grid(self, blocks: int) -> tuple[int]:
++        tiles = -(-blocks // self.group_blocks)
++        return (max(1, min(tiles, 4 * self.num_sms)),)
++
++    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
++        assert self.supports_all_reduce(x)
++        if self._rotated is not None:
++            return self._rotated.all_reduce(x)
++        lay = self.layout
++        numel = x.numel()
++        shard = numel // WORLD
++        block = lay.block
++        out = torch.empty_like(x)
++        _quant_push[self._grid(numel // block)](
++            x, self.ptrs, self.rank, numel, shard, lay.rs_values, lay.rs_scales,
++            block, self.group_blocks, False, num_warps=4, enable_fp_fusion=False)
++        _barrier[(1,)](self.ptrs, self.rank, PHASE_RS, num_warps=1)
++        _reduce_push[self._grid(shard // block)](
++            self.ptrs, self.rank, shard, lay.rs_values, lay.rs_scales,
++            lay.ag_values, lay.ag_scales, block, self.group_blocks,
++            num_warps=4, enable_fp_fusion=False)
++        _barrier[(1,)](self.ptrs, self.rank, PHASE_AG, num_warps=1)
++        # Local-only pass: no PCIe traffic, so it may use every SM.
++        _gather_local[self._local_grid(numel // block)](
++            self.ptrs, out, self.rank, shard, lay.ag_values, lay.ag_scales,
++            block, self.group_blocks, num_warps=4, enable_fp_fusion=False)
++        return out
++
++    def all_gather_stacked(self, x: torch.Tensor) -> torch.Tensor:
++        """Return [WORLD * x.shape[0], *x.shape[1:]], rank r's data at block r.
++
++        Same layout as PyNCCL's all_gather output; the caller applies the
++        existing movedim/reshape for dim != 0. Every slot, including this
++        rank's own, is the dequantized copy, so all ranks see identical bits.
++        """
++        assert x.is_contiguous() and x.numel() <= self.layout.slot
++        if self._rotated is not None:
++            return self._rotated.all_gather_stacked(x)
++        lay = self.layout
++        numel = x.numel()
++        block = lay.block
++        out = x.new_empty((WORLD * x.shape[0], *x.shape[1:]))
++        # Pre-barrier: every rank has finished reading its gather inbox.
++        _barrier[(1,)](self.ptrs, self.rank, PHASE_FREE, num_warps=1)
++        _quant_push[self._grid(numel // block)](
++            x, self.ptrs, self.rank, numel, numel, lay.ag_values, lay.ag_scales,
++            block, self.group_blocks, True, num_warps=4, enable_fp_fusion=False)
++        _barrier[(1,)](self.ptrs, self.rank, PHASE_AG, num_warps=1)
++        _gather_local[self._local_grid(WORLD * numel // block)](
++            self.ptrs, out, self.rank, numel, lay.ag_values, lay.ag_scales,
++            block, self.group_blocks, num_warps=4, enable_fp_fusion=False)
++        return out
++
++    def destroy(self):
++        if not self.closed:
++            torch.cuda.synchronize(self.device)
++            dist.barrier(group=self.group)
++            CustomAllreduce.free_shared_buffer(self.pointers, rank=self.rank)
++            self.closed = True
+diff --git a/vllm/distributed/device_communicators/dsv41_int8_prefill_policy.py b/vllm/distributed/device_communicators/dsv41_int8_prefill_policy.py
+new file mode 100644
+index 0000000..4fab5b9
+--- /dev/null
++++ b/vllm/distributed/device_communicators/dsv41_int8_prefill_policy.py
+@@ -0,0 +1,283 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pure-Python policy for the opt-in DSV4.1 TP4 INT8 prefill collectives.
++
++No torch import: flag parsing, buffer layout and dispatch predicates are
++unit-tested without CUDA. The kernels live in ``dsv41_int8_prefill.py``.
++
++Decode safety: every predicate requires at least ``min_rows`` rows and
++``min_rows`` is forced above 48, the largest decode/verify message (8 seqs x
++6 DSpark rows) and the FlashInfer true-ring ceiling. Rows <= 48 can never take
++this path, so decode collectives keep their existing backend byte for byte.
++
++Schedules (``VLLM_DSV41_INT8_PREFILL_SCHEDULE``):
++
++* ``two_shot`` (default, patch 0032): every rank pushes to all three peers at
++  once in each shot.
++* ``rotated`` (patch 0034): the same two-shot numerics (one quantization per
++  input, FP32 sum in rank order 0..3, one requantization, every rank
++  dequantizes the same bytes), but each rank writes to one peer per step:
++  step k (1..3) sends to rank (r + k) % 4 and receives from (r - k) % 4, in
++  the reduce-scatter and again in the all-gather. Same bytes on the wire,
++  bit-identical results to ``two_shot``.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import threading
++from dataclasses import dataclass
++
++WIDTH = 5120
++WORLD = 4
++DECODE_MAX_ROWS = 48
++ALIGN = 256
++HEADER_BYTES = 512
++PHASES = 3  # 0: free (all-gather pre-barrier), 1: reduce-scatter ready, 2: gather ready
++PHASE_FREE, PHASE_RS, PHASE_AG = 0, 1, 2
++
++ENV_AR = "VLLM_DSV41_INT8_PREFILL_AR"
++ENV_AG = "VLLM_DSV41_INT8_PREFILL_AG"
++ENV_MIN_ROWS = "VLLM_DSV41_INT8_PREFILL_MIN_ROWS"
++ENV_MAX_ROWS = "VLLM_DSV41_INT8_PREFILL_MAX_ROWS"
++ENV_BLOCK = "VLLM_DSV41_INT8_PREFILL_BLOCK"
++ENV_CTAS = "VLLM_DSV41_INT8_PREFILL_CTAS"
++ENV_SCHEDULE = "VLLM_DSV41_INT8_PREFILL_SCHEDULE"
++
++DEFAULT_MIN_ROWS = 64
++DEFAULT_MAX_ROWS = 2048
++DEFAULT_BLOCK = 64
++DEFAULT_CTAS = 16
++BLOCKS = (64, 128, 256)
++SCHEDULE_TWO_SHOT = "two_shot"
++SCHEDULE_ROTATED = "rotated"
++SCHEDULES = (SCHEDULE_TWO_SHOT, SCHEDULE_ROTATED)
++PAYLOAD_ALIGN = 16  # rotated: copies are rounded up to whole 16-byte vectors
++
++# Engram all-gathers (per-rank shapes, trailing dims) are the only all-gathers
++# this path may compress: head rows [T, 6, 256] gathered on dim 1 and the
++# wkv ColumnParallel output [T, 6400] gathered on the last dim. Everything else
++# (logits, prompt logprobs, metadata) keeps the exact NCCL gather.
++ENGRAM_AG_TRAILING = ((6, 256), (6400,))
++ENGRAM_AG_MAX_SLOT = 6400  # widest allow-listed per-row width
++
++
++@dataclass(frozen=True)
++class Settings:
++    all_reduce: bool
++    all_gather: bool
++    min_rows: int
++    max_rows: int
++    block: int
++    ctas: int
++    schedule: str = SCHEDULE_TWO_SHOT
++
++
++@dataclass(frozen=True)
++class Layout:
++    block: int
++    ar_numel: int  # largest all-reduce message (elements)
++    ar_shard: int  # its per-rank quarter
++    slot: int  # all-gather slot capacity (elements per source rank)
++    rs_values: int
++    rs_scales: int
++    ag_values: int
++    ag_scales: int
++    total_bytes: int
++    # rotated schedule only: fixed slot strides (bytes). A slot holds one
++    # message's int8 values followed by its FP32 scales; 0 for two_shot.
++    rs_stride: int = 0
++    ag_stride: int = 0
++
++    def flag_offset(self, phase: int, source: int) -> int:
++        return (phase * WORLD + source) * 8
++
++
++def _flag(environ, name: str) -> bool:
++    value = environ.get(name, "0")
++    if value not in ("0", "1"):
++        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
++    return value == "1"
++
++
++def _int(environ, name: str, default: int) -> int:
++    raw = environ.get(name)
++    if raw is None or raw == "":
++        return default
++    if not raw.isdigit():
++        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
++    return int(raw)
++
++
++def parse_settings(environ, max_num_batched_tokens: int | None = None) -> Settings | None:
++    """Return the settings, or None when both switches are off.
++
++    Invalid values raise: a silent fallback would leave ranks disagreeing on
++    whether the path is armed only if the environment differed between them,
++    and a typo in an opt-in numerics change should stop the boot.
++    """
++    ar = _flag(environ, ENV_AR)
++    ag = _flag(environ, ENV_AG)
++    schedule = environ.get(ENV_SCHEDULE) or SCHEDULE_TWO_SHOT
++    if schedule not in SCHEDULES:
++        raise ValueError(f"{ENV_SCHEDULE} must be one of {SCHEDULES}, got {schedule!r}")
++    if not (ar or ag):
++        if schedule != SCHEDULE_TWO_SHOT:
++            # A schedule with no armed collective is a silent no-op: refuse it.
++            raise ValueError(f"{ENV_SCHEDULE}={schedule} needs {ENV_AR}=1 or {ENV_AG}=1")
++        return None
++    default_max = max_num_batched_tokens or DEFAULT_MAX_ROWS
++    max_rows = _int(environ, ENV_MAX_ROWS, default_max)
++    min_rows = _int(environ, ENV_MIN_ROWS, DEFAULT_MIN_ROWS)
++    block = _int(environ, ENV_BLOCK, DEFAULT_BLOCK)
++    ctas = _int(environ, ENV_CTAS, DEFAULT_CTAS)
++    if min_rows <= DECODE_MAX_ROWS:
++        raise ValueError(
++            f"{ENV_MIN_ROWS} must exceed {DECODE_MAX_ROWS} so decode never compresses"
++        )
++    if max_rows < min_rows or max_rows > 65536:
++        raise ValueError(f"{ENV_MAX_ROWS} must be in [{min_rows}, 65536]")
++    if block not in BLOCKS:
++        raise ValueError(f"{ENV_BLOCK} must be one of {BLOCKS}")
++    if not 1 <= ctas <= 1024:
++        raise ValueError(f"{ENV_CTAS} must be in [1, 1024]")
++    return Settings(ar, ag, min_rows, max_rows, block, ctas, schedule)
++
++
++def _align(n: int) -> int:
++    return (n + ALIGN - 1) // ALIGN * ALIGN
++
++
++def payload_bytes(numel: int, block: int) -> int:
++    """Bytes of one quantized message part: int8 values then FP32 scales."""
++    return numel + numel // block * 4
++
++
++def make_layout(settings: Settings) -> Layout:
++    """Peer-visible buffer: header, reduce-scatter inbox, gather inbox.
++
++    Reduce-scatter inbox: WORLD source slots of one quarter message each.
++    Gather inbox: WORLD source slots; a slot holds either an all-reduce quarter
++    (second shot) or one rank's whole all-gather contribution.
++
++    two_shot: values and scales live in separate regions, slots compact per
++    message (patch 0032 layout, unchanged). rotated: each slot is one fixed
++    stride (256-byte aligned) holding [values | scales] for the current
++    message, so a slot's payload is one contiguous copy.
++    """
++    block = settings.block
++    ar_numel = settings.max_rows * WIDTH
++    ar_shard = ar_numel // WORLD
++    slot = ar_shard
++    if settings.all_gather:
++        slot = max(slot, settings.max_rows * ENGRAM_AG_MAX_SLOT)
++    assert ar_shard % block == 0 and slot % block == 0
++    if settings.schedule == SCHEDULE_ROTATED:
++        rs_stride = _align(payload_bytes(ar_shard, block))
++        ag_stride = _align(payload_bytes(slot, block))
++        rs_values = HEADER_BYTES
++        ag_values = _align(rs_values + WORLD * rs_stride)
++        total = _align(ag_values + WORLD * ag_stride)
++        # *_scales carry no meaning here (scales sit inside each slot).
++        return Layout(block, ar_numel, ar_shard, slot, rs_values, rs_values,
++                      ag_values, ag_values, total, rs_stride, ag_stride)
++    rs_values = HEADER_BYTES
++    rs_scales = _align(rs_values + WORLD * ar_shard)
++    ag_values = _align(rs_scales + WORLD * (ar_shard // block) * 4)
++    ag_scales = _align(ag_values + WORLD * slot)
++    total = _align(ag_scales + WORLD * (slot // block) * 4)
++    return Layout(block, ar_numel, ar_shard, slot, rs_values, rs_scales,
++                  ag_values, ag_scales, total)
++
++
++def wire_bytes_per_rank(numel: int, block: int) -> float:
++    """Remote bytes each rank sends for one two-shot all-reduce."""
++    per_quarter = numel / WORLD * (1 + 4 / block)
++    return 2 * (WORLD - 1) * per_quarter
++
++
++def bf16_ring_bytes_per_rank(numel: int) -> float:
++    return 2 * (WORLD - 1) / WORLD * numel * 2
++
++
++def copy_bytes(numel: int, block: int) -> int:
++    """rotated: bytes one slot copy moves (payload rounded up to 16 bytes)."""
++    n = payload_bytes(numel, block)
++    return (n + PAYLOAD_ALIGN - 1) // PAYLOAD_ALIGN * PAYLOAD_ALIGN
++
++
++def rotated_steps(rank: int):
++    """The rotated schedule of one rank, in launch order.
++
++    Returns (phase, step, peer, quarter) tuples: in phase "rs" step k the rank
++    quantizes the quarter owned by peer (rank + k) % 4 into that peer's
++    reduce-scatter slot ``rank``; step 0 is its own quarter, written locally
++    last so the link starts at once. In phase "ag" step k it copies its reduced
++    quarter (``rank``) into peer (rank + k) % 4's gather slot ``rank``.
++    Each step names exactly one peer; across ranks a step is a permutation
++    (rank r receives only from (r - k) % 4), so no link carries two flows.
++    """
++    steps = []
++    for k in (1, 2, 3, 0):
++        peer = (rank + k) % WORLD
++        steps.append(("rs", k, peer, peer))
++    for k in (1, 2, 3):
++        steps.append(("ag", k, (rank + k) % WORLD, rank))
++    return steps
++
++
++# Scoped opt-out used for exact collectives (embedding gather-by-sum, checks).
++_exact = threading.local()
++
++
++@contextlib.contextmanager
++def exact_scope():
++    depth = getattr(_exact, "depth", 0)
++    _exact.depth = depth + 1
++    try:
++        yield
++    finally:
++        _exact.depth = depth
++
++
++def in_exact_scope() -> bool:
++    return getattr(_exact, "depth", 0) > 0
++
++
++def ar_eligible(settings: Settings | None, shape, dtype: str, contiguous: bool,
++                is_cuda: bool, capturing: bool) -> bool:
++    return bool(
++        settings is not None
++        and settings.all_reduce
++        and is_cuda
++        and not capturing
++        and not in_exact_scope()
++        and dtype == "torch.bfloat16"
++        and contiguous
++        and len(shape) == 2
++        and shape[1] == WIDTH
++        and settings.min_rows <= shape[0] <= settings.max_rows
++    )
++
++
++def ag_eligible(settings: Settings | None, layout: Layout | None, shape, dim: int,
++                dtype: str, contiguous: bool, is_cuda: bool, capturing: bool) -> bool:
++    if settings is None or layout is None or not settings.all_gather:
++        return False
++    if not is_cuda or capturing or in_exact_scope() or not contiguous:
++        return False
++    if dtype != "torch.bfloat16" or len(shape) < 2:
++        return False
++    if dim < 0:
++        dim += len(shape)
++    trailing = tuple(shape[1:])
++    if trailing not in ENGRAM_AG_TRAILING:
++        return False
++    if dim != (1 if trailing == (6, 256) else len(shape) - 1):
++        return False
++    rows = shape[0]
++    numel = 1
++    for n in shape:
++        numel *= n
++    return (settings.min_rows <= rows <= settings.max_rows
++            and numel % layout.block == 0 and numel <= layout.slot)
+diff --git a/vllm/distributed/device_communicators/dsv41_int8_prefill_rotated.py b/vllm/distributed/device_communicators/dsv41_int8_prefill_rotated.py
+new file mode 100644
+index 0000000..166be07
+--- /dev/null
++++ b/vllm/distributed/device_communicators/dsv41_int8_prefill_rotated.py
+@@ -0,0 +1,265 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Rotated one-peer-per-step schedule for the INT8 prefill collectives (0034).
++
++Selected by ``VLLM_DSV41_INT8_PREFILL_SCHEDULE=rotated`` on top of 0032's
++``DSV41Int8PrefillComm``; dispatch, eligibility (rows >= min_rows > 48, never
++in capture or exact scope, BF16 [rows, 5120] or the Engram all-gather shapes)
++and the cross-rank settings check are 0032's, unchanged.
++
++Why: on opera (PCIe 2.0 x4, one GPU per Zen 1 die) 0032's push two-shot sent
++half of NCCL's bytes in the same time. Each shot wrote to three peers at once,
++through base addresses loaded from a pointer table (unknown alignment, so
++byte-wide peer stores). This schedule changes only how the bytes travel:
++
++* reduce-scatter: step k = 1, 2, 3 quantizes the quarter owned by rank
++  (r + k) % 4 straight into that rank's inbox slot r; the own quarter is
++  written locally last. Across ranks each step is a permutation, so every
++  GPU sends to one peer and receives from one peer at a time.
++* the owner sums its four slots in FP32 in rank order 0..3, requantizes once
++  into its own gather slot, then copies that slot to (r + 1), (r + 2), (r + 3)
++  one at a time; every rank dequantizes the same bytes.
++* peer addresses are passed to Triton as typed pointer arguments (``_Raw``),
++  which Triton specializes on 16-byte alignment: peer stores compile to
++  16-byte vector stores.
++
++Numerics are 0032's bit for bit (same blocks, same scale and rounding, same
++sum order): the GPU gate checks rotated == two_shot on every case. Wire bytes
++per rank are 0032's, about half the BF16 ring. Synchronization is 0032's two
++device barriers per call (monotonic epochs, no host sync), so the inbox reuse
++argument carries over: a rank writes call n+1's reduce-scatter slots only after
++everyone passed call n's gather barrier (all reduces done), and call n+1's
++gather slots only after everyone passed call n+1's reduce-scatter barrier (all
++call-n gathers done, by stream order).
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from .dsv41_int8_prefill import _barrier, _fence_sys, _rint
++from .dsv41_int8_prefill_policy import (
++    PHASE_AG,
++    PHASE_FREE,
++    PHASE_RS,
++    WORLD,
++    copy_bytes,
++    rotated_steps,
++)
++
++TILE = 2048  # values per CTA iteration in the codec kernels (as 0032)
++COPY_CHUNK = 4096  # bytes per CTA iteration in the slot copy
++
++
++class _Raw:
++    """A raw device address passed to Triton as a typed pointer argument.
++
++    Triton treats any object with ``data_ptr()`` and ``dtype`` as a pointer and
++    specializes it on 16-byte alignment, so contiguous accesses through it
++    vectorize. A base loaded from a pointer table inside the kernel (0032) has
++    unknown alignment and compiles to element-wide accesses.
++    """
++
++    __slots__ = ("_ptr", "dtype")
++
++    def __init__(self, ptr: int, dtype: torch.dtype):
++        self._ptr = int(ptr)
++        self.dtype = dtype
++
++    def data_ptr(self) -> int:
++        return self._ptr
++
++
++@triton.jit
++def _quant_store(X, DstV, DstS, NBLK, BLOCK: tl.constexpr, GROUP: tl.constexpr,
++                 REMOTE: tl.constexpr):
++    """Quantize NBLK blocks of X into DstV (int8) and DstS (FP32 scales).
++
++    Same arithmetic as 0032's _quant_push: symmetric INT8 [-127, 127], scale =
++    max(absmax / 127, 1e-30), round to nearest even.
++    """
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    tiles = tl.cdiv(NBLK, GROUP)
++    g = tl.arange(0, GROUP)
++    lane = tl.arange(0, BLOCK)
++    for tile in range(pid, tiles, nprog):
++        b = tile * GROUP + g
++        live = b < NBLK
++        offs = b[:, None] * BLOCK + lane[None, :]
++        x = tl.load(X + offs, mask=live[:, None], other=0.0).to(tl.float32)
++        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(x), 1), 127.0), 1.0e-30)
++        q = tl.minimum(127, tl.maximum(-127, _rint(tl.div_rn(x, scale[:, None]))))
++        tl.store(DstV + offs, q.to(tl.int8), mask=live[:, None])
++        tl.store(DstS + b, scale, mask=live)
++    if REMOTE:
++        _fence_sys(pid)
++
++
++@triton.jit
++def _reduce_requant(RsV, RsS, STRIDE_V, STRIDE_S, AgV, AgS, NBLK,
++                    BLOCK: tl.constexpr, GROUP: tl.constexpr):
++    """Sum the four local reduce-scatter slots in rank order 0..3 (FP32),
++    requantize, and write the result into this rank's own gather slot.
++
++    Local only. Same expression order as 0032's _reduce_push.
++    """
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    tiles = tl.cdiv(NBLK, GROUP)
++    g = tl.arange(0, GROUP)
++    lane = tl.arange(0, BLOCK)
++    for tile in range(pid, tiles, nprog):
++        b = tile * GROUP + g
++        live = b < NBLK
++        offs = b[:, None] * BLOCK + lane[None, :]
++        total = tl.zeros((GROUP, BLOCK), dtype=tl.float32)
++        for source in tl.static_range(4):
++            q = tl.load(RsV + source * STRIDE_V + offs, mask=live[:, None], other=0,
++                        cache_modifier=".cg").to(tl.float32)
++            s = tl.load(RsS + source * STRIDE_S + b, mask=live, other=0.0,
++                        cache_modifier=".cg")
++            total = total + q * s[:, None]
++        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(total), 1), 127.0), 1.0e-30)
++        q2 = tl.minimum(127, tl.maximum(-127, _rint(tl.div_rn(total, scale[:, None]))))
++        tl.store(AgV + offs, q2.to(tl.int8), mask=live[:, None])
++        tl.store(AgS + b, scale, mask=live)
++
++
++@triton.jit
++def _copy_slot(Src, Dst, NBYTES, CHUNK: tl.constexpr):
++    """Copy NBYTES (a multiple of 16) from a local slot into a peer slot."""
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    o = tl.arange(0, CHUNK)
++    for t in range(pid, tl.cdiv(NBYTES, CHUNK), nprog):
++        offs = t * CHUNK + o
++        m = offs < NBYTES
++        v = tl.load(Src + offs, mask=m, other=0, cache_modifier=".cg")
++        tl.store(Dst + offs, v, mask=m)
++    _fence_sys(pid)
++
++
++@triton.jit
++def _gather(AgV, AgS, STRIDE_V, STRIDE_S, Out, PART, BLOCK: tl.constexpr,
++            GROUP: tl.constexpr):
++    """Dequantize the four local gather slots (PART values each) into Out.
++
++    Local reads only; .cg bypasses the incoherent L1 (peers wrote the data).
++    """
++    pid = tl.program_id(0)
++    nprog = tl.num_programs(0)
++    part_blocks = PART // BLOCK
++    blocks = part_blocks * 4
++    tiles = tl.cdiv(blocks, GROUP)
++    g = tl.arange(0, GROUP)
++    lane = tl.arange(0, BLOCK)
++    for tile in range(pid, tiles, nprog):
++        b = tile * GROUP + g
++        live = b < blocks
++        source = b // part_blocks
++        local = b - source * part_blocks
++        q = tl.load(AgV + (source * STRIDE_V + local * BLOCK)[:, None] + lane[None, :],
++                    mask=live[:, None], other=0, cache_modifier=".cg").to(tl.float32)
++        s = tl.load(AgS + source * STRIDE_S + local, mask=live, other=0.0,
++                    cache_modifier=".cg")
++        y = q * s[:, None]
++        tl.store(Out + b[:, None] * BLOCK + lane[None, :], y.to(tl.bfloat16),
++                 mask=live[:, None])
++
++
++class RotatedSchedule:
++    """The rotated schedule over an initialized ``DSV41Int8PrefillComm``.
++
++    Uses the comm's peer buffer (rotated layout), barrier header, CTA settings
++    and grids. All work runs on the caller's current stream; one instance must
++    not be used by two streams concurrently (as 0032).
++    """
++
++    def __init__(self, comm):
++        self.comm = comm
++        lay = comm.layout
++        if lay.rs_stride <= 0 or lay.ag_stride <= 0:
++            raise ValueError("rotated schedule needs the rotated buffer layout")
++        self.rank = comm.rank
++        self.rs_base = [p + lay.rs_values for p in comm.pointers]
++        self.ag_base = [p + lay.ag_values for p in comm.pointers]
++        self.group_blocks = TILE // lay.block
++        steps = rotated_steps(self.rank)
++        self.rs_steps = [(k, peer, quarter) for phase, k, peer, quarter in steps if phase == "rs"]
++        self.ag_peers = [peer for phase, _, peer, _ in steps if phase == "ag"]
++        # Boot probe (local, inside this rank's own buffer): Triton must accept
++        # raw pointer arguments, and the copy kernel compiles now rather than
++        # at the first prefill.
++        base = self.ag_base[self.rank]
++        with torch.cuda.device(comm.device):
++            _copy_slot[(1,)](_Raw(base, torch.int8), _Raw(base + lay.ag_stride, torch.int8),
++                             256, COPY_CHUNK, num_warps=4)
++        torch.cuda.synchronize(comm.device)
++
++    def _copy_grid(self, nbytes: int) -> tuple[int]:
++        tiles = -(-nbytes // COPY_CHUNK)
++        return (max(1, min(tiles, self.comm.settings.ctas)),)
++
++    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
++        c, lay, r = self.comm, self.comm.layout, self.rank
++        block = lay.block
++        shard = x.numel() // WORLD
++        nblk = shard // block
++        flat = x.view(-1)
++        out = torch.empty_like(x)
++        for k, peer, quarter in self.rs_steps:
++            slot = self.rs_base[peer] + r * lay.rs_stride
++            grid = c._grid(nblk) if k else c._local_grid(nblk)
++            _quant_store[grid](
++                flat[quarter * shard:(quarter + 1) * shard],
++                _Raw(slot, torch.int8), _Raw(slot + shard, torch.float32),
++                nblk, block, self.group_blocks, k != 0,
++                num_warps=4, enable_fp_fusion=False)
++        _barrier[(1,)](c.ptrs, r, PHASE_RS, num_warps=1)
++        own_rs = self.rs_base[r]
++        own_ag = self.ag_base[r] + r * lay.ag_stride
++        _reduce_requant[c._local_grid(nblk)](
++            _Raw(own_rs, torch.int8), _Raw(own_rs + shard, torch.float32),
++            lay.rs_stride, lay.rs_stride // 4,
++            _Raw(own_ag, torch.int8), _Raw(own_ag + shard, torch.float32),
++            nblk, block, self.group_blocks, num_warps=4, enable_fp_fusion=False)
++        self._push_own_gather_slot(own_ag, copy_bytes(shard, block))
++        _barrier[(1,)](c.ptrs, r, PHASE_AG, num_warps=1)
++        _gather[c._local_grid(WORLD * nblk)](
++            _Raw(self.ag_base[r], torch.int8), _Raw(self.ag_base[r] + shard, torch.float32),
++            lay.ag_stride, lay.ag_stride // 4, out, shard, block, self.group_blocks,
++            num_warps=4, enable_fp_fusion=False)
++        return out
++
++    def all_gather_stacked(self, x: torch.Tensor) -> torch.Tensor:
++        """0032's stacked layout: [WORLD * x.shape[0], *x.shape[1:]]."""
++        c, lay, r = self.comm, self.comm.layout, self.rank
++        block = lay.block
++        numel = x.numel()
++        nblk = numel // block
++        out = x.new_empty((WORLD * x.shape[0], *x.shape[1:]))
++        # Pre-barrier: every rank has finished reading its gather inbox.
++        _barrier[(1,)](c.ptrs, r, PHASE_FREE, num_warps=1)
++        own_ag = self.ag_base[r] + r * lay.ag_stride
++        _quant_store[c._local_grid(nblk)](
++            x.view(-1), _Raw(own_ag, torch.int8), _Raw(own_ag + numel, torch.float32),
++            nblk, block, self.group_blocks, False, num_warps=4, enable_fp_fusion=False)
++        self._push_own_gather_slot(own_ag, copy_bytes(numel, block))
++        _barrier[(1,)](c.ptrs, r, PHASE_AG, num_warps=1)
++        _gather[c._local_grid(WORLD * nblk)](
++            _Raw(self.ag_base[r], torch.int8), _Raw(self.ag_base[r] + numel, torch.float32),
++            lay.ag_stride, lay.ag_stride // 4, out, numel, block, self.group_blocks,
++            num_warps=4, enable_fp_fusion=False)
++        return out
++
++    def _push_own_gather_slot(self, own_ag: int, nbytes: int) -> None:
++        # One peer per launch, in rotated order; kernel boundaries keep the
++        # GPU writing to a single peer at a time.
++        lay, r = self.comm.layout, self.rank
++        assert nbytes <= lay.ag_stride
++        grid = self._copy_grid(nbytes)
++        for peer in self.ag_peers:
++            dst = self.ag_base[peer] + r * lay.ag_stride
++            _copy_slot[grid](_Raw(own_ag, torch.int8), _Raw(dst, torch.int8), nbytes,
++                             COPY_CHUNK, num_warps=4)
+diff --git a/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py b/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
+index e92d667..ca60d14 100644
+--- a/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
++++ b/vllm/distributed/device_communicators/flashinfer_pcie_ipc_all_reduce.py
+@@ -8,6 +8,8 @@ existing FlashInfer MNNVL/TRT-LLM all-reduce implementation, so it intentionally
+ lives behind a separate wrapper and an opt-in environment variable.
+ """
+ 
++import os
++
+ from collections.abc import Sequence
+ from contextlib import contextmanager
+ from pathlib import Path
+@@ -127,6 +129,16 @@ class FlashInferPcieIpcAllReduce:
+         self.hidden_dim = int(hidden_dim)
+         self.dtype = dtype
+         max_numel = batches[-1] * self.hidden_dim
++        true_ring = os.environ.get("DSV41_TRUE_RING", "0")
++        if true_ring not in ("0", "1"):
++            raise ValueError("DSV41_TRUE_RING must be 0 or 1")
++        if true_ring == "1":
++            from .opera_true_ring import initialize
++
++            initialize(
++                world_size=self.world_size, hidden_dim=self.hidden_dim,
++                dtype=dtype, max_numel=max_numel, tbo_stream=tbo_stream,
++            )
+         workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
+             group=self.group,
+             max_numel=max_numel,
+@@ -147,6 +159,15 @@ class FlashInferPcieIpcAllReduce:
+             tune_group=self.tune_group,
+         )
+         workspace.prepare([(batch, self.hidden_dim) for batch in batches], dtype=dtype)
++        if true_ring == "1":
++            from .opera_true_ring import install
++
++            # Keep stock tuning/cache entries intact. Only qualified exact
++            # row counts override dispatch, after a loaded-workspace gate.
++            workspace = install(workspace, tune_group=self.tune_group)
++            self.workspace = workspace
++        torch.accelerator.synchronize(self.device)
++        workspace.rebind_stream()
+         if tbo_stream is not None:
+             # One workspace per stream; the two halves serialize on tbo_stream.
+             with torch.cuda.stream(tbo_stream):
+diff --git a/vllm/distributed/device_communicators/opera_true_ring.py b/vllm/distributed/device_communicators/opera_true_ring.py
+new file mode 100644
+index 0000000..b63a96e
+--- /dev/null
++++ b/vllm/distributed/device_communicators/opera_true_ring.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: MIT
++"""Default-off dispatch of the exact CUDA-gated Opera true-ring native asset.
++
++The stock FI package, workspace, tuning and caches are never replaced. Opt-in
++loads a hash-pinned private module containing the same stock kernels plus7;
++only rows6/24/48 override dispatch after a loaded-workspace graph gate.
++"""
++import hashlib
++import importlib.metadata
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++
++ASSETS=Path('/opt/dsv41/opera-true-ring')
++GATED_NATIVE_SHA256='0a69390478b36c6ccacfdae41f371baf891846c717434e389c9fc0b228bada8a'
++GATED_MEASUREMENTS_SHA256='14f3c891c6379232c820c5b8b013ac0184a3a238b897b6d02f5a2518e01894f2'
++_NATIVE_STATE=None
++
++def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++def read_assets(root=ASSETS):
++    root=Path(root);manifest=json.loads((root/'manifest.json').read_text())
++    if manifest['native_library_sha256']!=GATED_NATIVE_SHA256:
++        raise RuntimeError('native manifest does not name the qualified CUDA-gated binary')
++    for rel,expected in manifest['files'].items():
++        if digest(root/rel)!=expected:raise RuntimeError('true-ring asset changed: '+rel)
++    if digest(root/'native.so')!=manifest['native_library_sha256']:
++        raise RuntimeError('true-ring native binary differs from actual CUDA-gated asset')
++    policy=json.loads((root/'policy.json').read_text())
++    if (policy['version'],policy['world_size'],policy['hidden_dim'],policy['dtype'],policy['max_numel'],policy['gate_sha256'])!=(1,4,5120,'torch.bfloat16',245760,GATED_MEASUREMENTS_SHA256):
++        raise RuntimeError('unqualified true-ring policy geometry/gate receipt')
++    if policy['ring_configs']!={'6':{'variant':7,'blocks':2,'threads':256},
++                              '24':{'variant':7,'blocks':8,'threads':256},
++                              '48':{'variant':7,'blocks':8,'threads':256}}:
++        raise RuntimeError('unqualified true-ring configuration table')
++    return manifest,policy
++
++def initialize(*,world_size,hidden_dim,dtype,max_numel,tbo_stream):
++    """Called before the original FI workspace creates its native wrapper."""
++    global _NATIVE_STATE
++    import flashinfer
++    import flashinfer.comm.pcie_ipc_ar as ar
++    import torch
++    import tvm_ffi
++    from vllm.logger import init_logger
++    log=init_logger(__name__)
++    manifest,policy=read_assets()
++    if (world_size!=policy['world_size'] or hidden_dim!=policy['hidden_dim']
++        or str(dtype)!=policy['dtype'] or max_numel!=policy['max_numel']
++        or tbo_stream is not None or os.environ.get('VLLM_DSV41_TBO','0')!='0'):
++        raise RuntimeError('true-ring requires gated TP4/BF16/hidden5120/max48rows and no TBO')
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()!=(8,0):
++        raise RuntimeError('true-ring requires the gated SM80 CUDA platform')
++    if str(torch.__version__)!=manifest['torch_version']:
++        raise RuntimeError('true-ring Torch/CUDA ABI differs from actual hardware gate')
++    if importlib.metadata.version('flashinfer-python')!='0.7.2':
++        raise RuntimeError('true-ring requires accepted FI0.7.2')
++    fi=Path(flashinfer.__file__).resolve().parent
++    for rel,expected in manifest['stock_fi_sources'].items():
++        if digest(fi/rel)!=expected:raise RuntimeError('stock FI source changed: '+rel)
++    if _NATIVE_STATE is not None:
++        if ar.gen_pcie_ipc_comm_module is not _NATIVE_STATE['factory']:
++            raise RuntimeError('FI native factory changed after true-ring initialization')
++        return
++    if ar.get_pcie_ipc_comm_module.cache_info().currsize:
++        raise RuntimeError('stock FI native wrapper already initialized; refuse live replacement')
++    # Explicit path bypasses FI AOT/JIT provider resolution entirely. Source and
++    # binary are tied to the PASS hardware gate, not a reusable generic URI.
++    native=tvm_ffi.load_module(str(ASSETS/'native.so'))
++    if int(native.opera_ring_variant_count_v1())!=8:
++        raise RuntimeError('loaded true-ring native probe must report count8')
++    factory=lambda:SimpleNamespace(build_and_load=lambda:native)
++    ar.gen_pcie_ipc_comm_module=factory
++    _NATIVE_STATE={'factory':factory,'policy':policy,'manifest':manifest,'native':native}
++    log.info('Opera true-ring native verified: count8, sha256=%s, gate=%s; exact rows6/24/48 only',
++             manifest['native_library_sha256'],policy['gate_sha256'])
++
++
++class RingWorkspace:
++    """Delegate stock lifecycle/stream/tuning; override only three exact shapes."""
++    def __init__(self,base,policy,config_factory):
++        self._base=base;self._policy=policy
++        self._configs={int(n):config_factory(**values) for n,values in policy['ring_configs'].items()}
++    def __getattr__(self,name):return getattr(self._base,name)
++    def all_reduce(self,inp,*,out=None,config=None,enable_pdl=False):
++        if config is None and not enable_pdl and inp.dim()==2 and inp.shape[1]==5120 and str(inp.dtype)=='torch.bfloat16':
++            config=self._configs.get(inp.shape[0])
++        return self._base.all_reduce(inp,out=out,config=config,enable_pdl=enable_pdl)
++
++
++def _workspace_gate(workspace,tune_group):
++    """Small mandatory graph/ordering check on the actual loaded-model workspace."""
++    import threading
++    import torch
++    import torch.distributed as dist
++    from vllm.logger import init_logger
++    # A peer/kernel stall must fail this candidate boot, not wait for a serving
++    # timeout. Parent unit still owns complete container/process-group cleanup.
++    watchdog=threading.Timer(90,lambda:os._exit(75));watchdog.daemon=True;watchdog.start()
++    graph=None;buffers={};rank=dist.get_rank(workspace.group)
++    try:
++        def input_for(n,epoch,r):
++            i=torch.arange(n*5120,device=workspace.device,dtype=torch.int32)
++            return ((i+3*r+7*epoch)%17-8).to(torch.bfloat16).reshape(n,5120)
++        def verify(n,epoch,out):
++            expected=sum(input_for(n,epoch,r).float() for r in range(4)).bfloat16()
++            ok=bool(torch.equal(out,expected));flags=[None]*4
++            dist.all_gather_object(flags,ok,group=tune_group)
++            if not all(flags):raise RuntimeError('true-ring loaded workspace row mismatch')
++        for n in (1,6,24,48):
++            x=input_for(n,0,rank);y=torch.empty_like(x);buffers[n]=(x,y)
++            workspace.all_reduce(x,out=y);torch.cuda.synchronize(workspace.device)
++            verify(n,0,y)
++        dist.barrier(group=tune_group);torch.cuda.synchronize(workspace.device);workspace.rebind_stream()
++        graph=torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            # Odd21-call chain switches stock/ring and payload geometry on the
++            # same underlying scratch. Main inference capture remains separate.
++            for i in range(21):
++                n=(1,6,24,48)[i%4];x,y=buffers[n];workspace.all_reduce(x,out=y)
++        torch.cuda.synchronize(workspace.device);workspace.rebind_stream()
++        for epoch in range(1,6):
++            for n,(x,y) in buffers.items():x.copy_(input_for(n,epoch,rank));y.fill_(float('nan'))
++            dist.barrier(group=tune_group);graph.replay();torch.cuda.synchronize(workspace.device)
++            for n,(_,y) in buffers.items():verify(n,epoch,y)
++        init_logger(__name__).info('Opera true-ring loaded-workspace gate PASS: eager4, graph105calls, rows1/6/24/48')
++    except BaseException:
++        import traceback
++        traceback.print_exc()
++        os._exit(76)
++    else:
++        # Normal success occurs after all ranks completed their work;
++        # the watchdog hard-exits on a native stall. Never destroy shared slabs
++        # from this helper; ownership remains with the original vLLM wrapper.
++        if graph is not None:del graph
++        buffers.clear()
++        workspace.rebind_stream()
++        watchdog.cancel()
++
++
++def install(base,*,tune_group):
++    import torch.distributed as dist
++    from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig
++    if _NATIVE_STATE is None:raise RuntimeError('true-ring native was not initialized')
++    # Agree before entering the new collective sequence. All workers launched
++    # from one container must carry the same explicit environment switch.
++    stamp={'policy':_NATIVE_STATE['policy'],'binary':_NATIVE_STATE['manifest']['native_library_sha256']}
++    stamps=[None]*4;dist.all_gather_object(stamps,stamp,group=tune_group)
++    if any(x!=stamp for x in stamps):raise RuntimeError('ranks disagree on true-ring policy/binary')
++    proxy=RingWorkspace(base,_NATIVE_STATE['policy'],IpcLaunchConfig)
++    _workspace_gate(proxy,tune_group)
++    return proxy
+diff --git a/vllm/lora/layers/base_linear.py b/vllm/lora/layers/base_linear.py
+index 24ae439..06c3440 100644
+--- a/vllm/lora/layers/base_linear.py
++++ b/vllm/lora/layers/base_linear.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ from transformers import PreTrainedConfig
+ 
+@@ -67,6 +69,32 @@ if envs.VLLM_LORA_ENABLE_DUAL_STREAM:
+     )
+ 
+ 
++def _dsv41_dense_rank1(x, output, a, b, token_lora_indices):
++    """Dense wo_b LoRA; all tensor indexing uses fixed Python slices only.
++
++    M may be smaller than metadata (slice it), never larger (shape-only assert).
++    No device scalars, sorting, gather/scatter, or persistent scratch buffers.
++    Preserve inactive output bytes, including signed zero and NaN payloads.
++    """
++    assert x.ndim == output.ndim == 2
++    m = x.shape[0]
++    assert output.shape[0] == m and token_lora_indices.ndim == 1
++    assert m <= token_lora_indices.shape[0], "wo_b rows exceed LoRA metadata"
++    assert a.shape == (1, 1, 1, x.shape[1])
++    assert b.shape == (1, 1, output.shape[1], 1)
++    assert x.dtype == output.dtype == a.dtype == b.dtype == torch.bfloat16
++    assert x.device == output.device == a.device == b.device == token_lora_indices.device
++    idx = token_lora_indices[:m]
++    for slot in range(a.shape[0]):
++        mask = (idx == slot).unsqueeze(1)
++        t = x.float() @ a[slot, 0].float().T
++        t = t * mask
++        delta = (t @ b[slot, 0].float().T).to(output.dtype)
++        # add_(0) changes -0 to +0; select the original inactive bytes instead.
++        output.copy_(torch.where(mask, output + delta, output))
++    return output
++
++
+ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
+     # The adapter branch consumes the original activation, independently of
+     # whether the wrapped base layer can consume a pre-quantized activation.
+@@ -219,6 +247,18 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
+     def _apply_lora_to_output(
+         self, x: torch.Tensor, output: torch.Tensor
+     ) -> torch.Tensor:
++        if (os.environ.get("DSV41_DENSE_LORA", "0") == "1"
++                and type(self).__name__ == "RowParallelLinearWithLoRA"
++                and self.base_layer.prefix.endswith(".attn.wo_b")):
++            assert self.tp_size == 4 and not self._enable_aux_cuda_stream
++            assert self.n_slices == len(self.lora_a_stacked) == len(self.lora_b_stacked) == 1
++            assert self.output_slices == (5120,) and x.shape[-1] == 2048
++            shape = output.shape
++            _dsv41_dense_rank1(x.reshape(-1, 2048), output.reshape(-1, 5120),
++                self.lora_a_stacked[0], self.lora_b_stacked[0],
++                self.punica_wrapper.token_lora_indices)
++            return output.reshape(shape)
++
+         original_shape = output.shape if output.ndim == 3 else None
+ 
+         # In transformers backend, x and output have extra batch dimension like
+diff --git a/vllm/model_executor/kernels/mhc/sm80.py b/vllm/model_executor/kernels/mhc/sm80.py
+index ed8a2b0..64eadfd 100644
+--- a/vllm/model_executor/kernels/mhc/sm80.py
++++ b/vllm/model_executor/kernels/mhc/sm80.py
+@@ -33,7 +33,8 @@ def _post_values(X, R, P, C, row, k, valid, H: tl.constexpr):
+         coeff = tl.load(C + row * 16 + i * 4 + stream, valid, 0)
+         residual = tl.load(R + row * 4 * H + i * H + h, valid, 0).to(tl.float32)
+         value = tl.fma(coeff, residual, value)
+-    return value
++    # Projection and collapse must both see the serialized BF16 residual.
++    return value.to(tl.bfloat16).to(tl.float32)
+ 
+ 
+ @triton.jit
+@@ -53,7 +54,6 @@ def _project(
+     BK: tl.constexpr,
+     BN: tl.constexpr,
+     POST: tl.constexpr,
+-    ROUND_POST: tl.constexpr,
+ ):
+     row = tl.program_id(0)
+     tile = tl.program_id(1)
+@@ -64,8 +64,6 @@ def _project(
+         value = _post_values(X, R, P, C, row, k, k < K, H)
+         if tile == 0:
+             tl.store(R_OUT + row * K + k, value, k < K)
+-        if ROUND_POST:
+-            value = value.to(tl.bfloat16).to(tl.float32)
+     else:
+         value = tl.load(X + row * K + k, k < K, 0).to(tl.float32)
+     weight = tl.load(
+@@ -210,15 +208,6 @@ def mhc_pre_sm80(
+     """Return the six delayed-seam outputs; standalone pre drops first/last."""
+     rows, _, hidden = residual.shape
+     fused = sublayer_out is not None
+-    round_post = False
+-    if fused:
+-        from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+-            mhc_fused_post_pre_split_config,
+-        )
+-
+-        # Upstream's fused seam projects FP32 registers. Its separate post/pre
+-        # route projects the stored BF16 residual instead.
+-        round_post = mhc_fused_post_pre_split_config(rows, hidden, 4) is None
+     projection = residual.flatten(1) if x is None else x
+     width = projection.shape[1]
+     assert residual.is_contiguous() and residual.dtype == torch.bfloat16
+@@ -275,7 +264,6 @@ def mhc_pre_sm80(
+         config.block_k,
+         config.tile_n,
+         fused,
+-        round_post,
+         num_warps=config.num_warps,
+     )
+     _finish[(rows,)](
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 4ea40be..13353fa 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -128,6 +128,7 @@ from ..pp_shadow import (
+ from ..pp_shadow import (
+     remap_shadow_weight_name as _dsv41_remap_shadow_weight_name,
+ )
++from . import prefill_overlap as _dsv41_overlap
+ from .ops.mhc import (
+     MHC_OVERLAP_MAX_TOKENS,
+     hc_expand,
+@@ -138,6 +139,9 @@ from .ops.mhc import (
+     supports_mhc_overlap,
+ )
+ from .specialized_decode import specialized_decode_config
++from vllm.distributed.device_communicators.dsv41_int8_prefill_policy import (
++    exact_scope as _dsv41_exact_scope,
++)
+ 
+ if typing.TYPE_CHECKING:
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+@@ -180,6 +184,12 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
+                     "DSV41_PREFILL_MOE_CHUNK requires SM80 TP4/PP1/DP1 EXL3, "
+                     "no EP, SP, ubatching, LoRA or fused mHC reduction; chunk >=128"
+                 )
++        # Prefill overlap (DSV41_PREFILL_OVERLAP=1): keep the MoE output local
++        # and reduce explicitly, so the decoder layer can split prefill rows.
++        self._dsv41_overlap = (
++            _dsv41_overlap.parse_settings() is not None
++            and vllm_config.parallel_config.tensor_parallel_size > 1
++        )
+         n_routed_experts = config.n_routed_experts
+         n_activated_experts = config.num_experts_per_tok
+         if extract_layer_index(prefix) >= config.num_hidden_layers:
+@@ -196,22 +206,42 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
+             n_routed_experts=n_routed_experts,
+             n_activated_experts=n_activated_experts,
+             num_hash_layers=0,
+-            reduce_results=reduce_results and not self._dsv41_prefill_chunk,
++            reduce_results=reduce_results
++            and not self._dsv41_prefill_chunk
++            and not self._dsv41_overlap,
+             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
+         )
+         if self._dsv41_prefill_chunk:
+             from vllm.utils.dsv41_prefill_overlap import register_moe
+ 
+             self._dsv41_prefill_name = register_moe(self, prefix)
++        if self._dsv41_overlap and self.use_native_mega_moe:
++            # The split forward has no per-half MegaMoE routing metadata.
++            raise ValueError("DSV41_PREFILL_OVERLAP does not support native MegaMoE")
+ 
+     def _dsv41_local_forward(self, hidden, input_ids):
+         return super().forward(hidden, input_ids)
+ 
++    def _dsv41_overlap_local(self, hidden, input_ids, lo, hi):
++        """Unreduced MoE output for prefill rows lo:hi of the forward batch."""
++        context = get_forward_context()
++        full_padding = context.is_padding
++        context.is_padding = full_padding[lo:hi] if full_padding is not None else None
++        try:
++            return super().forward(hidden, input_ids)
++        finally:
++            context.is_padding = full_padding
++
+     def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
+         if self._dsv41_prefill_chunk:
+             return torch.ops.vllm.dsv41_prefill_moe(
+                 hidden_states, input_ids, self._dsv41_prefill_name
+             )
++        if self._dsv41_overlap:
++            # Same tensor and dispatcher as the runner's late reduction.
++            return tensor_model_parallel_all_reduce(
++                super().forward(hidden_states, input_ids, mega_gate_metadata)
++            )
+         return super().forward(hidden_states, input_ids, mega_gate_metadata)
+ 
+     def defer_finalize(self) -> None:
+@@ -439,6 +469,26 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 # forward keeps the separate reduce-scatter below.
+                 self.attn.bind_gemm_rs()
+         self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)
++        self._dsv41_overlap = _dsv41_overlap.parse_settings()
++        if self._dsv41_overlap is not None:
++            parallel = vllm_config.parallel_config
++            capability = current_platform.get_device_capability()
++            quant = vllm_config.quant_config
++            _dsv41_overlap.validate(
++                device_capability=tuple(capability) if capability else None,
++                tp=parallel.tensor_parallel_size,
++                pp=parallel.pipeline_parallel_size,
++                dp=parallel.data_parallel_size,
++                expert_parallel=parallel.enable_expert_parallel,
++                ubatching=getattr(parallel, "use_ubatching", False),
++                sequence_parallel=self.use_sequence_parallel,
++                fuse_mhc_all_reduce=fuse_mhc_all_reduce,
++                gemm_rs=run_gemm_rs,
++                quant_name=quant.get_name() if quant is not None else None,
++                batch_invariant=envs.VLLM_BATCH_INVARIANT,
++                moe_chunk=int(os.environ.get("DSV41_PREFILL_MOE_CHUNK", "0") or 0),
++                lora=getattr(vllm_config, "lora_config", None) is not None,
++            )
+         self.ffn = DeepseekV4MoE(
+             vllm_config,
+             prefix=f"{prefix}.ffn",
+@@ -706,6 +756,19 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+         if getattr(self, "_dsv41_ship_attn_input", False):
+             self._dsv41_shipped_x = x
++        if (
++            self._dsv41_overlap is not None
++            and mhc_stream is None
++            and _dsv41_overlap.eligible(
++                self._dsv41_overlap,
++                x.shape[0],
++                torch.cuda.is_current_stream_capturing(),
++            )
++        ):
++            return self._dsv41_overlap_tail(
++                x, positions, input_ids, residual, post_mix, res_mix, attn_pre,
++                previous_aux,
++            )
+         x = self.attn(positions, x, None)
+         # With GEMM-RS bound, the attention output is already this rank's
+         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
+@@ -742,6 +805,66 @@ class DeepseekV4DecoderLayer(nn.Module):
+             torch.cuda.current_stream().wait_stream(mhc_stream)
+         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
+ 
++    def _dsv41_overlap_tail(
++        self, x, positions, input_ids, residual, post_mix, res_mix, attn_pre,
++        previous_aux,
++    ):
++        """Eager prefill: attention, then the two-half reduction pipeline."""
++        wo_b = self.attn.wo_b
++        reduce_results = wo_b.reduce_results
++        wo_b.reduce_results = False
++        try:
++            partial_out = self.attn(positions, x, None)
++        finally:
++            wo_b.reduce_results = reduce_results
++
++        def seam(lo, hi, reduced):
++            return mhc_shifted_post_pre(
++                reduced,
++                residual[lo:hi],
++                post_mix[lo:hi],
++                res_mix[lo:hi],
++                self.hc_ffn_fn,
++                self.hc_ffn_scale,
++                self.hc_ffn_base,
++                self.rms_norm_eps,
++                self.hc_eps,
++                self.hc_eps,
++                self.hc_post_alpha,
++                self.hc_sinkhorn_iters,
++                pre_mix=attn_pre[lo:hi],
++                norm_weight=self.ffn_norm.weight,
++                norm_eps=self.ffn_norm.variance_epsilon,
++                stream=None,
++                reduce_results=False,
++            )[:5]
++
++        def moe_local(lo, hi, hidden):
++            ids = input_ids[lo:hi] if input_ids is not None else None
++            return self.ffn._dsv41_overlap_local(hidden, ids, lo, hi)
++
++        ops = _dsv41_overlap.TorchOps(_dsv41_overlap.comm_stream(partial_out.device))
++        result = _dsv41_overlap.run(
++            partial_out, seam, moe_local, tensor_model_parallel_all_reduce, ops
++        )
++        settings = self._dsv41_overlap
++        if settings.check:
++            # Qualification only: serial reference on the same inputs, same
++            # collective order on every rank. Doubles the layer's cost.
++            reference = _dsv41_overlap.serial(
++                partial_out, seam, moe_local, tensor_model_parallel_all_reduce
++            )
++            _dsv41_overlap.compare(
++                self.ffn.prefix if hasattr(self.ffn, "prefix") else str(id(self)),
++                partial_out.shape[0],
++                result,
++                reference,
++                settings.check_dir,
++                torch.distributed.get_rank(),
++            )
++        out, residual, post_mix, res_mix, ffn_pre = result
++        return out, residual, post_mix, res_mix, ffn_pre, previous_aux
++
+     def write_kv(
+         self,
+         x: torch.Tensor | MoEOutput,
+@@ -1055,7 +1178,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             self._mtp_hidden_buffer = None
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return self.embed_tokens(input_ids)
++        # The vocab-parallel gather-by-sum is exact in BF16; keep it out of the
++        # opt-in INT8 prefill all-reduce (a no-op scope when that is off).
++        with _dsv41_exact_scope():
++            return self.embed_tokens(input_ids)
+ 
+     def make_empty_intermediate_tensors(
+         self,
+diff --git a/vllm/models/deepseek_v41/nvidia/prefill_overlap.py b/vllm/models/deepseek_v41/nvidia/prefill_overlap.py
+new file mode 100644
+index 0000000..0f7a7ad
+--- /dev/null
++++ b/vllm/models/deepseek_v41/nvidia/prefill_overlap.py
+@@ -0,0 +1,232 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in prefill overlap of TP reductions with row-wise compute (SM80 TP4).
++
++Between two attention cores every operation of a DeepSeek V4.1 decoder layer
++is row-wise: the attention output projection, its all-reduce, the mHC
++post/pre seam, the MoE and its all-reduce. Only the sparse attention core
++mixes tokens. The pipeline therefore splits the rows after the attention core
++into two halves and keeps one communication stream busy:
++
++    comm:  AR_attn(h0)  AR_attn(h1)        AR_moe(h0)       AR_moe(h1)
++    main:  [o-proj]     seam(h0)+MoE(h0)   seam(h1)+MoE(h1)  join
++
++MoE(h0) runs under AR_attn(h1) and MoE(h1) under AR_moe(h0). Every rank
++issues the four collectives in the same order on the same stream, so the
++collective sequence is identical across ranks (deadlock-free by construction).
++Decode, CUDA graph capture and small batches never enter the pipeline.
++
++Torch is imported lazily so the scheduling logic is testable without CUDA:
++callers pass an ``ops`` object (``TorchOps`` in serving, fakes in tests).
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++ENV = "DSV41_PREFILL_OVERLAP"
++ENV_MIN_ROWS = "DSV41_PREFILL_OVERLAP_MIN_ROWS"
++ENV_CHECK = "DSV41_PREFILL_OVERLAP_CHECK"
++ENV_CHECK_DIR = "DSV41_PREFILL_OVERLAP_CHECK_DIR"
++DEFAULT_MIN_ROWS = 512
++DECODE_MAX_ROWS = 48
++
++
++@dataclass(frozen=True)
++class Settings:
++    min_rows: int
++    check: bool
++    check_dir: str | None
++
++
++def parse_settings(environ=os.environ) -> Settings | None:
++    value = environ.get(ENV, "0")
++    if value not in ("0", "1"):
++        raise ValueError(f"{ENV} must be 0 or 1, got {value!r}")
++    if value == "0":
++        return None
++    raw = environ.get(ENV_MIN_ROWS, str(DEFAULT_MIN_ROWS))
++    if not raw.isdigit() or int(raw) < 2 * (DECODE_MAX_ROWS + 1) or int(raw) > 65536:
++        raise ValueError(f"{ENV_MIN_ROWS} must be an integer in [98, 65536]")
++    check = environ.get(ENV_CHECK, "0")
++    if check not in ("0", "1"):
++        raise ValueError(f"{ENV_CHECK} must be 0 or 1")
++    return Settings(int(raw), check == "1", environ.get(ENV_CHECK_DIR) or None)
++
++
++def validate(*, device_capability, tp, pp, dp, expert_parallel, ubatching,
++             sequence_parallel, fuse_mhc_all_reduce, gemm_rs, quant_name,
++             batch_invariant, moe_chunk, lora) -> None:
++    """Refuse every configuration the pipeline was not designed for."""
++    problems = []
++    if device_capability != (8, 0):
++        problems.append("SM80")
++    if (tp, pp, dp) != (4, 1, 1):
++        problems.append("TP4/PP1/DP1")
++    if expert_parallel:
++        problems.append("no expert parallel")
++    if ubatching:
++        problems.append("no ubatching/TBO (it also disables SWA bounded replay)")
++    if sequence_parallel:
++        problems.append("no sequence parallel")
++    if fuse_mhc_all_reduce or gemm_rs:
++        problems.append("no fused mHC all-reduce or GEMM-RS")
++    if quant_name != "exl3":
++        problems.append("EXL3 weights")
++    if batch_invariant:
++        problems.append("no batch-invariant mode")
++    if moe_chunk:
++        problems.append("DSV41_PREFILL_MOE_CHUNK=0 (r13 pipeline is the MoE-only predecessor)")
++    if lora:
++        problems.append("no LoRA")
++    if problems:
++        raise ValueError(f"{ENV}=1 requires: " + ", ".join(problems))
++
++
++def eligible(settings: Settings | None, rows: int, capturing: bool) -> bool:
++    return settings is not None and not capturing and rows >= settings.min_rows
++
++
++def half_ranges(rows: int) -> list[tuple[int, int]]:
++    if rows < 2:
++        raise ValueError("need at least two rows to split")
++    mid = rows // 2
++    return [(0, mid), (mid, rows)]
++
++
++_COMM_STREAMS: dict = {}
++
++
++def comm_stream(device):
++    """One communication stream per device, shared by every layer, so all
++    pipelined collectives of a rank stay in one issue order."""
++    stream = _COMM_STREAMS.get(device)
++    if stream is None:
++        import torch
++
++        stream = _COMM_STREAMS[device] = torch.cuda.Stream(device=device)
++    return stream
++
++
++class TorchOps:
++    """Stream/event primitives for the serving path."""
++
++    def __init__(self, comm_stream):
++        import torch
++
++        self.torch = torch
++        self.comm = comm_stream
++
++    def main(self):
++        return self.torch.cuda.current_stream()
++
++    def record(self, stream):
++        event = self.torch.cuda.Event()
++        event.record(stream)
++        return event
++
++    def wait(self, stream, event):
++        stream.wait_event(event)
++
++    def on(self, stream):
++        return self.torch.cuda.stream(stream)
++
++    def keep(self, tensor, stream):
++        tensor.record_stream(stream)
++
++    def own(self, tensor):
++        # Producers may return views of persistent scratch that the next call
++        # reuses; the communication stream reads an owned copy.
++        return tensor.contiguous().clone()
++
++    def join(self, main, comm):
++        main.wait_stream(comm)
++
++    def cat(self, parts):
++        return self.torch.cat(parts, dim=0)
++
++
++def run(partial, seam, moe_local, all_reduce, ops):
++    """Pipeline the post-attention half of a decoder layer.
++
++    partial:   [T, H] unreduced attention output (o-projection without its AR)
++    seam:      (lo, hi, reduced_attn) -> (residual, post_mix, res_mix, x, ffn_pre)
++               for rows lo:hi (the second mHC post/pre of the layer)
++    moe_local: (lo, hi, x) -> unreduced MoE output for rows lo:hi
++    all_reduce: tensor -> reduced tensor, called with ``ops.comm`` current
++    Returns (moe_out_reduced, residual, post_mix, res_mix, ffn_pre) for all rows.
++    """
++    rows = partial.shape[0]
++    ranges = half_ranges(rows)
++    main = ops.main()
++    comm = ops.comm
++    owned = ops.own(partial)
++    ops.wait(comm, ops.record(main))
++    ops.keep(owned, comm)
++    attn_done = []
++    for lo, hi in ranges:
++        with ops.on(comm):
++            reduced = all_reduce(owned[lo:hi])
++        attn_done.append((reduced, ops.record(comm)))
++    seams, moe_done = [], []
++    for (lo, hi), (reduced, event) in zip(ranges, attn_done):
++        ops.wait(main, event)
++        ops.keep(reduced, main)
++        state = seam(lo, hi, reduced)
++        local = ops.own(moe_local(lo, hi, state[3]))
++        ops.wait(comm, ops.record(main))
++        ops.keep(local, comm)
++        with ops.on(comm):
++            out = all_reduce(local)
++        moe_done.append(out)
++        seams.append(state)
++    ops.join(main, comm)
++    for out in moe_done:
++        ops.keep(out, main)
++    x = ops.cat(moe_done)
++    residual, post_mix, res_mix, _, ffn_pre = (
++        ops.cat([s[i] for s in seams]) for i in range(5)
++    )
++    return x, residual, post_mix, res_mix, ffn_pre
++
++
++def serial(partial, seam, moe_local, all_reduce):
++    """Reference order (no split): what the unmodified layer computes."""
++    rows = partial.shape[0]
++    reduced = all_reduce(partial)
++    residual, post_mix, res_mix, x, ffn_pre = seam(0, rows, reduced)
++    return all_reduce(moe_local(0, rows, x)), residual, post_mix, res_mix, ffn_pre
++
++
++def compare(name, rows, got, ref, directory=None, rank=0):
++    """Record pipelined-vs-serial differences (qualification only).
++
++    Bit identity is not expected: MoE and mHC kernels choose tiling by row
++    count and a BF16 NCCL reduction's order depends on the message size. The
++    INT8 prefill all-reduce itself is split-invariant.
++    """
++    import json
++
++    labels = ("x", "residual", "post_mix", "res_mix", "ffn_pre")
++    record = {"layer": name, "rows": rows, "rank": rank, "outputs": {}}
++    for label, a, b in zip(labels, got, ref):
++        diff = (a.float() - b.float()).abs()
++        scale = b.float().abs().max().item()
++        record["outputs"][label] = {
++            "bit_equal": bool((a == b).all().item()),
++            "max_abs": diff.max().item(),
++            "max_ref": scale,
++            "rel_rms": (diff.pow(2).mean().sqrt() / b.float().pow(2).mean().sqrt().clamp_min(1e-30)).item(),
++        }
++    if directory:
++        import re
++        from pathlib import Path
++
++        root = Path(directory)
++        root.mkdir(parents=True, exist_ok=True)
++        label = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
++        (root / f"overlap-rank{rank}-{label}-t{rows}.json").write_text(
++            json.dumps(record, indent=2) + "\n"
++        )
++    return record
+diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
+index d587cd0..03306e4 100644
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -135,6 +135,11 @@ class DeepseekV41ForCausalLM(
+     implemented by ``DeepseekV4VLEncoderCudaGraphMixin``.
+     """
+ 
++    # LoRA is managed on this outer model, not on language_model separately.
++    # Keep the VL HF mapper below; it re-roots layers.* under language_model.
++    packed_modules_mapping = DeepseekV41LLMForCausalLM.packed_modules_mapping
++    lora_skip_prefixes = ["mtp."]
++
+     supports_encoder_tp_data = True
+ 
+     packed_modules_mapping = {
+diff --git a/vllm/v1/core/sched/dsv41_adaptive_verify.py b/vllm/v1/core/sched/dsv41_adaptive_verify.py
+new file mode 100644
+index 0000000..bb5a42c
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_adaptive_verify.py
+@@ -0,0 +1,561 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSV41 host-side adaptive DSpark verify width (opera adaptive-verify-r1).
++
++``VLLM_DSV41_ADAPTIVE_VERIFY_POLICY=<policy JSON>`` makes the scheduler pick,
++for every decode step, one verify width K (drafts verified per request) from
++the running requests' recent draft acceptance and a measured step-cost table.
++Empty or unset: off, and the scheduler runs exactly as before.
++
++Adapted from Morrowmake's ``adaptive_k`` acceptance rule
++(github.com/Morrowmake/vllm-cmp170hx @ a0c57b52,
++``vllm/sm80/spec_decode/adaptive_k.py``, Apache-2.0) and the truncation
++point of its DSpark ``host_width`` layer
++(``vllm/sm80/spec_decode/dspark_host_width.py``). Morrowmake's per-request
++device row mask is not ported (see the round's MORROWMAKE.md).
++
++What it does and does not change:
++
++* The drafter still drafts its full block (``num_spec_tokens_to_schedule`` is
++  untouched), so K can climb back on the next step.
++* At the start of ``Scheduler.schedule`` each running decode request's
++  placeholder draft list is truncated (rebound, never mutated: the async
++  scheduler shares one placeholder list) to K. Every downstream size follows
++  from that list: scheduled tokens ``1 + K``, KV slots, the worker's verify
++  rows, ``update_draft_token_ids_in_output``'s trim of the arriving drafts and
++  the rejection count. Verifying a prefix of the drafts is ordinary
++  speculative decoding: the target distribution is unchanged.
++* The step stays a uniform decode batch (every request ``1 + K`` rows), so it
++  replays a FULL CUDA graph if ``b * (K + 1)`` is captured for query length
++  ``K + 1`` (``capture_query_lens`` adds those query lengths).
++
++The rule (per decode step of ``b`` running requests, none prefilling,
++``b >= min_batch``)::
++
++    p_r      = (s_r + strength * prior) / (s_r + f_r + strength)
++    E(p, k)  = (1 - p^(k+1)) / (1 - p)        tokens a step commits, bonus incl.
++    K        = argmax_{k in k_choices, k <= cap} sum_r E(p_r, k) / T(b, k)
++
++``s_r`` / ``f_r`` are request r's decayed counts of accepted drafts and of
++rejections (one per verify round that did not accept every draft): a
++geometric model of per-draft acceptance, which needs no censoring correction
++when K < max. ``T(b, k)`` is the policy's step time (ms), linearly
++interpolated between listed batch sizes. Ties go to the larger k; the step
++keeps the previous K unless the best k beats it by ``hysteresis``.
++Steps with a prefilling request take ``mixed_step_k``; below ``min_batch``
++nothing is truncated.
++
++Calibration (``VLLM_DSV41_ADAPTIVE_VERIFY_FORCE_FILE=<path>``): the file is
++checked on every step (one ``stat``; re-read when it changes). A value in
++``k_choices`` forces that width on every step, anything else means policy
++mode. Each step then rewrites ``<path>.status`` atomically: the step sequence,
++the forced value, the sequence at which it took effect, and cumulative step
++counts by the width actually applied, so a client can wait for an
++acknowledged width and check that a scored interval ran only at that width.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++from collections import Counter, OrderedDict
++from dataclasses import dataclass, field
++from functools import cache
++from pathlib import Path
++from typing import Any
++
++SCHEMA = "dsv41-adaptive-verify/1"
++ENV_POLICY = "VLLM_DSV41_ADAPTIVE_VERIFY_POLICY"
++ENV_FORCE_FILE = "VLLM_DSV41_ADAPTIVE_VERIFY_FORCE_FILE"
++# Placeholder-padded outputs remembered at most (outputs never processed,
++# e.g. dropped at shutdown, must not grow the map without bound).
++MAX_PADDED_OUTPUTS = 64
++
++_KEYS = frozenset(
++    {
++        "schema",
++        "max_k",
++        "k_choices",
++        "min_batch",
++        "mixed_step_k",
++        "prior",
++        "decay",
++        "strength",
++        "hysteresis",
++        "costs_ms",
++        "log_interval",
++        "source",
++    }
++)
++
++
++def _logger():
++    try:
++        from vllm.logger import init_logger
++
++        return init_logger(__name__)
++    except Exception:  # pragma: no cover - CPU tests without vLLM
++        import logging
++
++        return logging.getLogger(__name__)
++
++
++# ------------------------------------------------------------------ policy
++
++
++@dataclass(frozen=True)
++class Policy:
++    max_k: int
++    # Ascending, every value in 1..max_k, max_k included.
++    k_choices: tuple[int, ...]
++    min_batch: int
++    mixed_step_k: int
++    prior: float
++    decay: float
++    strength: float
++    hysteresis: float
++    # cost[b][k] (ms) for b = 1 .. max_batch, k in k_choices (index 0 unused).
++    cost: tuple[dict[int, float], ...]
++    log_interval: int = 0
++
++    @property
++    def max_batch(self) -> int:
++        return len(self.cost) - 1
++
++    def step_ms(self, b: int, k: int) -> float:
++        row = self.cost[min(max(b, 1), self.max_batch)]
++        return row[k]
++
++
++def _num(path: Any, what: str, value: Any) -> float:
++    if isinstance(value, bool):
++        raise ValueError(f"{path}: {what} must be a number, got {value!r}")
++    try:
++        v = float(value)
++    except (TypeError, ValueError):
++        raise ValueError(f"{path}: {what} must be a number, got {value!r}") from None
++    if not math.isfinite(v):
++        raise ValueError(f"{path}: {what} is not finite: {value!r}")
++    return v
++
++
++def _int(path: Any, what: str, value: Any) -> int:
++    if not isinstance(value, int) or isinstance(value, bool):
++        raise ValueError(f"{path}: {what} must be an integer, got {value!r}")
++    return value
++
++
++def parse_policy(
++    raw: Any, max_num_seqs: int, num_spec_tokens: int, path: Any = "policy"
++) -> Policy:
++    """Check a ``dsv41-adaptive-verify/1`` mapping (ValueError when malformed or
++    not matching the engine's ``num_spec_tokens`` / ``max_num_seqs``)."""
++    if not isinstance(raw, dict):
++        raise ValueError(f"{path}: the policy must be a JSON object")
++    if raw.get("schema") != SCHEMA:
++        raise ValueError(
++            f"{path}: schema must be {SCHEMA!r}, got {raw.get('schema')!r}"
++        )
++    unknown = set(raw) - _KEYS
++    if unknown:
++        raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
++    max_k = _int(path, "max_k", raw.get("max_k"))
++    if max_k != num_spec_tokens:
++        raise ValueError(
++            f"{path}: max_k {max_k} must equal num_speculative_tokens {num_spec_tokens}"
++        )
++    choices = raw.get("k_choices")
++    if (
++        not isinstance(choices, list)
++        or not choices
++        or any(not isinstance(k, int) or isinstance(k, bool) for k in choices)
++        or len(set(choices)) != len(choices)
++        or any(not 1 <= k <= max_k for k in choices)
++    ):
++        raise ValueError(f"{path}: k_choices must be distinct integers in 1..{max_k}")
++    k_choices = tuple(sorted(choices))
++    if k_choices[-1] != max_k:
++        raise ValueError(f"{path}: k_choices must include max_k {max_k}")
++    min_batch = _int(path, "min_batch", raw.get("min_batch", 2))
++    if min_batch < 1:
++        raise ValueError(f"{path}: min_batch must be >= 1")
++    mixed = _int(path, "mixed_step_k", raw.get("mixed_step_k", max_k))
++    if mixed not in k_choices:
++        raise ValueError(
++            f"{path}: mixed_step_k {mixed} is not in k_choices {list(k_choices)}"
++        )
++    prior = _num(path, "prior", raw.get("prior", 0.7))
++    decay = _num(path, "decay", raw.get("decay", 0.9))
++    strength = _num(path, "strength", raw.get("strength", 2.0))
++    hysteresis = _num(path, "hysteresis", raw.get("hysteresis", 0.03))
++    if not 0.0 < prior < 1.0:
++        raise ValueError(f"{path}: prior must be in (0, 1)")
++    if not 0.0 <= decay < 1.0:
++        raise ValueError(f"{path}: decay must be in [0, 1)")
++    if not strength > 0.0:
++        raise ValueError(f"{path}: strength must be > 0")
++    if not 0.0 <= hysteresis < 1.0:
++        raise ValueError(f"{path}: hysteresis must be in [0, 1)")
++    log_interval = _int(path, "log_interval", raw.get("log_interval", 0))
++    if log_interval < 0:
++        raise ValueError(f"{path}: log_interval must be >= 0")
++
++    costs = raw.get("costs_ms")
++    if not isinstance(costs, dict) or not costs:
++        raise ValueError(
++            f"{path}: costs_ms must be a non-empty object of batch -> {{k: ms}}"
++        )
++    rows: dict[int, dict[int, float]] = {}
++    for key, by_k in costs.items():
++        try:
++            b = int(key)
++        except ValueError:
++            raise ValueError(
++                f"{path}: costs_ms batch {key!r} is not an integer"
++            ) from None
++        if b < 1 or str(b) != key:
++            raise ValueError(
++                f"{path}: costs_ms batch {key!r} must be a positive integer"
++            )
++        if not isinstance(by_k, dict):
++            raise ValueError(f"{path}: costs_ms[{b}] must be an object of k -> ms")
++        row: dict[int, float] = {}
++        for k in k_choices:
++            if str(k) not in by_k:
++                raise ValueError(f"{path}: costs_ms[{b}] has no k = {k}")
++            v = _num(path, f"costs_ms[{b}][{k}]", by_k[str(k)])
++            if v <= 0.0:
++                raise ValueError(f"{path}: costs_ms[{b}][{k}] must be positive")
++            row[k] = v
++        rows[b] = row
++    known = sorted(rows)
++    table: list[dict[int, float]] = [{}]
++    for b in range(1, max_num_seqs + 1):
++        if b <= known[0]:
++            row = rows[known[0]]
++        elif b >= known[-1]:
++            row = rows[known[-1]]
++        else:
++            lo = max(x for x in known if x <= b)
++            hi = min(x for x in known if x >= b)
++            w = 0.0 if hi == lo else (b - lo) / (hi - lo)
++            row = {k: rows[lo][k] + (rows[hi][k] - rows[lo][k]) * w for k in k_choices}
++        table.append(dict(row))
++    return Policy(
++        max_k=max_k,
++        k_choices=k_choices,
++        min_batch=min_batch,
++        mixed_step_k=mixed,
++        prior=prior,
++        decay=decay,
++        strength=strength,
++        hysteresis=hysteresis,
++        cost=tuple(table),
++        log_interval=log_interval,
++    )
++
++
++@cache
++def _policy_json(path: str) -> Any:
++    return json.loads(Path(path).read_text())
++
++
++def policy_path() -> str:
++    return os.environ.get(ENV_POLICY, "").strip()
++
++
++def capture_query_lens(decode_query_len: int, num_spec_tokens: int) -> list[int] | None:
++    """Uniform-decode query lengths the policy may run (``k + sampled`` for
++    every k in k_choices), for the target model's CUDA graph capture; None when
++    off, and None for a manager whose query length is not a verify step's
++    (``decode_query_len <= num_spec_tokens``: the DSpark/DFlash drafter's
++    query-block manager drafts its full block whatever the verify width)."""
++    path = policy_path()
++    if not path:
++        return None
++    sampled = decode_query_len - num_spec_tokens
++    if sampled < 1:
++        return None
++    raw = _policy_json(path)
++    choices = raw.get("k_choices") if isinstance(raw, dict) else None
++    if (
++        not isinstance(choices, list)
++        or not choices
++        or any(
++            not isinstance(k, int)
++            or isinstance(k, bool)
++            or not 1 <= k <= num_spec_tokens
++            for k in choices
++        )
++    ):
++        raise ValueError(f"{path}: k_choices must be integers in 1..{num_spec_tokens}")
++    return sorted({k + sampled for k in choices})
++
++
++# ------------------------------------------------------------------ state
++
++
++def expected_tokens(p: float, k: int) -> float:
++    """Tokens a verify round commits at depth k (bonus included) when each
++    draft is accepted with probability p given the earlier ones were."""
++    p = min(max(p, 0.0), 0.999)
++    return (1.0 - p ** (k + 1)) / (1.0 - p)
++
++
++@dataclass
++class AdaptiveVerify:
++    policy: Policy
++    # Per request: decayed accepted drafts / rejections.
++    acc_s: dict[str, float] = field(default_factory=dict)
++    acc_f: dict[str, float] = field(default_factory=dict)
++    # Request ids padded into decode by the step being scheduled, then per
++    # scheduler output (by object id) until that output is processed.
++    step_padded: set[str] = field(default_factory=set)
++    padded_by_output: OrderedDict = field(default_factory=OrderedDict)
++    last_k: int | None = None
++    force_path: str = ""
++    _force_value: int | None = None
++    _force_stamp: tuple[int, int, int] | None = None
++    _force_since: int = 0
++    _seq: int = 0
++    applied: Counter = field(default_factory=Counter)
++    # Logging.
++    chosen: Counter = field(default_factory=Counter)
++    _steps: int = 0
++    _obs_s: float = 0.0
++    _obs_f: float = 0.0
++
++    # ------------------------------------------------------------ feedback
++
++    def mark_padded(self, req_id: str) -> None:
++        """The step being scheduled pads ``req_id`` into decode with
++        ``[-1] * K`` placeholder drafts: their rejection is not evidence."""
++        self.step_padded.add(req_id)
++
++    def end_step(self, scheduler_output: Any) -> None:
++        """Attach this step's padded request ids to its scheduler output."""
++        if not self.step_padded:
++            return
++        self.padded_by_output[id(scheduler_output)] = frozenset(self.step_padded)
++        self.step_padded = set()
++        while len(self.padded_by_output) > MAX_PADDED_OUTPUTS:
++            self.padded_by_output.popitem(last=False)
++
++    def take_padded(self, scheduler_output: Any) -> frozenset[str]:
++        """The padded request ids of an output being processed (once)."""
++        if not self.padded_by_output:
++            return frozenset()
++        return self.padded_by_output.pop(id(scheduler_output), frozenset())
++
++    def observe(
++        self,
++        req_id: str,
++        num_draft_tokens: int,
++        num_accepted: int,
++        stale: bool = False,
++        padded: bool = False,
++    ) -> None:
++        """One verify round of ``req_id``: ``num_accepted`` of
++        ``num_draft_tokens`` valid drafts accepted (bonus token excluded).
++        Placeholder-padded and stale rounds are not evidence."""
++        if num_draft_tokens <= 0 or padded or stale:
++            return
++        accepted = min(max(num_accepted, 0), num_draft_tokens)
++        rejected = 1.0 if accepted < num_draft_tokens else 0.0
++        d = self.policy.decay
++        self.acc_s[req_id] = d * self.acc_s.get(req_id, 0.0) + accepted
++        self.acc_f[req_id] = d * self.acc_f.get(req_id, 0.0) + rejected
++        self._obs_s = 0.999 * self._obs_s + accepted
++        self._obs_f = 0.999 * self._obs_f + rejected
++
++    def forget(self, req_id: str) -> None:
++        self.acc_s.pop(req_id, None)
++        self.acc_f.pop(req_id, None)
++
++    def accept_rate(self, req_id: str) -> float:
++        pol = self.policy
++        s = self.acc_s.get(req_id, 0.0)
++        f = self.acc_f.get(req_id, 0.0)
++        return (s + pol.strength * pol.prior) / (s + f + pol.strength)
++
++    # -------------------------------------------------------------- choice
++
++    def choose(self, b: int, rates: list[float], cap: int) -> int:
++        """The verify width for a decode step of ``b`` requests with per-draft
++        acceptance ``rates`` and at most ``cap`` drafts on hand."""
++        pol = self.policy
++        candidates = [k for k in pol.k_choices if k <= cap]
++        if not candidates:
++            return cap
++        scores = {
++            k: sum(expected_tokens(p, k) for p in rates) / pol.step_ms(b, k)
++            for k in candidates
++        }
++        # Ties to the larger k (the served default is the widest).
++        best = max(candidates, key=lambda k: (scores[k], k))
++        last = self.last_k
++        if (
++            last is not None
++            and last in scores
++            and last != best
++            and scores[best] <= scores[last] * (1.0 + pol.hysteresis)
++        ):
++            best = last
++        return best
++
++    def _forced(self) -> int | None:
++        if not self.force_path:
++            return None
++        try:
++            st = os.stat(self.force_path)
++            stamp: tuple[int, int, int] | None = (
++                st.st_ino,
++                st.st_mtime_ns,
++                st.st_size,
++            )
++        except OSError:
++            stamp = None
++        if stamp != self._force_stamp:
++            self._force_stamp = stamp
++            try:
++                value = int(Path(self.force_path).read_text().strip() or 0)
++            except (OSError, ValueError):
++                value = 0
++            value = value if value in self.policy.k_choices else None
++            if value != self._force_value:
++                self._force_value = value
++                self._force_since = self._seq
++        return self._force_value
++
++    def _write_status(self, k: int, b: int) -> None:
++        status = {
++            "seq": self._seq,
++            "forced": self._force_value,
++            "since_seq": self._force_since,
++            "last": {"k": k, "b": b},
++            "applied": {str(key): n for key, n in sorted(self.applied.items())},
++        }
++        target = self.force_path + ".status"
++        tmp = f"{target}.{os.getpid()}.tmp"
++        try:
++            Path(tmp).write_text(json.dumps(status, sort_keys=True))
++            os.replace(tmp, target)
++        except OSError:  # pragma: no cover - read-only mount: no acknowledgement
++            pass
++
++    def begin_step(self, running: list[Any]) -> int:
++        """Choose this step's verify width and truncate the running decode
++        requests' draft lists to it (rebinding them). Returns K, the width a
++        request newly padded into decode this step must use."""
++        pol = self.policy
++        self.step_padded = set()
++        self._seq += 1
++        decoding = [r for r in running if not r.is_prefill_chunk]
++        on_hand = [len(r.spec_token_ids) for r in decoding if r.spec_token_ids]
++        cap = min(on_hand) if on_hand else pol.max_k
++        forced = self._forced()
++        b = len(running)
++        tag: int | None
++        if forced is not None:
++            k = forced
++            tag = -forced
++        elif b != len(decoding):
++            k = pol.mixed_step_k
++            tag = 0
++            self.last_k = None
++        elif b < pol.min_batch or not decoding:
++            k = pol.max_k
++            tag = None
++            self.last_k = None
++        else:
++            rates = [self.accept_rate(r.request_id) for r in decoding]
++            k = self.choose(b, rates, cap)
++            self.last_k = k
++            tag = k
++        if on_hand and k > cap:
++            # Fewer drafts on hand than chosen: the widest captured k that fits.
++            k = max((c for c in pol.k_choices if c <= cap), default=cap)
++        if k < pol.max_k:
++            for r in decoding:
++                if len(r.spec_token_ids) > k:
++                    # Rebind: AsyncScheduler hands every request one shared list.
++                    r.spec_token_ids = r.spec_token_ids[:k]
++        if tag is not None:
++            self._record(tag)
++        if self.force_path:
++            # "<k>:<b>" for decode steps, "mixed:<k>" for steps with a prefill.
++            key = f"{k}:{b}" if b == len(decoding) else f"mixed:{k}"
++            self.applied[key] += 1
++            self._write_status(k, b)
++        return k
++
++    # ------------------------------------------------------------- logging
++
++    def _record(self, tag: int) -> None:
++        interval = self.policy.log_interval
++        if not interval:
++            return
++        self.chosen[tag] += 1
++        self._steps += 1
++        if self._steps < interval:
++            return
++        total = sum(self.chosen.values()) or 1
++        hist = " ".join(
++            ("mixed" if t == 0 else f"forced{-t}" if t < 0 else f"K{t}")
++            + f":{n}({100 * n / total:.0f}%)"
++            for t, n in sorted(self.chosen.items())
++        )
++        obs = self._obs_s + self._obs_f
++        _logger().info(
++            "DSV41 adaptive verify: %d steps at batch >= %d, %s; "
++            "per-draft acceptance %.3f",
++            total,
++            self.policy.min_batch,
++            hist,
++            self._obs_s / obs if obs else float("nan"),
++        )
++        self.chosen.clear()
++        self._steps = 0
++
++
++def from_env(
++    speculative_config: Any, num_spec_tokens: int, max_num_seqs: int, dynamic_sd: bool
++) -> AdaptiveVerify | None:
++    """The scheduler's state, or None when ``VLLM_DSV41_ADAPTIVE_VERIFY_POLICY``
++    is unset or empty (nothing changes)."""
++    path = policy_path()
++    if not path:
++        return None
++    if speculative_config is None or num_spec_tokens <= 0:
++        raise ValueError(f"{ENV_POLICY} needs speculative decoding")
++    if getattr(speculative_config, "method", None) != "dspark":
++        raise ValueError(f"{ENV_POLICY} is qualified for DSpark only")
++    if dynamic_sd:
++        raise ValueError(
++            f"{ENV_POLICY} and num_speculative_tokens_per_batch_size both choose "
++            "the verify width"
++        )
++    if getattr(speculative_config, "enable_adaptive_verification", False):
++        raise ValueError(
++            f"{ENV_POLICY} and enable_adaptive_verification both choose the "
++            "verify width"
++        )
++    policy = parse_policy(_policy_json(path), max_num_seqs, num_spec_tokens, path)
++    state = AdaptiveVerify(
++        policy, force_path=os.environ.get(ENV_FORCE_FILE, "").strip()
++    )
++    _logger().info(
++        "DSV41 adaptive verify on (%s=%s): K in %s from batch %d, mixed steps K%d, "
++        "prior %.2f decay %.2f hysteresis %.2f%s",
++        ENV_POLICY,
++        path,
++        list(policy.k_choices),
++        policy.min_batch,
++        policy.mixed_step_k,
++        policy.prior,
++        policy.decay,
++        policy.hysteresis,
++        f", force file {state.force_path}" if state.force_path else "",
++    )
++    return state
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3dd7aa3..21c6ae8 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -40,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.sched import dsv41_adaptive_verify
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -318,7 +319,12 @@ class Scheduler(SchedulerInterface):
+         # The model runner skips drafting in steps where no scheduled request
+         # can use the drafts. Only drafters with their own forward pass reserve
+         # lookahead slots.
+-        self.can_skip_drafts = self.num_lookahead_tokens > 0
++        # Keep the incumbent V4.1 DSpark proposal cadence during the rebase.
++        self.can_skip_drafts = self.num_lookahead_tokens > 0 and not (
++            speculative_config is not None
++            and speculative_config.use_dspark()
++            and vllm_config.model_config.hf_text_config.model_type == "deepseek_v41"
++        )
+         self.dynamic_sd_lookup: list[int] | None = None
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+@@ -338,6 +344,16 @@ class Scheduler(SchedulerInterface):
+                     "This is experimental and may affect speculative-token "
+                     "acceptance rates."
+                 )
++        # DSV41 host adaptive verify width (VLLM_DSV41_ADAPTIVE_VERIFY_POLICY);
++        # None when unset, and then nothing below changes.
++        self.dsv41_av = dsv41_adaptive_verify.from_env(
++            speculative_config,
++            self.num_spec_tokens,
++            self.scheduler_config.max_num_seqs,
++            self.dynamic_sd_lookup is not None,
++        )
++        # This step's verify width (num_spec_tokens unless dsv41_av chose less).
++        self.dsv41_av_k = self.num_spec_tokens
+ 
+         self.num_hash_lookahead_tokens = vllm_config.num_hash_lookahead_tokens
+         if self.num_hash_lookahead_tokens:
+@@ -761,6 +777,13 @@ class Scheduler(SchedulerInterface):
+ 
+         self.kv_cache_manager.new_step_starts()
+ 
++        if self.dsv41_av is not None:
++            # One verify width for the step, before any request is sized: the
++            # running decodes' draft lists are truncated to it here, and a
++            # request padded into decode below takes it too, so the batch stays
++            # a uniform decode (FULL graph for query length K + 1).
++            self.dsv41_av_k = self.dsv41_av.begin_step(self.running)
++
+         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
+         # all prefill compute unless saturated.
+         defer_prefills = (
+@@ -1365,7 +1388,8 @@ class Scheduler(SchedulerInterface):
+                         and not prefill_scheduled
+                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                     ):
+-                        padded_num_tokens = 1 + self.num_spec_tokens
++                        # dsv41_av_k == num_spec_tokens unless dsv41_av is on.
++                        padded_num_tokens = 1 + self.dsv41_av_k
+                         # Pad only when there is room for the sampled token(s).
+                         if (
+                             num_computed_tokens
+@@ -1408,7 +1432,7 @@ class Scheduler(SchedulerInterface):
+                             break
+                         if (
+                             pad_spec_decode
+-                            and num_new_tokens != 1 + self.num_spec_tokens
++                            and num_new_tokens != 1 + self.dsv41_av_k
+                         ):
+                             # Alignment clipped the placeholder rows. The split
+                             # aligns prefill chunks, but the padded tail rows are
+@@ -1640,10 +1664,13 @@ class Scheduler(SchedulerInterface):
+                     request, num_computed_tokens, num_new_tokens
+                 )
+                 if pad_spec_decode:
+-                    assert num_new_tokens == 1 + self.num_spec_tokens
++                    assert num_new_tokens == 1 + self.dsv41_av_k
+                     scheduled_spec_decode_tokens[request_id] = [
+                         -1
+-                    ] * self.num_spec_tokens
++                    ] * self.dsv41_av_k
++                    if self.dsv41_av is not None:
++                        # Placeholder drafts are rejected by construction.
++                        self.dsv41_av.mark_padded(request_id)
+                 # Must use the SAME predicate as the deferral gate in the
+                 # waiting loop (`num_computed_tokens < num_tokens - 1`).
+                 # Stamping on `< num_prompt_tokens` instead let a request with
+@@ -1835,6 +1862,9 @@ class Scheduler(SchedulerInterface):
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        if self.dsv41_av is not None:
++            # Remember which requests this output padded into decode.
++            self.dsv41_av.end_step(scheduler_output)
+         return scheduler_output
+ 
+     def _build_kv_connector_meta(
+@@ -2350,6 +2380,12 @@ class Scheduler(SchedulerInterface):
+         # to avoid expensive operations inside the loop.
+         stopped_running_reqs: set[Request] = set()
+         stopped_preempted_reqs: set[Request] = set()
++        # Requests this output padded into decode (dsv41_av on only).
++        dsv41_padded = (
++            self.dsv41_av.take_padded(scheduler_output)
++            if self.dsv41_av is not None
++            else frozenset()
++        )
+         # Stopped resumable requests to re-enqueue, in output order.
+         continuing_reqs: list[Request] = []
+         # The worker's output order follows its batch, not num_scheduled_tokens.
+@@ -2399,6 +2435,19 @@ class Scheduler(SchedulerInterface):
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                if self.dsv41_av is not None:
++                    num_invalid = (
++                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
++                        if scheduler_output.num_invalid_spec_tokens
++                        else 0
++                    )
++                    self.dsv41_av.observe(
++                        req_id,
++                        num_draft_tokens - num_invalid,
++                        num_accepted,
++                        stale=output_is_stale,
++                        padded=req_id in dsv41_padded,
++                    )
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+@@ -3191,6 +3240,8 @@ class Scheduler(SchedulerInterface):
+         self.encoder_cache_manager.free(request)
+         self._pending_encoder_input_ids.pop(request.request_id, None)
+         request_id = request.request_id
++        if self.dsv41_av is not None:
++            self.dsv41_av.forget(request_id)
+         self.finished_req_ids.add(request_id)
+         if self.finished_req_ids_dict is not None:
+             self.finished_req_ids_dict[request.client_index].add(request_id)

@@ -1,0 +1,172 @@
+--- a/opera_true_ring.py
++++ b/opera_true_ring.py
+@@ -1,40 +1,49 @@
+ # SPDX-License-Identifier: MIT
+-"""Default-off dispatch of the exact CUDA-gated Opera true-ring native asset.
++"""Default-off dispatch of the r18 Opera true-ring build.
+ 
+ The stock FI package, workspace, tuning and caches are never replaced. Opt-in
+-loads a hash-pinned private module containing the same stock kernels plus7;
++loads a hash-pinned private FI0.7.3 module containing the served ring;
+ only rows6/24/48 override dispatch after a loaded-workspace graph gate.
+ DSV41_TRUE_RING_SHAPES (unset = the line above) names exact rows instead; rows
+ outside 6/24/48 take configs derived at load time from pinned standalone gate
+ receipts in ASSETS/extra, and the loaded-workspace gate covers every listed row.
+ """
+ import hashlib
+ import importlib.metadata
+ import json
+ import os
+ from pathlib import Path
++import sysconfig
+ from types import SimpleNamespace
+ 
+ ASSETS=Path('/opt/dsv41/opera-true-ring')
+ GATED_NATIVE_SHA256='0a69390478b36c6ccacfdae41f371baf891846c717434e389c9fc0b228bada8a'
+ GATED_MEASUREMENTS_SHA256='14f3c891c6379232c820c5b8b013ac0184a3a238b897b6d02f5a2518e01894f2'
++# Historical hashes continue to authenticate the served launch policy.
++IMAGE_BUILD_MANIFEST_SHA256 = None  # Filled once by the r18 image build.
++FLASHINFER_VERSION = "0.7.3"
++PRIVATE_VARIANT = 8  # Stock FI now owns wire ID 7. The served policy still uses 7.
+ LEGACY_ROWS=(6,24,48)
+ SHAPES_ENV='DSV41_TRUE_RING_SHAPES'
+ EXTRA_MIN_SPEEDUP=1.03
+ _NATIVE_STATE=None
+ 
+ def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+ 
+ def read_assets(root=ASSETS):
+-    root=Path(root);manifest=json.loads((root/'manifest.json').read_text())
+-    if manifest['native_library_sha256']!=GATED_NATIVE_SHA256:
+-        raise RuntimeError('native manifest does not name the qualified CUDA-gated binary')
++    root = Path(root)
++    data = (root / "manifest.json").read_bytes()
++    if hashlib.sha256(data).hexdigest() != IMAGE_BUILD_MANIFEST_SHA256:
++        raise RuntimeError("true-ring manifest differs from the image build seal")
++    manifest = json.loads(data)
++    if manifest["incumbent_native_sha256"] != GATED_NATIVE_SHA256:
++        raise RuntimeError("true-ring manifest does not name the served policy's binary")
+     for rel,expected in manifest['files'].items():
+         if digest(root/rel)!=expected:raise RuntimeError('true-ring asset changed: '+rel)
+     if digest(root/'native.so')!=manifest['native_library_sha256']:
+-        raise RuntimeError('true-ring native binary differs from actual CUDA-gated asset')
++        raise RuntimeError('true-ring native binary differs from the image build')
+     policy=json.loads((root/'policy.json').read_text())
+     if (policy['version'],policy['world_size'],policy['hidden_dim'],policy['dtype'],policy['max_numel'],policy['gate_sha256'])!=(1,4,5120,'torch.bfloat16',245760,GATED_MEASUREMENTS_SHA256):
+         raise RuntimeError('unqualified true-ring policy geometry/gate receipt')
+     if policy['ring_configs']!={'6':{'variant':7,'blocks':2,'threads':256},
+                               '24':{'variant':7,'blocks':8,'threads':256},
+@@ -115,65 +124,95 @@
+         if str(n) in policy['ring_configs']:table[str(n)]=policy['ring_configs'][str(n)]
+         elif n in extra:table[str(n)]=extra[n]
+         else:raise RuntimeError('true-ring row %d has no gated configuration'%n)
+     return table,extra_sha
+ 
++def load_native(manifest, root=ASSETS):
++    """Check the installed FI/FFI ABI and load the sealed binary without CUDA calls."""
++    import flashinfer
++    import torch
++    import tvm_ffi
++
++    abi = {
++        "flashinfer_version": importlib.metadata.version("flashinfer-python"),
++        "tvm_ffi_version": importlib.metadata.version("apache-tvm-ffi"),
++        "torch_version": str(torch.__version__),
++        "torch_cuda": torch.version.cuda,
++        "python_soabi": sysconfig.get_config_var("SOABI"),
++        "cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
++    }
++    if abi["flashinfer_version"] != FLASHINFER_VERSION or any(
++        manifest[key] != value for key, value in abi.items()
++    ):
++        raise RuntimeError("true-ring FlashInfer/FFI/Torch/CUDA ABI differs from the image build")
++    fi = Path(flashinfer.__file__).resolve().parent
++    for rel, expected in manifest["stock_fi_sources"].items():
++        if digest(fi / rel) != expected:
++            raise RuntimeError("stock FI source changed: " + rel)
++    native = tvm_ffi.load_module(str(Path(root) / "native.so"))
++    if (int(native.opera_ring_variant_count_v1()), int(native.opera_ring_variant_id_v1())) != (
++        PRIVATE_VARIANT + 1, PRIVATE_VARIANT
++    ):
++        raise RuntimeError("loaded true-ring native module has the wrong dispatch ABI")
++    for name in (
++        "memop_supported", "set_memop_enabled", "set_ce_slow_hops",
++        "workspace_size", "init", "dispose", "all_reduce",
++    ):
++        if not callable(getattr(native, "pcie_ipc_" + name)):
++            raise RuntimeError("missing true-ring native export: " + name)
++    return native
++
++
+ def initialize(*,world_size,hidden_dim,dtype,max_numel,tbo_stream):
+     """Called before the original FI workspace creates its native wrapper."""
+     global _NATIVE_STATE
+-    import flashinfer
+     import flashinfer.comm.pcie_ipc_ar as ar
+     import torch
+-    import tvm_ffi
+     from vllm.logger import init_logger
+     log=init_logger(__name__)
+     manifest,policy=read_assets()
+     if (world_size!=policy['world_size'] or hidden_dim!=policy['hidden_dim']
+         or str(dtype)!=policy['dtype'] or max_numel!=policy['max_numel']
+         or tbo_stream is not None or os.environ.get('VLLM_DSV41_TBO','0')!='0'):
+         raise RuntimeError('true-ring requires gated TP4/BF16/hidden5120/max48rows and no TBO')
+     if not torch.cuda.is_available() or torch.cuda.get_device_capability()!=(8,0):
+         raise RuntimeError('true-ring requires the gated SM80 CUDA platform')
+-    if str(torch.__version__)!=manifest['torch_version']:
+-        raise RuntimeError('true-ring Torch/CUDA ABI differs from actual hardware gate')
+-    if importlib.metadata.version('flashinfer-python')!='0.7.2':
+-        raise RuntimeError('true-ring requires accepted FI0.7.2')
+-    fi=Path(flashinfer.__file__).resolve().parent
+-    for rel,expected in manifest['stock_fi_sources'].items():
+-        if digest(fi/rel)!=expected:raise RuntimeError('stock FI source changed: '+rel)
+     rows=requested_rows();extra=None
+     if rows is not None:extra=effective_table(rows,policy)
+     if _NATIVE_STATE is not None:
+         if ar.gen_pcie_ipc_comm_module is not _NATIVE_STATE['factory']:
+             raise RuntimeError('FI native factory changed after true-ring initialization')
+         if _NATIVE_STATE.get('rows')!=rows:raise RuntimeError(SHAPES_ENV+' changed after true-ring initialization')
+         return
+     if ar.get_pcie_ipc_comm_module.cache_info().currsize:
+         raise RuntimeError('stock FI native wrapper already initialized; refuse live replacement')
+-    # Explicit path bypasses FI AOT/JIT provider resolution entirely. Source and
+-    # binary are tied to the PASS hardware gate, not a reusable generic URI.
+-    native=tvm_ffi.load_module(str(ASSETS/'native.so'))
+-    if int(native.opera_ring_variant_count_v1())!=8:
+-        raise RuntimeError('loaded true-ring native probe must report count8')
++    # The binary is sealed at build time. The loaded-workspace gate below
++    # qualifies this image and its actual TP4 workspace at boot.
++    native = load_native(manifest)
+     factory=lambda:SimpleNamespace(build_and_load=lambda:native)
+     ar.gen_pcie_ipc_comm_module=factory
+     _NATIVE_STATE={'factory':factory,'policy':policy,'manifest':manifest,'native':native}
+     if rows is None:
+-        log.info('Opera true-ring native verified: count8, sha256=%s, gate=%s; exact rows6/24/48 only',
++        log.info('Opera true-ring native verified: count9/wire8, sha256=%s, gate=%s; exact rows6/24/48 only',
+                  manifest['native_library_sha256'],policy['gate_sha256'])
+     else:
+         _NATIVE_STATE.update(rows=rows,ring_configs=extra[0],extra_sha256=extra[1])
+-        log.info('Opera true-ring native verified: count8, sha256=%s, gate=%s; exact rows%s, extra=%s',
++        log.info('Opera true-ring native verified: count9/wire8, sha256=%s, gate=%s; exact rows%s, extra=%s',
+                  manifest['native_library_sha256'],policy['gate_sha256'],'/'.join(map(str,rows)),extra[1])
+         log.info('Opera true-ring rows: %s',','.join(map(str,rows)))
+ 
+ 
+ class RingWorkspace:
+-    """Delegate stock lifecycle/stream/tuning; override only three exact shapes."""
++    """Delegate stock lifecycle/stream/tuning and override the selected exact rows."""
+     def __init__(self,base,policy,config_factory):
+         self._base=base;self._policy=policy
+-        self._configs={int(n):config_factory(**values) for n,values in policy['ring_configs'].items()}
++        # Translate only the selected policy entries. Explicit caller configs
++        # and FI's own tuned/seed choices keep their stock IDs.
++        self._configs = {
++            int(n): config_factory(**dict(values, variant=PRIVATE_VARIANT))
++            for n, values in policy["ring_configs"].items()
++        }
+     def __getattr__(self,name):return getattr(self._base,name)
+     def all_reduce(self,inp,*,out=None,config=None,enable_pdl=False):
+         if config is None and not enable_pdl and inp.dim()==2 and inp.shape[1]==5120 and str(inp.dtype)=='torch.bfloat16':
+             config=self._configs.get(inp.shape[0])
+         return self._base.all_reduce(inp,out=out,config=config,enable_pdl=enable_pdl)
