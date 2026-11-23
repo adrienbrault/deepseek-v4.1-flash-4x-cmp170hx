@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash on four CMP 170HX cards
 
-![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-160aceb9.png)
+![Recipe card with Spec-Bench, cached-code decode, context and hardware, measured 2026-11-24 UTC](docs/img/recipe-card-fb0f268e.png)
 
 Serving configuration, image sources, launch settings and benchmarks for DeepSeek-V4.1-Flash-1017 on four NVIDIA CMP 170HX cards.
 
@@ -8,7 +8,8 @@ Serving configuration, image sources, launch settings and benchmarks for DeepSee
 
 - **Model.** DeepSeek-V4.1-Flash-1017 with EXL3 EAQ v1.1 routed experts at 2.9 bits per weight. The official checkpoint supplies attention, shared experts, the output head, the DSpark drafter and Engram. [Model and quantization pins](THIRD_PARTY.md)
 - **Engine.** Patched vLLM 0.34.0 on four memory-unlocked 64 GB Ampere GPUs. The headline run used PCIe Gen2 x16 and a configured 175 W cap on every card. [Serving plan](config/served.json)
-- **Window and KV pool.** Up to 262,144 prompt-plus-output tokens per request, with eight active sequence slots. The FP8 KV pool held 2,483,207 tokens at the 2026-11-20 serving acceptance on the same image with one GPU at x8. [Pool record](config/served.json)
+- **Window and KV pool.** Up to 262,144 prompt-plus-output tokens per request, with eight active sequence slots. The FP8 KV pool holds 2,483,207 tokens (5.25 GiB per card), measured on the served boot of 2026-11-23 with all four cards at x16. [Memory record](bench/results/2026-11-23-hardware/NOTES.md)
+- **Hardware.** Four CMP 170HX (GA100, 64 GB HBM2e each, PCIe Gen2 x16, 175 W cap), an AMD EPYC 7371 with 64 GB DDR4-2667, and two Samsung 970 EVO Plus 2 TB SSDs in RAID0 that hold the checkpoint and the Engram tables (6.5 GB/s sequential read). On the served boot the weights take 214.3 GiB and the KV pool 21.0 GiB of the 256 GiB of VRAM; the serving container uses 25.5 GiB of host RAM. [Hardware record](bench/results/2026-11-23-hardware/NOTES.md)
 - **Enabled features.** DSpark speculative decoding, prefix caching, fair prefill, images, reasoning and tool calls. The API also exposes separate model names for a rank-one adapter and opt-in sampling policies. [Served configuration](#served-configuration)
 
 ## Numbers

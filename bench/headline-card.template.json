@@ -227,7 +227,7 @@
         "maker": "NVIDIA"
       }
     ],
-    "cpu": "AMD EPYC 7401P",
+    "cpu": "AMD EPYC 7371",
     "cores": "",
     "ram": "Host capacity not verified",
     "link": "PCIe Gen2 x16 per GPU",

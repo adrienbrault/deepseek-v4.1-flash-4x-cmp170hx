@@ -18,13 +18,14 @@
     "tp": 4,
     "pcie": "Gen2 x16 per GPU",
     "power_cap_w_per_gpu": 175,
-    "cpu": "EPYC 7401P",
-    "host_ram_gb": null,
-    "host_ram_note": "Historical summaries recorded 46 GB. Host capacity is unverified on the headline boot."
+    "cpu": "EPYC 7371 (16 cores, SMT off; replaced the EPYC 7401P on 2026-11-02)",
+    "host_ram_gb": 64,
+    "host_ram_note": "8 x 8 GB DDR4-2667 RDIMM, recorded 2026-11-23 (bench/results/2026-11-23-hardware).",
+    "model_storage": "2 x Samsung 970 EVO Plus 2 TB, RAID0, ext4; checkpoint and Engram tables; fio sequential read 6.5 GB/s on 2026-11-23"
   },
   "kv_pool": {
     "tokens": 2483207,
-    "source": "current-r18b acceptance, 2026-11-20 UTC, one card at x8; no independent pool probe in the x16 headline."
+    "source": "vLLM startup log of the current-r18b served boot, 2026-11-23 07:44 UTC, all four cards x16 (bench/results/2026-11-23-hardware); the 2026-11-20 acceptance with one card at x8 reported the same count."
   },
   "served_names": [
     "deepseek-v4.1-flash-1017",
